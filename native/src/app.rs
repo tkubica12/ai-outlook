@@ -2,6 +2,7 @@ use chrono::{Datelike, Local, NaiveDate};
 use eframe::egui::{self, Color32, Id, Key, Modifiers, RichText, Stroke, Vec2};
 use std::sync::Arc;
 use tomlook::{
+    ai::{self, Engine, Question},
     calendar::{Calendar, Event, View, safe_url},
     storage::Preferences,
     worker::{Command, Notice, Options, Worker},
@@ -29,14 +30,57 @@ pub struct Tomlook {
     focus_search: bool,
     loading: bool,
     error: Option<String>,
+    ai: Option<Engine>,
+    connection: String,
+    ai_ready: bool,
+    assistant: bool,
+    assistant_context: Option<Event>,
+    question: String,
+    public_topic: String,
+    request_id: u64,
+    active_request: Option<u64>,
+    answer: Option<Arc<String>>,
+    ai_error: Option<String>,
 }
 
 impl Tomlook {
-    pub fn new(creation: &eframe::CreationContext<'_>, options: Options) -> Self {
-        let (worker, error) = match Worker::start(options, creation.egui_ctx.clone()) {
+    pub fn new(
+        creation: &eframe::CreationContext<'_>,
+        options: Options,
+        shutdown: Arc<std::sync::Mutex<Option<ai::Shutdown>>>,
+    ) -> Self {
+        let (worker, mut error) = match Worker::start(options.clone(), creation.egui_ctx.clone()) {
             Ok(worker) => (Some(worker), None),
             Err(error) => (None, Some(error)),
         };
+        let ai = match Engine::start(
+            options.state,
+            options.demo.is_some(),
+            creation.egui_ctx.clone(),
+        ) {
+            Ok(mut engine) => {
+                match shutdown.lock() {
+                    Ok(mut handle) => {
+                        if let Some(done) = engine.done.take() {
+                            *handle = Some(ai::Shutdown {
+                                commands: engine.commands.clone(),
+                                done,
+                            });
+                        }
+                    }
+                    Err(_) => error = Some("AI shutdown coordinator is unavailable".into()),
+                }
+                Some(engine)
+            }
+            Err(problem) => {
+                error = Some(problem);
+                None
+            }
+        };
+        Self::initial(worker, ai, error)
+    }
+
+    fn initial(worker: Option<Worker>, ai: Option<Engine>, error: Option<String>) -> Self {
         Self {
             worker,
             error,
@@ -52,6 +96,17 @@ impl Tomlook {
             palette: false,
             focus_search: false,
             loading: true,
+            ai,
+            connection: "AI not connected - no runtime started".into(),
+            ai_ready: false,
+            assistant: false,
+            assistant_context: None,
+            question: String::new(),
+            public_topic: String::new(),
+            request_id: 0,
+            active_request: None,
+            answer: None,
+            ai_error: None,
         }
     }
 
@@ -83,20 +138,45 @@ impl Tomlook {
                     calendar,
                     preferences,
                 } => {
+                    if let Some(context) = &self.assistant_context {
+                        let updated = calendar.events.iter().find(|event| event.id == context.id);
+                        if updated.is_none_or(|event| event.fingerprint() != context.fingerprint())
+                        {
+                            let updated = updated.cloned();
+                            self.cancel_ai();
+                            self.answer = None;
+                            self.ai_error = Some("The meeting changed or disappeared. The old result was invalidated and cancellation requested; review the updated context before asking again.".into());
+                            self.assistant_context = updated;
+                        }
+                    }
                     let id = self.selected.map(|i| self.calendar.events[i].id.clone());
-                    self.selected =
+                    let next =
                         id.and_then(|id| calendar.events.iter().position(|event| event.id == id));
+                    let changed = match (self.selected, next) {
+                        (Some(old), Some(new)) => {
+                            self.calendar.events[old].fingerprint()
+                                != calendar.events[new].fingerprint()
+                        }
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    self.selected = next;
+                    if changed {
+                        self.detail_revision += 1;
+                        self.briefing = None;
+                    }
                     self.calendar = calendar;
                     self.preferences = preferences;
                     self.loading = false;
+                    if changed && let Some(index) = self.selected {
+                        self.command(Command::Detail {
+                            revision: self.detail_revision,
+                            id: self.calendar.events[index].id.clone(),
+                        });
+                    }
                 }
                 Notice::Detail { revision, payload } if revision == self.detail_revision => {
-                    match payload.map(|json| serde_json::from_str(&json)).transpose() {
-                        Ok(briefing) => self.briefing = briefing,
-                        Err(error) => {
-                            self.error = Some(format!("Saved briefing is invalid: {error}"))
-                        }
-                    }
+                    self.briefing = payload;
                 }
                 Notice::Detail { .. } => {}
                 Notice::Error(error) => {
@@ -105,9 +185,47 @@ impl Tomlook {
                 }
             }
         }
+        for _ in 0..16 {
+            let Some(notice) = self
+                .ai
+                .as_ref()
+                .and_then(|engine| engine.notices.try_recv().ok())
+            else {
+                break;
+            };
+            match notice {
+                ai::Notice::Connection { ready, message } => {
+                    self.ai_ready = ready;
+                    self.connection = message;
+                }
+                ai::Notice::Answer { id, result } if self.active_request == Some(id) => {
+                    self.active_request = None;
+                    match result {
+                        Ok(answer) => {
+                            self.answer = Some(answer);
+                            self.ai_error = None;
+                        }
+                        Err(error) => {
+                            self.ai_error = Some(error);
+                            self.answer = None;
+                        }
+                    }
+                }
+                ai::Notice::Answer { .. } => {}
+                ai::Notice::Stopped => {
+                    self.ai_ready = false;
+                    self.connection = "AI stopped".into();
+                }
+            }
+        }
     }
 
     fn select(&mut self, index: usize) {
+        if self.assistant_context.is_some() {
+            self.cancel_ai();
+            self.assistant_context = Some(self.calendar.events[index].clone());
+            self.answer = None;
+        }
         self.selected = Some(index);
         self.detail_revision += 1;
         self.briefing = None;
@@ -147,6 +265,17 @@ impl Tomlook {
                 Color32::from_gray(if self.preferences.dark { 23 } else { 250 });
             style.visuals.window_fill =
                 Color32::from_gray(if self.preferences.dark { 29 } else { 255 });
+            style.visuals.override_text_color =
+                Some(Color32::from_gray(if self.preferences.dark {
+                    225
+                } else {
+                    35
+                }));
+            style.visuals.weak_text_color = Some(Color32::from_gray(if self.preferences.dark {
+                158
+            } else {
+                100
+            }));
         });
     }
 
@@ -158,11 +287,20 @@ impl Tomlook {
         if consume(Modifiers::CTRL, Key::F) {
             self.focus_search = true;
         }
+        if consume(Modifiers::CTRL, Key::Space) {
+            self.assistant = !self.assistant;
+            if !self.assistant {
+                self.cancel_ai();
+            }
+        }
         if consume(Modifiers::NONE, Key::Escape) {
             if self.palette {
                 self.palette = false;
             } else if self.settings {
                 self.settings = false;
+            } else if self.assistant {
+                self.assistant = false;
+                self.cancel_ai();
             } else if self.selected.is_some() {
                 self.selected = None;
                 self.detail_revision += 1;
@@ -170,7 +308,7 @@ impl Tomlook {
                 self.query.clear();
             }
         }
-        if context.memory(|memory| memory.focused() == Some(Id::new("calendar-search")))
+        if context.memory(|memory| matches!(memory.focused(), Some(id) if id == Id::new("calendar-search") || id == Id::new("assistant-question") || id == Id::new("public-topic")))
             || self.palette
             || self.settings
         {
@@ -268,6 +406,12 @@ impl Tomlook {
                 if ui.button("Settings").clicked() {
                     self.settings = !self.settings;
                 }
+                if ui.button("Ask").on_hover_text("Ctrl+Space").clicked() {
+                    self.assistant = !self.assistant;
+                    if !self.assistant {
+                        self.cancel_ai();
+                    }
+                }
             });
         });
         ui.add_space(4.0);
@@ -350,21 +494,13 @@ impl Tomlook {
         {
             self.category.clear();
         }
-        let categories = self
-            .calendar
-            .events
-            .iter()
-            .map(|e| e.category.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        for category in categories {
-            if category.is_empty() {
-                continue;
-            }
+        let calendar = self.calendar.clone();
+        for category in &calendar.categories {
             if ui
-                .selectable_label(self.category == category, &category)
+                .selectable_label(self.category == *category, category)
                 .clicked()
             {
-                self.category = category;
+                self.category = category.clone();
             }
         }
         ui.add_space(24.0);
@@ -691,6 +827,12 @@ impl Tomlook {
         if let Some(url) = event.source_url.as_ref().filter(|url| safe_url(url)) {
             ui.hyperlink_to("Open original meeting", url);
         }
+        if ui.button("Ask about this meeting").clicked() {
+            self.cancel_ai();
+            self.assistant = true;
+            self.assistant_context = Some(event.clone());
+            self.answer = None;
+        }
         ui.add_space(16.0);
         ui.separator();
         ui.weak("PREPARATION");
@@ -740,7 +882,135 @@ impl Tomlook {
             }
         } else {
             ui.label("No saved briefing. Meeting details are always available.");
-            ui.weak("The isolated SDK connection is added in the next migration milestone.");
+            ui.weak("Questions work independently of a saved briefing.");
+        }
+    }
+
+    fn ai_command(&mut self, command: ai::Command) -> bool {
+        match self
+            .ai
+            .as_ref()
+            .map(|engine| engine.commands.try_send(command))
+        {
+            Some(Ok(())) => return true,
+            Some(Err(tokio::sync::mpsc::error::TrySendError::Full(_))) => {
+                self.ai_error =
+                    Some("AI command queue is full; nothing was submitted. Try again.".into())
+            }
+            _ => self.ai_error = Some("The AI worker is unavailable. Restart Tomlook.".into()),
+        }
+        false
+    }
+
+    fn cancel_ai(&mut self) {
+        if let Some(id) = self.active_request.take()
+            && !self.ai_command(ai::Command::Cancel(id))
+        {
+            self.error = Some("AI cancellation could not be submitted. Its result will be discarded, but the provider request may continue until timeout or application exit.".into());
+        }
+    }
+
+    fn assistant_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.weak("ASSISTANT");
+            if ui.button("Close").on_hover_text("Esc").clicked() {
+                self.assistant = false;
+                self.cancel_ai();
+            }
+        });
+        ui.add_space(8.0);
+        ui.label(&self.connection);
+        if !self.ai_ready && ui.button("Connect isolated SDK").clicked() {
+            self.ai_command(ai::Command::Connect);
+        }
+        ui.separator();
+        if let Some(event) = &self.assistant_context {
+            ui.label(RichText::new(&event.title).strong());
+            ui.weak("Meeting snapshot; no briefing prerequisite");
+            if ui.button("Switch to global question").clicked() {
+                self.cancel_ai();
+                self.assistant_context = None;
+                self.answer = None;
+            }
+        } else {
+            ui.label(RichText::new("Your workspace").strong());
+            ui.weak("Ask about mail, calendar or work context. Read-only.");
+            if let Some(index) = self.selected
+                && ui.button("Use selected meeting").clicked()
+            {
+                self.cancel_ai();
+                self.assistant_context = Some(self.calendar.events[index].clone());
+                self.answer = None;
+            }
+        }
+        ui.add_space(12.0);
+        let question = ui.add(
+            egui::TextEdit::multiline(&mut self.question)
+                .id(Id::new("assistant-question"))
+                .hint_text("Ask a question...")
+                .desired_rows(4)
+                .desired_width(f32::INFINITY),
+        );
+        ui.weak("Public web is off unless you supply a public topic.");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.public_topic)
+                .id(Id::new("public-topic"))
+                .hint_text("Public topic (optional)")
+                .desired_width(f32::INFINITY),
+        );
+        let shortcut = question.has_focus()
+            && ui.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Enter));
+        let can_ask =
+            self.ai_ready && !self.question.trim().is_empty() && self.active_request.is_none();
+        ui.horizontal(|ui| {
+            let clicked = ui
+                .add_enabled(
+                    can_ask,
+                    egui::Button::new("Ask").min_size([72.0, 30.0].into()),
+                )
+                .on_hover_text("Ctrl+Enter")
+                .clicked();
+            if (clicked || shortcut) && can_ask {
+                self.request_id += 1;
+                self.active_request = Some(self.request_id);
+                self.answer = None;
+                self.ai_error = None;
+                self.ai_command(ai::Command::Ask(Box::new(Question {
+                    id: self.request_id,
+                    question: self.question.clone(),
+                    meeting: self.assistant_context.clone(),
+                    public_topic: (!self.public_topic.trim().is_empty())
+                        .then(|| self.public_topic.trim().to_owned()),
+                })));
+                if self.ai_error.is_some() {
+                    self.active_request = None;
+                }
+            }
+            if self.active_request.is_some() && ui.button("Cancel").clicked() {
+                self.cancel_ai();
+                self.ai_error = Some("Cancelled; partial output is not a completed answer.".into());
+            }
+        });
+        if let Some(error) = &self.ai_error {
+            ui.label(RichText::new(error).strong());
+        }
+        ui.separator();
+        if let Some(answer) = &self.answer {
+            ui.label(answer.as_str());
+        }
+        if let Some(id) = self.active_request {
+            ui.weak("Working asynchronously - the calendar remains available");
+            let preview = self.ai.as_ref().and_then(|engine| {
+                engine
+                    .progress
+                    .try_lock()
+                    .ok()
+                    .filter(|progress| progress.id == id)
+                    .map(|progress| progress.text.clone())
+            });
+            if let Some(text) = preview {
+                ui.label(text.as_str());
+            }
         }
     }
 
@@ -784,6 +1054,10 @@ impl Tomlook {
                         self.settings = true;
                         self.palette = false;
                     }
+                    if ui.button("Open assistant").clicked() {
+                        self.assistant = true;
+                        self.palette = false;
+                    }
                 });
             self.palette &= open;
         }
@@ -810,7 +1084,11 @@ impl eframe::App for Tomlook {
             } else {
                 ui.horizontal_wrapped(|ui| {
                     ui.weak(if self.calendar.warnings.is_empty() {
-                        "Local calendar - AI disconnected"
+                        if self.ai_ready {
+                            "Local calendar - isolated AI connected"
+                        } else {
+                            "Local calendar - AI not connected"
+                        }
                     } else {
                         self.calendar.warnings.first().expect("nonempty")
                     });
@@ -823,7 +1101,15 @@ impl eframe::App for Tomlook {
         egui::Panel::left("navigation")
             .exact_size(192.0)
             .show(ui, |ui| self.sidebar(ui));
-        if let Some(event) = self.selected.map(|i| self.calendar.events[i].clone()) {
+        if self.assistant {
+            egui::Panel::right("assistant")
+                .default_size(380.0)
+                .size_range(300.0..=520.0)
+                .resizable(true)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| self.assistant_panel(ui));
+                });
+        } else if let Some(event) = self.selected.map(|i| self.calendar.events[i].clone()) {
             egui::Panel::right("meeting-details")
                 .default_size(345.0)
                 .size_range(285.0..=500.0)
@@ -840,5 +1126,54 @@ impl eframe::App for Tomlook {
             }
         });
         self.overlays(&context);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ai_notices_are_drained_without_storage_notices_and_stale_answers_are_ignored() {
+        let (output, notices) = std::sync::mpsc::channel();
+        let (commands, _input) = tokio::sync::mpsc::channel(1);
+        let engine = Engine {
+            commands,
+            notices,
+            progress: Arc::new(std::sync::Mutex::new(ai::Progress::default())),
+            done: None,
+        };
+        let mut app = Tomlook::initial(None, Some(engine), None);
+        output
+            .send(ai::Notice::Connection {
+                ready: true,
+                message: "Test connection".into(),
+            })
+            .unwrap();
+        app.receive();
+        assert!(app.ai_ready);
+        assert_eq!(app.connection, "Test connection");
+        app.active_request = Some(2);
+        output
+            .send(ai::Notice::Answer {
+                id: 1,
+                result: Ok(Arc::new("Old meeting".into())),
+            })
+            .unwrap();
+        app.receive();
+        assert!(app.answer.is_none());
+        assert_eq!(app.active_request, Some(2));
+        output
+            .send(ai::Notice::Answer {
+                id: 2,
+                result: Ok(Arc::new("Current request".into())),
+            })
+            .unwrap();
+        app.receive();
+        assert_eq!(
+            app.answer.as_deref().map(String::as_str),
+            Some("Current request")
+        );
+        assert!(app.active_request.is_none());
     }
 }

@@ -33,7 +33,7 @@ pub enum Notice {
     },
     Detail {
         revision: u64,
-        payload: Option<String>,
+        payload: Option<serde_json::Value>,
     },
     Error(String),
 }
@@ -102,10 +102,16 @@ impl Worker {
                     let result = match command {
                         Command::Preferences(preferences) => store.save_preferences(&preferences),
                         Command::Detail { revision, id } => match store.briefing(&id) {
-                            Ok(payload) => {
-                                notify(Notice::Detail { revision, payload });
-                                Ok(())
-                            }
+                            Ok(payload) => match payload
+                                .map(|json| serde_json::from_str(&json))
+                                .transpose()
+                            {
+                                Ok(payload) => {
+                                    notify(Notice::Detail { revision, payload });
+                                    Ok(())
+                                }
+                                Err(error) => Err(format!("Saved briefing is invalid: {error}")),
+                            },
                             Err(error) => Err(error),
                         },
                         Command::Reload => match load(&mut store) {

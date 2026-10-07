@@ -42,8 +42,12 @@ are clearly labelled and never replace production calendar data.
 Keyboard: Ctrl+F search, Ctrl+K commands, 1-4 views, T today, Alt+Left/Right
 period, Up/Down meeting, Escape close, and Tab/Shift+Tab focus.
 
-This first milestone is cache-first and offline. Live Rust SDK integration,
-tray scheduling and the global assistant follow in the subsequent cards.
+The calendar remains cache-first; native live synchronization and tray scheduling
+are not implemented yet. A lazy official Rust Copilot SDK adapter and native
+global/meeting assistant pilot are now available. SDK work, streaming and
+cancellation run on a separate executor with bounded channels; opening the
+calendar or assistant does not start Copilot. See [native setup](native/README.md)
+for the separate identity/configuration boundary and remaining acceptance gates.
 The retained web prototype below is still the live-data reference during migration.
 
 ## Web prototype: connect live data

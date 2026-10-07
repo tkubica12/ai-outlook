@@ -32,7 +32,18 @@ fn source_urls_reject_credentials_controls_and_non_web_schemes() {
     ] {
         assert!(!safe_url(unsafe_url));
     }
+
     assert!(safe_url("https://outlook.office.com/calendar/item/123"));
+}
+
+#[test]
+fn categories_are_precomputed_deduplicated_and_sorted() {
+    let mut events = calendar::demo(Local::now(), 4);
+    for (event, category) in events.iter_mut().zip(["Work", "", "Customer", "Work"]) {
+        event.category = category.into();
+    }
+    let calendar = Calendar::build(events, BTreeSet::new(), Vec::new()).unwrap();
+    assert_eq!(calendar.categories, ["Customer", "Work"]);
 }
 
 #[test]

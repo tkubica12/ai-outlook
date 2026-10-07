@@ -1,0 +1,18 @@
+{
+  "runtime": "C:\\Users\\YOUR_USER\\AppData\\Local\\Microsoft\\WindowsApps\\copilot.exe",
+  "model": "gpt-5.6-terra",
+  "servers": {
+    "WorkIQ-Calendar": {
+      "url": "https://YOUR_WORKIQ_HOST/YOUR_TENANT_CALENDAR_ENDPOINT",
+      "credential_env": "TOMLOOK_WORKIQ_TOKEN"
+    },
+    "WorkIQ-Mail": {
+      "url": "https://YOUR_WORKIQ_HOST/YOUR_TENANT_MAIL_ENDPOINT",
+      "credential_env": "TOMLOOK_WORKIQ_TOKEN"
+    },
+    "WebIQ-MCP": {
+      "url": "https://api.microsoft.ai/v3/mcp",
+      "credential_env": "TOMLOOK_WEBIQ_API_KEY"
+    }
+  }
+}

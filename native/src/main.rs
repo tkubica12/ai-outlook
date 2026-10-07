@@ -36,6 +36,10 @@ fn options() -> Result<Options, String> {
             _ => return Err(format!("Unknown argument: {}", arg.to_string_lossy())),
         }
     }
+    result.state = std::path::absolute(result.state)
+        .map_err(|e| format!("Resolve Tomlook state directory: {e}"))?;
+    result.legacy_root = std::path::absolute(result.legacy_root)
+        .map_err(|e| format!("Resolve legacy directory: {e}"))?;
     Ok(result)
 }
 
@@ -54,9 +58,27 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
-    eframe::run_native(
+    let shutdown = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let on_shutdown = shutdown.clone();
+    let result = eframe::run_native(
         "Tomlook",
         native,
-        Box::new(move |creation| Ok(Box::new(app::Tomlook::new(creation, options)))),
-    )
+        Box::new(move |creation| Ok(Box::new(app::Tomlook::new(creation, options, on_shutdown)))),
+    );
+    // The UI is already closed; shutdown waiting never blocks a UI callback.
+    if let Ok(mut coordinator) = shutdown.lock()
+        && let Some(handle) = coordinator.take()
+    {
+        if handle
+            .commands
+            .blocking_send(tomlook::ai::Command::Stop)
+            .is_err()
+        {
+            eprintln!("Tomlook AI worker was already stopped");
+        }
+        if let Err(error) = handle.done.recv_timeout(std::time::Duration::from_secs(75)) {
+            eprintln!("Tomlook AI shutdown could not be verified: {error}");
+        }
+    }
+    result
 }

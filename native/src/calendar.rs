@@ -156,6 +156,7 @@ pub struct Calendar {
     pub days: BTreeMap<NaiveDate, Day>,
     pub coverage: BTreeSet<NaiveDate>,
     pub search: Vec<String>,
+    pub categories: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -179,6 +180,14 @@ impl Calendar {
             warnings,
             ..Default::default()
         };
+        result.categories = result
+            .events
+            .iter()
+            .map(|event| event.category.clone())
+            .filter(|category| !category.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         for (index, event) in result.events.iter().enumerate() {
             result.search.push(
                 format!(
