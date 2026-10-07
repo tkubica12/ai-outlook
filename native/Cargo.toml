@@ -1,0 +1,25 @@
+[package]
+name = "tomlook"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Performance-first native Windows calendar and meeting workspace"
+
+[dependencies]
+eframe = { version = "=0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+chrono = { version = "=0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+sha2 = "=0.10.9"
+url = "=2.5.8"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+chrono-tz = "=0.10.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

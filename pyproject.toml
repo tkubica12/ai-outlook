@@ -1,0 +1,28 @@
+[project]
+name = "tomlook"
+version = "0.1.0"
+description = "Local-first intelligent calendar and meeting preparation assistant"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "github-copilot-sdk>=0.1,<1",
+  "httpx>=0.28,<1",
+  "pydantic>=2.10,<3",
+  "python-dotenv>=1.0,<2",
+  "tzdata>=2025.2",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

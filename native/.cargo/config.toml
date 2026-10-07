@@ -1,0 +1,3 @@
+[env]
+# The SDK must use an explicitly installed runtime, not download executable code.
+COPILOT_SKIP_CLI_DOWNLOAD = "1"
