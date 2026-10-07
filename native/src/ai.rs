@@ -4,6 +4,7 @@ use crate::{
 };
 use eframe::egui;
 use github_copilot_sdk::MessageOptions;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -25,7 +26,27 @@ pub enum Command {
     Connect,
     Ask(Box<Question>),
     Cancel(u64),
+    Prepare(Box<Preparation>),
+    AttachWake(std::sync::mpsc::SyncSender<crate::worker::Command>),
     Stop,
+}
+
+pub struct Preparation {
+    pub id: u64,
+    pub event: Event,
+    pub foreground: bool,
+    pub reply: async_mpsc::Sender<Prepared>,
+    pub wake: std::sync::mpsc::SyncSender<crate::worker::Command>,
+}
+
+pub enum PreparationResult {
+    NotAdmitted(String),
+    Finished(Result<Arc<String>, String>),
+}
+
+pub struct Prepared {
+    pub id: u64,
+    pub result: PreparationResult,
 }
 
 pub enum Notice {
@@ -48,14 +69,111 @@ pub struct Progress {
 
 pub struct Engine {
     pub commands: async_mpsc::Sender<Command>,
-    pub notices: mpsc::Receiver<Notice>,
+    pub notices: Arc<Notices>,
     pub progress: Arc<Mutex<Progress>>,
     pub done: Option<mpsc::Receiver<()>>,
+    pub ready: Arc<AtomicBool>,
+    pub occupied: Arc<AtomicUsize>,
+    pub terminated: Arc<AtomicBool>,
+    pub stop: watch::Sender<bool>,
 }
 
 pub struct Shutdown {
-    pub commands: async_mpsc::Sender<Command>,
+    pub stop: watch::Sender<bool>,
     pub done: mpsc::Receiver<()>,
+}
+
+#[derive(Default)]
+struct Pending {
+    connection: Option<Notice>,
+    answers: BTreeMap<u64, Notice>,
+    stopped: bool,
+}
+
+impl Pending {
+    fn take(&mut self) -> Option<Notice> {
+        self.connection
+            .take()
+            .or_else(|| self.answers.pop_last().map(|(_, notice)| notice))
+            .or_else(|| std::mem::take(&mut self.stopped).then_some(Notice::Stopped))
+    }
+}
+
+#[derive(Default)]
+pub struct Notices {
+    pending: Mutex<Pending>,
+    changed: std::sync::Condvar,
+    poisoned: AtomicBool,
+}
+
+impl Notices {
+    pub fn send(&self, notice: Notice) -> Result<(), String> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "AI notifications are unavailable")?;
+        match notice {
+            Notice::Connection { .. } => pending.connection = Some(notice),
+            Notice::Answer { id, .. } => {
+                pending.answers.insert(id, notice);
+                if pending.answers.len() > 2 {
+                    pending.answers.pop_first();
+                }
+            }
+            Notice::Stopped => pending.stopped = true,
+        }
+        drop(pending);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn unavailable(&self) -> Result<Notice, mpsc::TryRecvError> {
+        if !self.poisoned.swap(true, Ordering::AcqRel) {
+            Ok(Notice::Connection {
+                ready: false,
+                message: "AI notifications are unavailable; restart Tomlook".into(),
+            })
+        } else {
+            Err(mpsc::TryRecvError::Disconnected)
+        }
+    }
+
+    pub fn try_recv(&self) -> Result<Notice, mpsc::TryRecvError> {
+        match self.pending.try_lock() {
+            Ok(mut pending) => pending.take().ok_or(mpsc::TryRecvError::Empty),
+            Err(std::sync::TryLockError::WouldBlock) => Err(mpsc::TryRecvError::Empty),
+            Err(std::sync::TryLockError::Poisoned(_)) => self.unavailable(),
+        }
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Notice, mpsc::RecvTimeoutError> {
+        let deadline = Instant::now() + timeout;
+        let mut pending = match self.pending.lock() {
+            Ok(pending) => pending,
+            Err(_) => {
+                return self
+                    .unavailable()
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected);
+            }
+        };
+        loop {
+            if let Some(notice) = pending.take() {
+                return Ok(notice);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            }
+            pending = match self.changed.wait_timeout(pending, remaining) {
+                Ok((pending, _)) => pending,
+                Err(_) => {
+                    return self
+                        .unavailable()
+                        .map_err(|_| mpsc::RecvTimeoutError::Disconnected);
+                }
+            };
+        }
+    }
 }
 
 enum Completion {
@@ -64,39 +182,70 @@ enum Completion {
         id: u64,
         result: Result<Arc<String>, String>,
     },
+    Prepared {
+        request: Box<Preparation>,
+        result: Result<Arc<String>, String>,
+    },
 }
 
 impl Engine {
     pub fn start(root: PathBuf, demo: bool, context: egui::Context) -> Result<Self, String> {
         let (commands, mut input) = async_mpsc::channel(64);
-        let (output, notices) = mpsc::sync_channel(64);
+        let notices = Arc::new(Notices::default());
+        let output = notices.clone();
+        let (stop, mut stopped) = watch::channel(false);
         let (finished, done) = mpsc::sync_channel(1);
         let progress = Arc::new(Mutex::new(Progress::default()));
         let streaming = progress.clone();
+        let ready = Arc::new(AtomicBool::new(false));
+        let connected = ready.clone();
+        let occupied = Arc::new(AtomicUsize::new(0));
+        let active = occupied.clone();
+        let terminated = Arc::new(AtomicBool::new(false));
+        let ended = terminated.clone();
         thread::Builder::new().name("tomlook-sdk".into()).spawn(move || {
             let notify = |notice| {
-                let delivered = output.send(notice).is_ok();
+                let result = output.send(notice);
                 context.request_repaint();
-                delivered
+                if let Err(error) = &result { eprintln!("Tomlook: {error}"); }
+                result.is_ok()
             };
             let runtime = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     notify(Notice::Connection { ready: false, message: format!("Start AI executor: {error}") });
+                    ended.store(true, Ordering::Release);
                     let _ = finished.send(());
                     return;
                 }
             };
+            let mut wake: Option<std::sync::mpsc::SyncSender<crate::worker::Command>> = None;
             runtime.block_on(async {
                 let mut harness: Option<Arc<Harness>> = None;
                 let mut starting = false;
                 let mut tasks = tokio::task::JoinSet::new();
-                let mut cancellations = BTreeMap::<u64, watch::Sender<bool>>::new();
+                let mut cancellations = BTreeMap::<u64, (watch::Sender<bool>, bool)>::new();
                 let mut stopping = false;
                 loop {
+                    if *stopped.borrow() { stopping = true; }
+                    if stopping {
+                        connected.store(false, Ordering::Release);
+                        for (cancel, _) in cancellations.values() { let _ = cancel.send(true); }
+                    }
+                    if stopping && tasks.is_empty() {
+                        if let Some(harness) = harness.take()
+                            && let Err(error) = harness.stop().await {
+                                notify(Notice::Connection { ready: false, message: error });
+                            }
+                        notify(Notice::Stopped);
+                        break;
+                    }
                     tokio::select! {
+                        biased;
+                        _ = stopped.changed(), if !stopping => { stopping = true; }
                         command = input.recv(), if !stopping => {
                             match command {
+                                Some(Command::AttachWake(sender)) => { wake = Some(sender); }
                                 Some(Command::Connect) if demo => {
                                     notify(Notice::Connection { ready: false, message: "Synthetic preview never starts Copilot or live connectors.".into() });
                                 }
@@ -134,12 +283,12 @@ impl Engine {
                                         notify(Notice::Answer { id: question.id, result: Err("Both AI slots are busy; nothing was submitted. Cancel or wait, then retry.".into()) });
                                     } else if let Some(harness) = harness.clone() {
                                         let (cancel, cancelled) = watch::channel(false);
-                                        cancellations.insert(question.id, cancel);
+                                        cancellations.insert(question.id, (cancel, false));
                                         let progress = streaming.clone();
                                         let context = context.clone();
                                         tasks.spawn(async move {
                                             let id = question.id;
-                                            let result = ask(harness, *question, cancelled, progress, context).await.map(Arc::new);
+                                            let result = ask(harness, *question, cancelled, progress, context, true).await.map(Arc::new);
                                             Completion::Answer { id, result }
                                         });
                                     } else {
@@ -147,11 +296,38 @@ impl Engine {
                                     }
                                 }
                                 Some(Command::Cancel(id)) => {
-                                    if let Some(cancel) = cancellations.get(&id) { let _ = cancel.send(true); }
+                                    if let Some((cancel, _)) = cancellations.get(&id) { let _ = cancel.send(true); }
+                                }
+                                Some(Command::Prepare(request)) => {
+                                    let id = request.id | (1 << 63);
+                                    let denied = if demo || harness.is_none() { Some("Isolated AI is not available") }
+                                        else if cancellations.len() >= 2 || (!request.foreground && cancellations.values().any(|(_, background)| *background)) { Some("Execution capacity is reserved or busy") }
+                                        else if cancellations.contains_key(&id) { Some("Preparation identity is already active") } else { None };
+                                    if let Some(reason) = denied {
+                                        if request.reply.try_send(Prepared { id: request.id, result: PreparationResult::NotAdmitted(reason.into()) }).is_err() {
+                                            notify(Notice::Connection { ready: false, message: "Preparation admission could not reach storage; restart to inspect the interrupted ledger.".into() });
+                                            stopping = true;
+                                        }
+                                        let _ = request.wake.try_send(crate::worker::Command::Wake);
+                                    } else if let Some(harness) = harness.clone() {
+                                        let (cancel, cancelled) = watch::channel(false);
+                                        cancellations.insert(id, (cancel, !request.foreground));
+                                        let progress = streaming.clone();
+                                        let context = context.clone();
+                                        tasks.spawn(async move {
+                                            let question = Question {
+                                                id, question: "Prepare a concise evidence-led meeting briefing. Return ONLY a JSON object with summary (string), sources (array of objects with title and url strings), and gaps (array of strings). Use supplied read-only workplace tools. Cite only original URLs actually returned by those tools. If evidence is unavailable, say so in gaps. Never send private meeting data to public web. No writes.".into(),
+                                                meeting: Some(request.event.clone()), public_topic: None,
+                                            };
+                                            let result = ask(harness, question, cancelled, progress, context, false).await.map(Arc::new);
+                                            Completion::Prepared { request, result }
+                                        });
+                                    }
                                 }
                                 Some(Command::Stop) | None => {
                                     stopping = true;
-                                    for cancel in cancellations.values() { let _ = cancel.send(true); }
+                                    connected.store(false, Ordering::Release);
+                                    for (cancel, _) in cancellations.values() { let _ = cancel.send(true); }
                                 }
                             }
                         }
@@ -160,25 +336,42 @@ impl Engine {
                                 Some(Ok(Completion::Connection(result))) => {
                                     starting = false;
                                     match result {
-                                        Ok(connected) => {
-                                            harness = Some(connected);
-                                            notify(Notice::Connection { ready: true, message: "Connected: isolated SDK, registered read-only tools".into() });
+                                        Ok(connected_harness) => {
+                                            harness = Some(connected_harness);
+                                            if !stopping { connected.store(true, Ordering::Release); }
+                                            notify(Notice::Connection { ready: !stopping, message: if stopping { "Stopping the isolated SDK; no new work is admitted" } else { "Connected: isolated SDK, registered read-only tools" }.into() });
                                         }
                                         Err(error) => { notify(Notice::Connection { ready: false, message: error }); }
                                     }
                                 }
                                 Some(Ok(Completion::Answer { id, result })) => {
                                     cancellations.remove(&id);
+                                    active.store(cancellations.len(), Ordering::Release);
+                                    if let Some(wake) = &wake { let _ = wake.try_send(crate::worker::Command::Wake); }
                                     notify(Notice::Answer { id, result });
+                                }
+                                Some(Ok(Completion::Prepared { request, result })) => {
+                                    cancellations.remove(&(request.id | (1 << 63)));
+                                    active.store(cancellations.len(), Ordering::Release);
+                                    if request.reply.try_send(Prepared { id: request.id, result: PreparationResult::Finished(result) }).is_err() {
+                                        notify(Notice::Connection { ready: false, message: "Preparation outcome could not reach storage; restart and inspect the interrupted ledger. It was not replayed.".into() });
+                                        stopping = true;
+                                    }
+                                    let _ = request.wake.try_send(crate::worker::Command::Wake);
                                 }
                                 Some(Err(error)) => {
                                     notify(Notice::Connection { ready: false, message: format!("AI worker failed: {error}; reconnect after restart") });
                                     stopping = true;
-                                    for cancel in cancellations.values() { let _ = cancel.send(true); }
+                                    for (cancel, _) in cancellations.values() { let _ = cancel.send(true); }
                                 }
                                 None => {}
                             }
                         }
+                    }
+                    active.store(cancellations.len(), Ordering::Release);
+                    if stopping {
+                        connected.store(false, Ordering::Release);
+                        for (cancel, _) in cancellations.values() { let _ = cancel.send(true); }
                     }
                     if stopping && tasks.is_empty() {
                         if let Some(harness) = harness
@@ -190,6 +383,11 @@ impl Engine {
                     }
                 }
             });
+            drop(runtime);
+            connected.store(false, Ordering::Release);
+            active.store(0, Ordering::Release);
+            ended.store(true, Ordering::Release);
+            if let Some(wake) = wake { let _ = wake.try_send(crate::worker::Command::Wake); }
             let _ = finished.send(());
         }).map_err(|e| format!("Create AI worker: {e}"))?;
         Ok(Self {
@@ -197,6 +395,10 @@ impl Engine {
             notices,
             progress,
             done: Some(done),
+            ready,
+            occupied,
+            terminated,
+            stop,
         })
     }
 }
@@ -207,9 +409,18 @@ async fn ask(
     mut cancel: watch::Receiver<bool>,
     progress: Arc<Mutex<Progress>>,
     context: egui::Context,
+    stream: bool,
 ) -> Result<String, String> {
     if question.question.trim().is_empty() || question.question.len() > 8000 {
         return Err("Question must contain 1-8000 bytes; nothing was submitted".into());
+    }
+    let meeting = question
+        .meeting
+        .map(|event| serde_json::to_string(&event))
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    if meeting.as_ref().is_some_and(|data| data.len() > 32_000) {
+        return Err("Meeting context exceeds the 32 KiB limit; no AI request was made".into());
     }
     let session = tokio::time::timeout(
         Duration::from_secs(30),
@@ -218,11 +429,6 @@ async fn ask(
     .await
     .map_err(|_| "Creating the SDK session timed out".to_string())??;
     let mut subscription = session.subscribe();
-    let meeting = question
-        .meeting
-        .map(|event| serde_json::to_string(&event))
-        .transpose()
-        .map_err(|e| e.to_string())?;
     let prompt = format!(
         "Answer the question concisely (normally under 180 words). Cite original sources as markdown links when supplied by tools; never fabricate URLs. If relevant data is inaccessible, state that explicitly. No briefing is required to answer. No writes.\nMEETING_DATA: {}\nUSER_QUESTION: {}",
         meeting
@@ -232,9 +438,16 @@ async fn ask(
     );
     let result = async {
         if *cancel.borrow() { return Err("Cancelled before sending".into()); }
-        tokio::time::timeout(Duration::from_secs(30), session.send(MessageOptions::new(prompt))).await
-            .map_err(|_| "Sending the SDK request timed out".to_string())?
-            .map_err(|e| format!("SDK request failed: {e}"))?;
+        tokio::select! {
+            changed = cancel.changed() => {
+                let _ = changed;
+                return Err("Cancelled while submitting the request; provider outcome may be unknown".into());
+            }
+            sent = tokio::time::timeout(Duration::from_secs(30), session.send(MessageOptions::new(prompt))) => {
+                sent.map_err(|_| "Sending the SDK request timed out".to_string())?
+                    .map_err(|e| format!("SDK request failed: {e}"))?;
+            }
+        }
         let timeout = tokio::time::sleep(Duration::from_secs(120));
         tokio::pin!(timeout);
         let mut accumulated = String::new();
@@ -253,7 +466,7 @@ async fn ask(
                             if let Some(delta) = event.data.get("deltaContent").and_then(|v| v.as_str()) {
                                 if accumulated.len() + delta.len() > 64_000 { return Err("AI answer exceeded the 64 KiB response limit".into()); }
                                 accumulated.push_str(delta);
-                                if last_update.elapsed() >= Duration::from_millis(100) {
+                                if stream && last_update.elapsed() >= Duration::from_millis(100) {
                                     let mut state = progress.lock().map_err(|_| "AI progress state is unavailable")?;
                                     *state = Progress { id: question.id, text: Arc::new(accumulated.clone()) };
                                     drop(state);

@@ -17,6 +17,7 @@ url = "=2.5.8"
 github-copilot-sdk = { version = "=1.0.18-preview.0", default-features = false, features = ["runtime"] }
 tokio = { version = "=1.53.2", features = ["rt-multi-thread", "sync", "time", "macros"] }
 async-trait = "=0.1.92"
+tray-icon = { version = "=0.26.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "=3.27.0"

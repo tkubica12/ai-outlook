@@ -17,6 +17,7 @@ pub struct Preferences {
     pub accent: usize,
     pub view: View,
     pub paused: bool,
+    pub prepare_enabled: bool,
 }
 
 impl Default for Preferences {
@@ -26,6 +27,7 @@ impl Default for Preferences {
             accent: 0,
             view: View::WorkWeek,
             paused: false,
+            prepare_enabled: false,
         }
     }
 }
@@ -285,5 +287,68 @@ impl Store {
             )
             .optional()
             .map_err(|e| e.to_string())
+    }
+
+    pub fn queue(&self) -> Result<crate::scheduler::Queue> {
+        use rusqlite::OptionalExtension;
+        let payload: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT payload FROM settings WHERE key='preparation-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let mut queue = match payload {
+            Some(payload) => serde_json::from_str(&payload)
+                .map_err(|e| format!("Read preparation ledger: {e}"))?,
+            None => crate::scheduler::Queue::default(),
+        };
+        queue.recover()?;
+        Ok(queue)
+    }
+
+    pub fn save_queue(&self, queue: &crate::scheduler::Queue) -> Result<()> {
+        let payload = serde_json::to_string(queue).map_err(|e| e.to_string())?;
+        if payload.len() > 32 * 1024 * 1024 {
+            return Err(
+                "Preparation ledger reached its 32 MiB safety limit; history was not discarded"
+                    .into(),
+            );
+        }
+        self.connection.execute("INSERT INTO settings VALUES('preparation-v1',?1) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload", [payload])
+            .map_err(|e| format!("Save preparation ledger: {e}"))?;
+        Ok(())
+    }
+
+    pub fn save_prepared(
+        &mut self,
+        queue: &crate::scheduler::Queue,
+        id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        let json = serde_json::to_string(payload).map_err(|e| e.to_string())?;
+        let ledger = serde_json::to_string(queue).map_err(|e| e.to_string())?;
+        if ledger.len() > 32 * 1024 * 1024 {
+            return Err("Preparation ledger reached its safety limit".into());
+        }
+        let transaction = self.connection.transaction().map_err(|e| e.to_string())?;
+        transaction.execute("INSERT INTO briefings SELECT ?1,COALESCE(MAX(version),0)+1,?2,?3 FROM briefings WHERE meeting_id=?1",
+            params![id, json, chrono::Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
+        let saved: String = transaction
+            .query_row(
+                "SELECT payload FROM briefings WHERE meeting_id=?1 ORDER BY version DESC LIMIT 1",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if saved != json {
+            return Err("Saved briefing read-back did not match".into());
+        }
+        transaction.execute("INSERT INTO settings VALUES('preparation-v1',?1) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload", [ledger]).map_err(|e| e.to_string())?;
+        transaction
+            .commit()
+            .map_err(|e| format!("Commit prepared briefing: {e}"))
     }
 }

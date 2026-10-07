@@ -13,7 +13,7 @@ remain unchanged for configuration and stored-data compatibility.
 ## Native Windows foundation
 
 `native\` is a real Rust-rendered Windows application using egui/eframe,
-AccessKit and OpenGL; it does not run a browser, WebView, Python server or Node.
+AccessKit and OpenGL; the UI needs no browser, WebView or Python/Node bridge.
 It currently provides day/work-week/week/month calendars, category/search filters,
 meeting details and saved briefings, commands, and persisted light/dark appearance
 with one of four accents. Disk access, SQLite, cache parsing and calendar layout
@@ -40,14 +40,25 @@ For explicitly synthetic, offline UI review, use `--demo` (200 meetings) or
 `--stress` (5,000 meetings), with a separate `--state` directory. These modes
 are clearly labelled and never replace production calendar data.
 Keyboard: Ctrl+F search, Ctrl+K commands, 1-4 views, T today, Alt+Left/Right
-period, Up/Down meeting, Escape close, and Tab/Shift+Tab focus.
+period, Up/Down meeting, Escape close, Tab/Shift+Tab focus, and Ctrl+Shift+Q Exit.
 
-The calendar remains cache-first; native live synchronization and tray scheduling
-are not implemented yet. A lazy official Rust Copilot SDK adapter and native
+The calendar remains cache-first; native live synchronization is not implemented
+yet. A durable native scheduler and Windows tray now retain future preparation
+jobs and promote an opened unfinished meeting. Preparation is **disabled by
+default**; Settings provides enable/pause and **Exit Tomlook**; meeting details
+provide explicit retry. Closing/minimizing hides the calendar when its tray is
+available, rather than stopping it. Restore through
+the Tomlook tray icon; Exit stops the workers. Each state directory allows one
+native instance, preventing duplicate preparation from a second launch.
+
+A lazy official Rust Copilot SDK adapter and native
 global/meeting assistant pilot are now available. SDK work, streaming and
 cancellation run on a separate executor with bounded channels; opening the
 calendar or assistant does not start Copilot. See [native setup](native/README.md)
 for the separate identity/configuration boundary and remaining acceptance gates.
+The SDK still owns an installed proprietary Copilot runtime child, not a Rust
+rewrite of that runtime. Preparation requires isolated authentication and
+verified calendar coverage; fixture tests do not establish live readiness.
 The retained web prototype below is still the live-data reference during migration.
 
 ## Web prototype: connect live data

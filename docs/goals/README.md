@@ -30,11 +30,16 @@ before migration and parity are verified.
 Current engineering slices: the native calendar foundation was committed and
 pushed as `d16ed22`. The Rust SDK isolation/control pilot includes child-only
 state options, lazy async execution, read-only policies and a native assistant
-shell. Its no-model runtime probe created a session only in the isolated probe
+shell, committed/pushed as `56669e6`. Its no-model runtime probe created a session only in the isolated probe
 directory. ISO-01 remains **BLOCKED for full acceptance** on isolated sign-in,
 approved live-call limits, live connector checks and regular App observation.
 NATIVE-01 still needs its full benchmark/input/appearance matrix and owner
-acceptance. QUEUE-01 and ASSIST-01 are not complete; an assistant shell is not
+acceptance. The subsequent QUEUE-01 engineering slice implements durable bounded
+admission, newest foreground promotion, atomic saved-result completion, native
+tray controls, profile ownership and priority shutdown. Local fixtures cover
+hidden notification backpressure, obsolete results and interrupted recovery;
+they do not prove authenticated tray operation or the full latency contract.
+QUEUE-01 and ASSIST-01 are not complete; an assistant shell is not
 accepted live integration. Private run records remain in the execution artifacts.
 
 ## What changed and why

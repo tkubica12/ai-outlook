@@ -41,16 +41,31 @@ pub struct Tomlook {
     active_request: Option<u64>,
     answer: Option<Arc<String>>,
     ai_error: Option<String>,
+    activity: Arc<tomlook::worker::Activity>,
+    tray: Option<crate::tray::Tray>,
+    in_tray: bool,
+    last_prepared: String,
 }
 
 impl Tomlook {
     pub fn new(
         creation: &eframe::CreationContext<'_>,
         options: Options,
-        shutdown: Arc<std::sync::Mutex<Option<ai::Shutdown>>>,
+        shutdown: Arc<std::sync::Mutex<crate::Lifecycle>>,
     ) -> Self {
         let (worker, mut error) = match Worker::start(options.clone(), creation.egui_ctx.clone()) {
-            Ok(worker) => (Some(worker), None),
+            Ok(mut worker) => {
+                if let Ok(mut handle) = shutdown.lock()
+                    && let Some(done) = worker.done.take()
+                {
+                    handle.storage = Some(tomlook::worker::Shutdown {
+                        commands: worker.commands.clone(),
+                        stop: worker.stop.clone(),
+                        done,
+                    });
+                }
+                (Some(worker), None)
+            }
             Err(error) => (None, Some(error)),
         };
         let ai = match Engine::start(
@@ -62,8 +77,8 @@ impl Tomlook {
                 match shutdown.lock() {
                     Ok(mut handle) => {
                         if let Some(done) = engine.done.take() {
-                            *handle = Some(ai::Shutdown {
-                                commands: engine.commands.clone(),
+                            handle.ai = Some(ai::Shutdown {
+                                stop: engine.stop.clone(),
                                 done,
                             });
                         }
@@ -77,7 +92,29 @@ impl Tomlook {
                 None
             }
         };
-        Self::initial(worker, ai, error)
+        if let (Some(worker), Some(engine)) = (&worker, &ai)
+            && let Err(problem) = worker.commands.try_send(Command::AttachAi {
+                commands: engine.commands.clone(),
+                ready: engine.ready.clone(),
+                occupied: engine.occupied.clone(),
+                terminated: engine.terminated.clone(),
+            })
+        {
+            error = Some(format!("Attach preparation engine: {problem}"));
+        }
+        let tray = match crate::tray::Tray::new(
+            creation.egui_ctx.clone(),
+            worker.as_ref().map(|worker| worker.commands.clone()),
+        ) {
+            Ok(tray) => Some(tray),
+            Err(problem) => {
+                error = Some(problem);
+                None
+            }
+        };
+        let mut app = Self::initial(worker, ai, error);
+        app.tray = tray;
+        app
     }
 
     fn initial(worker: Option<Worker>, ai: Option<Engine>, error: Option<String>) -> Self {
@@ -107,6 +144,10 @@ impl Tomlook {
             active_request: None,
             answer: None,
             ai_error: None,
+            activity: Arc::new(tomlook::worker::Activity::default()),
+            tray: None,
+            in_tray: false,
+            last_prepared: String::new(),
         }
     }
 
@@ -125,6 +166,37 @@ impl Tomlook {
     }
 
     fn receive(&mut self) {
+        if let Some(activity) = self
+            .worker
+            .as_ref()
+            .and_then(|worker| worker.activity.try_lock().ok().map(|value| value.clone()))
+            && activity.revision != self.activity.revision
+        {
+            self.preferences.prepare_enabled = activity.enabled;
+            self.preferences.paused = activity.paused;
+            if let Some(error) = &activity.error {
+                self.error = Some(error.clone());
+            } else if self.error == self.activity.error {
+                self.error = None;
+            }
+            self.activity = activity;
+            if let Some(index) = self.selected
+                && let Some(job) = self
+                    .activity
+                    .queue
+                    .jobs
+                    .get(&self.calendar.events[index].id)
+                && job.state == tomlook::scheduler::State::Completed
+                && self.last_prepared != job.fingerprint
+            {
+                self.last_prepared = job.fingerprint.clone();
+                self.detail_revision += 1;
+                self.command(Command::Detail {
+                    revision: self.detail_revision,
+                    id: self.calendar.events[index].id.clone(),
+                });
+            }
+        }
         for _ in 0..16 {
             let Some(notice) = self
                 .worker
@@ -197,6 +269,7 @@ impl Tomlook {
                 ai::Notice::Connection { ready, message } => {
                     self.ai_ready = ready;
                     self.connection = message;
+                    self.command(Command::Wake);
                 }
                 ai::Notice::Answer { id, result } if self.active_request == Some(id) => {
                     self.active_request = None;
@@ -215,6 +288,10 @@ impl Tomlook {
                 ai::Notice::Stopped => {
                     self.ai_ready = false;
                     self.connection = "AI stopped".into();
+                    if self.active_request.take().is_some() {
+                        self.answer = None;
+                        self.ai_error = Some("AI stopped without a completed answer; provider outcome may be unknown".into());
+                    }
                 }
             }
         }
@@ -233,6 +310,8 @@ impl Tomlook {
             revision: self.detail_revision,
             id: self.calendar.events[index].id.clone(),
         });
+        self.command(Command::Promote(self.calendar.events[index].id.clone()));
+        self.last_prepared.clear();
     }
 
     fn accent(&self) -> Color32 {
@@ -281,6 +360,9 @@ impl Tomlook {
 
     fn shortcuts(&mut self, context: &egui::Context) {
         let consume = |modifiers, key| context.input_mut(|input| input.consume_key(modifiers, key));
+        if consume(Modifiers::CTRL | Modifiers::SHIFT, Key::Q) {
+            self.exit(context);
+        }
         if consume(Modifiers::CTRL, Key::K) {
             self.palette = !self.palette;
         }
@@ -636,149 +718,156 @@ impl Tomlook {
         let dates = self.preferences.view.days(self.anchor);
         let query = self.query.to_lowercase();
         let day_width = ((ui.available_width() - 48.0) / dates.len() as f32).max(95.0);
-        ui.horizontal(|ui| {
-            ui.add_space(48.0);
-            for date in &dates {
-                ui.add_sized(
-                    [day_width - 8.0, 35.0],
-                    egui::Label::new(
-                        RichText::new(date.format("%a %e").to_string())
-                            .strong()
-                            .color(if *date == Local::now().date_naive() {
-                                self.accent()
-                            } else {
-                                ui.visuals().text_color()
-                            }),
-                    ),
-                );
-            }
-        });
-        let mut first = 8.0_f32;
-        let mut last = 18.0_f32;
-        let mut all_day_rows = 0;
-        for date in &dates {
-            if let Some(day) = self.calendar.days.get(date) {
-                all_day_rows = all_day_rows.max(day.all_day.len().min(4));
-                for slot in &day.timed {
-                    if self.calendar.matches(slot.event, &query, &self.category) {
-                        first = first.min((slot.start_minute / 60.0).floor());
-                        last = last.max((slot.end_minute / 60.0).ceil());
-                    }
-                }
-            }
-        }
-        if all_day_rows > 0 {
-            ui.horizontal_top(|ui| {
-                ui.add_sized([40.0, 23.0], egui::Label::new("All day").wrap());
-                for date in &dates {
-                    ui.vertical(|ui| {
-                        ui.set_width(day_width - 8.0);
-                        let indices = self
-                            .calendar
-                            .days
-                            .get(date)
-                            .map(|day| day.all_day.clone())
-                            .unwrap_or_default();
-                        egui::ScrollArea::vertical()
-                            .id_salt(("all-day", date))
-                            .max_height(140.0)
-                            .show(ui, |ui| {
-                                for index in indices {
-                                    if self.calendar.matches(index, &query, &self.category) {
-                                        self.event_button(
-                                            ui,
-                                            index,
-                                            Vec2::new(day_width - 8.0, 23.0),
-                                        );
-                                    }
-                                }
-                            });
-                    });
-                }
-            });
-        }
-        egui::ScrollArea::both()
-            .id_salt("calendar-timeline")
+        egui::ScrollArea::horizontal()
+            .id_salt("timeline-horizontal")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let height = (last - first) * 58.0;
-                let (rect, _) = ui.allocate_exact_size(
-                    Vec2::new(48.0 + day_width * dates.len() as f32, height),
-                    egui::Sense::hover(),
-                );
-                let line = ui.visuals().widgets.noninteractive.bg_stroke;
-                for hour in first as i32..=last as i32 {
-                    let y = rect.top() + (hour as f32 - first) * 58.0;
-                    ui.painter().text(
-                        egui::pos2(rect.left(), y + 5.0),
-                        egui::Align2::LEFT_TOP,
-                        format!("{hour:02}:00"),
-                        egui::FontId::proportional(11.0),
-                        ui.visuals().weak_text_color(),
-                    );
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(rect.left() + 48.0, y),
-                            egui::pos2(rect.right(), y),
-                        ],
-                        line,
-                    );
-                }
-                for (column, date) in dates.iter().enumerate() {
-                    let x = rect.left() + 48.0 + column as f32 * day_width;
-                    ui.painter().line_segment(
-                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                        line,
-                    );
-                    let day = self.calendar.days.get(date).cloned().unwrap_or_default();
-                    if !self.calendar.coverage.contains(date) {
-                        ui.painter().text(
-                            egui::pos2(x + 8.0, rect.top() + 6.0),
-                            egui::Align2::LEFT_TOP,
-                            "Not synced",
-                            egui::FontId::proportional(11.0),
-                            ui.visuals().weak_text_color(),
-                        );
-                    }
-                    for slot in day.timed {
-                        if !self.calendar.matches(slot.event, &query, &self.category) {
-                            continue;
-                        }
-                        let width = (day_width - 8.0) / slot.lanes.max(1) as f32;
-                        let y = rect.top() + (slot.start_minute / 60.0 - first) * 58.0;
-                        let card = egui::Rect::from_min_size(
-                            egui::pos2(x + 4.0 + slot.lane as f32 * width, y + 2.0),
-                            Vec2::new(
-                                (width - 3.0).max(12.0),
-                                ((slot.end_minute - slot.start_minute) / 60.0 * 58.0 - 4.0)
-                                    .max(23.0),
+                ui.set_min_width(48.0 + day_width * dates.len() as f32);
+                ui.horizontal(|ui| {
+                    ui.add_space(48.0);
+                    for date in &dates {
+                        ui.add_sized(
+                            [day_width - 8.0, 35.0],
+                            egui::Label::new(
+                                RichText::new(date.format("%a %e").to_string())
+                                    .strong()
+                                    .color(if *date == Local::now().date_naive() {
+                                        self.accent()
+                                    } else {
+                                        ui.visuals().text_color()
+                                    }),
                             ),
                         );
-                        let event = &self.calendar.events[slot.event];
-                        let text = format!(
-                            "{}  {}",
-                            event.start.with_timezone(&Local).format("%H:%M"),
-                            event.title
-                        );
-                        let button = egui::Button::new(RichText::new(text).size(12.0))
-                            .selected(self.selected == Some(slot.event))
-                            .truncate();
-                        if ui
-                            .put(card, button)
-                            .on_hover_text(format!(
-                                "{}\n{}\n{}",
-                                event.title, event.location, event.category
-                            ))
-                            .clicked()
-                        {
-                            self.select(slot.event);
+                    }
+                });
+                let mut first = 8.0_f32;
+                let mut last = 18.0_f32;
+                let mut all_day_rows = 0;
+                for date in &dates {
+                    if let Some(day) = self.calendar.days.get(date) {
+                        all_day_rows = all_day_rows.max(day.all_day.len().min(4));
+                        for slot in &day.timed {
+                            if self.calendar.matches(slot.event, &query, &self.category) {
+                                first = first.min((slot.start_minute / 60.0).floor());
+                                last = last.max((slot.end_minute / 60.0).ceil());
+                            }
                         }
-                        ui.painter().line_segment(
-                            [card.left_top(), card.left_bottom()],
-                            Stroke::new(2.0, self.accent()),
-                        );
                     }
                 }
+                if all_day_rows > 0 {
+                    ui.horizontal_top(|ui| {
+                        ui.add_sized([40.0, 23.0], egui::Label::new("All day").wrap());
+                        for date in &dates {
+                            ui.vertical(|ui| {
+                                ui.set_width(day_width - 8.0);
+                                let indices = self
+                                    .calendar
+                                    .days
+                                    .get(date)
+                                    .map(|day| day.all_day.clone())
+                                    .unwrap_or_default();
+                                egui::ScrollArea::vertical()
+                                    .id_salt(("all-day", date))
+                                    .max_height(140.0)
+                                    .show(ui, |ui| {
+                                        for index in indices {
+                                            if self.calendar.matches(index, &query, &self.category)
+                                            {
+                                                self.event_button(
+                                                    ui,
+                                                    index,
+                                                    Vec2::new(day_width - 8.0, 23.0),
+                                                );
+                                            }
+                                        }
+                                    });
+                            });
+                        }
+                    });
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("calendar-timeline")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let height = (last - first) * 58.0;
+                        let (rect, _) = ui.allocate_exact_size(
+                            Vec2::new(48.0 + day_width * dates.len() as f32, height),
+                            egui::Sense::hover(),
+                        );
+                        let line = ui.visuals().widgets.noninteractive.bg_stroke;
+                        for hour in first as i32..=last as i32 {
+                            let y = rect.top() + (hour as f32 - first) * 58.0;
+                            ui.painter().text(
+                                egui::pos2(rect.left(), y + 5.0),
+                                egui::Align2::LEFT_TOP,
+                                format!("{hour:02}:00"),
+                                egui::FontId::proportional(11.0),
+                                ui.visuals().weak_text_color(),
+                            );
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(rect.left() + 48.0, y),
+                                    egui::pos2(rect.right(), y),
+                                ],
+                                line,
+                            );
+                        }
+                        for (column, date) in dates.iter().enumerate() {
+                            let x = rect.left() + 48.0 + column as f32 * day_width;
+                            ui.painter().line_segment(
+                                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                                line,
+                            );
+                            let day = self.calendar.days.get(date).cloned().unwrap_or_default();
+                            if !self.calendar.coverage.contains(date) {
+                                ui.painter().text(
+                                    egui::pos2(x + 8.0, rect.top() + 6.0),
+                                    egui::Align2::LEFT_TOP,
+                                    "Not synced",
+                                    egui::FontId::proportional(11.0),
+                                    ui.visuals().weak_text_color(),
+                                );
+                            }
+                            for slot in day.timed {
+                                if !self.calendar.matches(slot.event, &query, &self.category) {
+                                    continue;
+                                }
+                                let width = (day_width - 8.0) / slot.lanes.max(1) as f32;
+                                let y = rect.top() + (slot.start_minute / 60.0 - first) * 58.0;
+                                let card = egui::Rect::from_min_size(
+                                    egui::pos2(x + 4.0 + slot.lane as f32 * width, y + 2.0),
+                                    Vec2::new(
+                                        (width - 3.0).max(12.0),
+                                        ((slot.end_minute - slot.start_minute) / 60.0 * 58.0 - 4.0)
+                                            .max(23.0),
+                                    ),
+                                );
+                                let event = &self.calendar.events[slot.event];
+                                let text = format!(
+                                    "{}  {}",
+                                    event.start.with_timezone(&Local).format("%H:%M"),
+                                    event.title
+                                );
+                                let button = egui::Button::new(RichText::new(text).size(12.0))
+                                    .selected(self.selected == Some(slot.event))
+                                    .truncate();
+                                if ui
+                                    .put(card, button)
+                                    .on_hover_text(format!(
+                                        "{}\n{}\n{}",
+                                        event.title, event.location, event.category
+                                    ))
+                                    .clicked()
+                                {
+                                    self.select(slot.event);
+                                }
+                                ui.painter().line_segment(
+                                    [card.left_top(), card.left_bottom()],
+                                    Stroke::new(2.0, self.accent()),
+                                );
+                            }
+                        }
+                    });
             });
     }
 
@@ -836,7 +925,33 @@ impl Tomlook {
         ui.add_space(16.0);
         ui.separator();
         ui.weak("PREPARATION");
+        if !self.activity.enabled {
+            ui.weak("Automatic preparation is disabled.");
+        } else if self.activity.paused {
+            ui.weak("Preparation is paused.");
+        } else if !self.ai_ready {
+            ui.weak("Waiting for the isolated SDK.");
+        }
+        if let Some(job) = self.activity.queue.jobs.get(&event.id).cloned() {
+            ui.label(format!("{:?}: {}", job.state, job.message));
+            if matches!(
+                job.state,
+                tomlook::scheduler::State::Failed | tomlook::scheduler::State::Interrupted
+            ) && ui.button("Retry preparation (AI)").clicked()
+            {
+                self.command(Command::Retry(event.id.clone()));
+            }
+            if job.state != tomlook::scheduler::State::Completed && self.briefing.is_some() {
+                ui.weak("Previous saved briefing; not current completion evidence.");
+            }
+        }
         if let Some(briefing) = &self.briefing {
+            if let Some(evidence) = briefing
+                .get("evidence_status")
+                .and_then(|value| value.as_str())
+            {
+                ui.weak(evidence);
+            }
             if let Some(summary) = briefing.get("summary").and_then(|v| v.as_str()) {
                 ui.label(summary);
             }
@@ -846,6 +961,7 @@ impl Tomlook {
                 ("open_questions", "Open questions"),
                 ("risks", "Risks"),
                 ("warnings", "Evidence gaps"),
+                ("gaps", "Evidence gaps"),
             ] {
                 if let Some(items) = briefing
                     .get(field)
@@ -1024,6 +1140,22 @@ impl Tomlook {
                     if ui.selectable_label(self.preferences.accent == i, *label).clicked() { self.preferences.accent = i; self.save_preferences(); }
                 }
                 ui.separator(); ui.weak("Calendar data stays local. Existing prototype files are never overwritten.");
+                ui.separator();
+                if ui.checkbox(&mut self.preferences.prepare_enabled, "Prepare upcoming meetings (read-only AI)").changed() { self.command(Command::EnablePreparation(self.preferences.prepare_enabled)); }
+                if ui.checkbox(&mut self.preferences.paused, "Pause preparation").changed() { self.command(Command::PausePreparation(self.preferences.paused)); }
+                ui.weak("Seven future days; 64 queued; at most one background job. Failed/interrupted jobs require explicit retry.");
+                if let Some(error) = &self.activity.error {
+                    ui.label(error);
+                    if ui.add_enabled(self.activity.queue.flights.is_empty(), egui::Button::new("Resume other queued jobs")).clicked() {
+                        self.command(Command::ResumeQueued);
+                    }
+                }
+                ui.weak(if self.tray.is_some() {
+                    "Closing or minimizing hides Tomlook in the tray. Use Exit Tomlook to stop all work."
+                } else {
+                    "Tray unavailable. Closing Tomlook exits instead of hiding it."
+                });
+                if ui.button("Exit Tomlook").clicked() { self.exit(context); }
             });
             self.settings = open;
         }
@@ -1058,8 +1190,26 @@ impl Tomlook {
                         self.assistant = true;
                         self.palette = false;
                     }
+                    if ui
+                        .add_enabled(self.tray.is_some(), egui::Button::new("Hide in tray"))
+                        .clicked()
+                    {
+                        context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                        self.cancel_ai();
+                    }
+                    if ui.button("Exit Tomlook").clicked() {
+                        self.exit(context);
+                    }
                 });
             self.palette &= open;
+        }
+    }
+
+    fn exit(&self, context: &egui::Context) {
+        if let Some(tray) = &self.tray {
+            tray.exit(context);
+        } else {
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 }
@@ -1067,6 +1217,27 @@ impl Tomlook {
 impl eframe::App for Tomlook {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        let viewport = context.input(|input| input.viewport().clone());
+        if let Some(tray) = &self.tray {
+            if viewport.close_requested()
+                && !tray.exiting.load(std::sync::atomic::Ordering::Acquire)
+            {
+                context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.cancel_ai();
+            } else if viewport.minimized == Some(true) && !self.in_tray {
+                self.in_tray = true;
+                context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.cancel_ai();
+            } else if viewport.minimized == Some(false) {
+                self.in_tray = false;
+            }
+        }
+        if let Some(error) =
+            context.data_mut(|data| data.remove_temp::<String>(Id::new("tray-error")))
+        {
+            self.error = Some(error);
+        }
         self.receive();
         self.style(&context);
         self.shortcuts(&context);
@@ -1093,7 +1264,21 @@ impl eframe::App for Tomlook {
                         self.calendar.warnings.first().expect("nonempty")
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.weak("Native Rust / no web server");
+                        let queued = self.activity.queued;
+                        let deferred = self.activity.deferred;
+                        ui.weak(format!(
+                            "Preparation {} | {queued} queued / {deferred} deferred | {} running",
+                            if !self.activity.enabled {
+                                "disabled"
+                            } else if self.activity.paused {
+                                "paused"
+                            } else if !self.ai_ready {
+                                "waiting for isolated AI"
+                            } else {
+                                "enabled"
+                            },
+                            self.activity.queue.flights.len()
+                        ));
                     });
                 });
             }
@@ -1135,13 +1320,19 @@ mod tests {
 
     #[test]
     fn ai_notices_are_drained_without_storage_notices_and_stale_answers_are_ignored() {
-        let (output, notices) = std::sync::mpsc::channel();
+        let output = Arc::new(ai::Notices::default());
+        let notices = output.clone();
         let (commands, _input) = tokio::sync::mpsc::channel(1);
+        let (stop, _stopped) = tokio::sync::watch::channel(false);
         let engine = Engine {
             commands,
             notices,
             progress: Arc::new(std::sync::Mutex::new(ai::Progress::default())),
             done: None,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            occupied: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            terminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop,
         };
         let mut app = Tomlook::initial(None, Some(engine), None);
         output

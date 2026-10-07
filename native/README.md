@@ -28,7 +28,7 @@ for the external-runtime adapter.
 The pinned official Rust `github-copilot-sdk` is an adapter to an installed
 Copilot runtime, not a Rust rewrite of that proprietary runtime. It starts only
 after **Connect isolated SDK**. The native application uses a separate SDK
-executor, two request slots, bounded command/notice channels and coalesced
+executor, two request slots, bounded command channels and coalesced notices and
 streaming. Calendar navigation does not wait for a model or briefing.
 Ctrl+Space opens the assistant, Ctrl+Enter submits a question from its editor,
 and Escape closes it and requests cancellation. Global questions and captured
@@ -71,10 +71,51 @@ profile, not the matching personal session path. This does **not** establish
 authenticated calendar/briefing/chat isolation after restart, regular App
 visibility, or live permission-request compatibility.
 
-Native live calendar retrieval, tray preparation and promotion, persistent
-conversation history, structured answer sources/proposals and full assistant
-acceptance are still pending. AI output is currently plain text, not verified
+Native live calendar retrieval, persistent conversation history, structured
+answer sources/proposals and full assistant acceptance are still pending.
+AI output is currently plain text, not verified
 source objects. The web prototype remains the live-data reference.
+
+## Durable preparation and Windows tray pilot
+
+Preparation is disabled by default. Enable it explicitly in Settings only after
+setting up the isolated identity and verified calendar data. The rolling horizon
+is seven 24-hour days, including ongoing meetings, with 64 pending jobs, two
+execution slots and at most one background preparation. Overflow remains durably
+deferred. The latest opened eligible unfinished meeting takes foreground
+precedence; unknown calendar coverage never becomes permission to prepare.
+
+The SQLite worker owns the versioned queue ledger, admission and result
+validation. Input/analysis fingerprints reject obsolete completions. Publishing
+a validated result and its completed ledger is one transaction with exact
+payload read-back. Model-provided citations are explicitly **not independently
+verified**. Previous briefings survive failed or cancelled attempts.
+Minute deadlines renew eligibility; metadata requests do not rescan all event
+fingerprints. Completed preparations reach storage even when no UI notices are
+consumed. Storage notices and SDK connection/focused-answer notices are bounded
+and coalesced, so a hidden window cannot block a worker on notification delivery.
+
+Closing/minimizing hides the window when its tray was created successfully.
+Left-click the T tray icon or choose **Open Tomlook** to restore. The tray also
+has pause/resume and **Exit Tomlook (stop AI)**. Settings and Commands expose
+explicit Exit, with Ctrl+Shift+Q as its shortcut. Exit uses a priority SDK stop
+signal, waits outside UI callbacks, then drains ready preparation results and
+stops storage through an independent stop flag. Final persistence failures are
+reported by the shutdown acknowledgement, not hidden in unconsumed UI notices.
+Unavailable tray controls are disabled rather than silently doing nothing.
+Windows exclusive profile ownership prevents a second instance
+from starting another scheduler for the same state.
+
+Failures stop automatic preparation and survive restart. Failed/interrupted
+jobs require explicit retry after inspecting the saved evidence.
+**Resume other queued jobs** acknowledges the global stop without replaying
+failed/interrupted operations. Lost executor outcomes become interrupted, not
+success. Restart never silently replays an interrupted provider operation.
+Synthetic modes still make zero provider calls even when preparation is enabled.
+
+This is an engineering pilot. Authenticated hidden-window completion, actual
+tray restoration, owned-child exit under live load and the full performance
+matrix still require their recorded product observations.
 
 Acceptance still requires the full cold/warm/interaction/DPI/input matrix,
 saturated live AI comparison, actual isolation/tray observations and owner

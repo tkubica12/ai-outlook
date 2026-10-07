@@ -113,6 +113,7 @@ fn cache_and_settings_survive_restart_without_claiming_coverage() {
             accent: 3,
             view: View::Month,
             paused: true,
+            prepare_enabled: false,
         })
         .unwrap();
     drop(store);
