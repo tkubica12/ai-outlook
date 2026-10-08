@@ -110,7 +110,25 @@ disables the shared system keychain in favor of the app-scoped profile.
 Both boundaries remain enabled for explicit tokens. This implements an
 authentication path, not evidence of a signed-in product or live integration.
 
-For a no-model, no-connector handshake/session probe from this package directory:
+**Isolated stored login (recommended).** Sign in once into Tomlook's own Copilot
+home, with ambient tokens hidden and the shared keychain disabled:
+
+```powershell
+$env:COPILOT_HOME = "$env:LOCALAPPDATA\Tomlook\copilot"; $env:COPILOT_DISABLE_KEYTAR = '1'
+Remove-Item Env:GH_TOKEN, Env:GITHUB_TOKEN, Env:COPILOT_GITHUB_TOKEN -ErrorAction SilentlyContinue
+copilot login   # approve in the browser; answer y to store in this app-owned folder
+```
+
+Then set `"use_stored_login": true` in `connections.json`. Tomlook connects
+only if the runtime reports the stored `user` identity; `gh`, environment or
+other identity kinds are rejected and the runtime is stopped. The token is a
+plain-text file under `%LOCALAPPDATA%\Tomlook\copilot`, readable by your Windows
+account and separate from your regular Copilot profile. `use_stored_login` and
+`copilot_credential_env` are mutually exclusive. Connect checks identity only;
+it sends no model request.
+
+For a no-model, no-connector handshake/session probe from this package directory
+(add `--stored-login` to check the isolated stored login):
 
 ```powershell
 cargo run --locked --bin sdk-probe -- D:\TomlookProbe C:\path\to\installed\copilot.exe

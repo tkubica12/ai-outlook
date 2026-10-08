@@ -94,6 +94,7 @@ fn connection_configuration_rejects_ambient_credentials_unknown_servers_and_unsa
         runtime,
         model: "sample".into(),
         copilot_credential_env: None,
+        use_stored_login: false,
         servers: Default::default(),
     };
     config.servers.insert(

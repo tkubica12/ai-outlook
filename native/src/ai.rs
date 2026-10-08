@@ -274,9 +274,9 @@ impl Engine {
                                             let health = harness.health().await;
                                             match health {
                                                 Ok(health) if health.authenticated => Ok(Arc::new(harness)),
-                                                Ok(_) => {
+                                                Ok(health) => {
                                                     harness.stop().await?;
-                                                    Err("Isolated Copilot identity is missing. Use the Tomlook-only profile or configure an explicit TOMLOOK_* Copilot credential variable; personal tokens and gh login are never imported.".into())
+                                                    Err(format!("Isolated Copilot identity is not accepted: {}. Run Tomlook's isolated sign-in and set use_stored_login, or configure an explicit TOMLOOK_* credential; personal tokens and gh login are never imported.", health.rejected.unwrap_or_else(|| "not signed in".into())))
                                                 }
                                                 Err(error) => {
                                                     let stopped = harness.stop().await;

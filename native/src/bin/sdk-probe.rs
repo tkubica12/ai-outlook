@@ -20,6 +20,11 @@ async fn run() -> Result<(), String> {
         .next()
         .map(PathBuf::from)
         .ok_or("Installed runtime path is required")?;
+    let stored_login = match args.next().as_deref().and_then(|arg| arg.to_str()) {
+        None => false,
+        Some("--stored-login") => true,
+        Some(_) => return Err("Optional third argument must be --stored-login".into()),
+    };
     if args.next().is_some() {
         return Err("Unexpected argument".into());
     }
@@ -27,6 +32,7 @@ async fn run() -> Result<(), String> {
         runtime,
         model: "gpt-5.6-terra".into(),
         copilot_credential_env: None,
+        use_stored_login: stored_login,
         servers: Default::default(),
     };
     let harness = Harness::start(&root, config).await?;

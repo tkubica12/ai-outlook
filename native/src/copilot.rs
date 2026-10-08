@@ -97,6 +97,10 @@ pub struct Config {
     pub model: String,
     #[serde(default)]
     pub copilot_credential_env: Option<String>,
+    /// Use the login saved by `copilot login` inside Tomlook's own Copilot home.
+    /// Accepted only when the runtime reports a stored-user identity, never `gh`/env fallback.
+    #[serde(default)]
+    pub use_stored_login: bool,
     #[serde(default)]
     pub servers: BTreeMap<String, Connection>,
 }
@@ -145,6 +149,11 @@ impl Config {
             return Err(
                 "copilot_credential_env must name an app-specific TOMLOOK_ environment variable"
                     .into(),
+            );
+        }
+        if self.use_stored_login && self.copilot_credential_env.is_some() {
+            return Err(
+                "Choose either use_stored_login or copilot_credential_env, not both".into(),
             );
         }
         for (name, connection) in &self.servers {
@@ -251,6 +260,7 @@ impl Config {
             crate::scheduler::PROFILE,
             &self.model,
             &self.copilot_credential_env,
+            self.use_stored_login,
             token,
             &self.runtime,
             metadata.len(),
@@ -264,6 +274,28 @@ impl Config {
         use sha2::{Digest, Sha256};
         Ok(format!("{:x}", Sha256::digest(input)))
     }
+}
+
+/// Accept only the identity source configured for Tomlook's own profile.
+fn accepted_identity(
+    config: &Config,
+    auth: &github_copilot_sdk::GetAuthStatusResponse,
+) -> Result<(), String> {
+    if !auth.is_authenticated {
+        return Err("Tomlook's isolated profile is not signed in".into());
+    }
+    let kind = auth.auth_type.as_deref().unwrap_or("unknown");
+    if config.use_stored_login && kind != "user" {
+        return Err(format!(
+            "Rejected '{kind}' identity; only Tomlook's own stored login is allowed"
+        ));
+    }
+    if !config.use_stored_login && config.copilot_credential_env.is_none() {
+        return Err(format!(
+            "Rejected '{kind}' identity; no Tomlook identity source is configured"
+        ));
+    }
+    Ok(())
 }
 
 pub fn isolated_options(root: &Path, runtime: &Path) -> ClientOptions {
@@ -297,8 +329,15 @@ pub fn isolated_options(root: &Path, runtime: &Path) -> ClientOptions {
     options
 }
 
-fn authenticated_options(root: &Path, runtime: &Path, token: Option<String>) -> ClientOptions {
+fn authenticated_options(
+    root: &Path,
+    runtime: &Path,
+    token: Option<String>,
+    stored_login: bool,
+) -> ClientOptions {
     let mut options = isolated_options(root, runtime);
+    // Ambient token variables stay stripped; health() rejects any non-stored identity.
+    options.use_logged_in_user = Some(stored_login && token.is_none());
     if let Some(token) = token {
         // The SDK injects its explicit token before applying env_remove.
         options
@@ -494,6 +533,9 @@ pub struct Health {
     pub authenticated: bool,
     pub isolated: bool,
     pub session_id: Option<String>,
+    pub auth_type: Option<String>,
+    pub login: Option<String>,
+    pub rejected: Option<String>,
 }
 
 impl Harness {
@@ -528,7 +570,8 @@ impl Harness {
             .map_err(|e| format!("Create isolated workspace: {e}"))?;
         std::fs::create_dir_all(root.join("copilot"))
             .map_err(|e| format!("Create isolated Copilot home: {e}"))?;
-        let mut options = authenticated_options(root, &config.runtime, token);
+        let mut options =
+            authenticated_options(root, &config.runtime, token, config.use_stored_login);
         if let Some(env) = &config.copilot_credential_env {
             options.env_remove.push(env.into());
         }
@@ -559,10 +602,14 @@ impl Harness {
                 self.redactor
                     .text(&format!("SDK authentication check failed: {e}"))
             })?;
+        let rejected = accepted_identity(&self.config, &auth).err();
         Ok(Health {
-            authenticated: auth.is_authenticated,
+            authenticated: auth.is_authenticated && rejected.is_none(),
             isolated: true,
             session_id: None,
+            auth_type: auth.auth_type,
+            login: auth.login,
+            rejected,
         })
     }
 
@@ -641,6 +688,7 @@ mod tests {
             runtime: std::env::current_exe().unwrap(),
             model: "fixture-model".into(),
             copilot_credential_env: None,
+            use_stored_login: false,
             servers: BTreeMap::from([(
                 "WorkIQ-Mail".into(),
                 Connection {
@@ -729,10 +777,49 @@ mod tests {
     }
 
     #[test]
+    fn stored_login_accepts_only_the_profile_user_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = std::env::current_exe().unwrap();
+        let stored = authenticated_options(root.path(), &runtime, None, true);
+        assert_eq!(stored.use_logged_in_user, Some(true));
+        assert!(stored.github_token.is_none());
+        assert!(stored.env_remove.iter().any(|name| name == "GH_TOKEN"));
+        assert_eq!(stored.mode, ClientMode::Empty);
+        assert_eq!(stored.base_directory, Some(root.path().join("copilot")));
+        assert_eq!(
+            authenticated_options(root.path(), &runtime, None, false).use_logged_in_user,
+            Some(false)
+        );
+        let mut config = Config {
+            runtime,
+            model: "fixture-model".into(),
+            copilot_credential_env: None,
+            use_stored_login: true,
+            servers: BTreeMap::new(),
+        };
+        let status = |authenticated: bool, kind: &str| {
+            serde_json::from_value::<github_copilot_sdk::GetAuthStatusResponse>(
+                serde_json::json!({ "isAuthenticated": authenticated, "authType": kind }),
+            )
+            .unwrap()
+        };
+        assert!(accepted_identity(&config, &status(true, "user")).is_ok());
+        for fallback in ["gh-cli", "env", "token", "hmac"] {
+            assert!(accepted_identity(&config, &status(true, fallback)).is_err());
+        }
+        assert!(accepted_identity(&config, &status(false, "user")).is_err());
+        config.use_stored_login = false;
+        assert!(accepted_identity(&config, &status(true, "user")).is_err());
+        config.use_stored_login = true;
+        config.copilot_credential_env = Some("TOMLOOK_FIXTURE".into());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn explicit_sdk_credential_preserves_isolation_without_stripping_its_injected_token() {
         let root = tempfile::tempdir().unwrap();
         let runtime = std::env::current_exe().unwrap();
-        let disabled = authenticated_options(root.path(), &runtime, None);
+        let disabled = authenticated_options(root.path(), &runtime, None, false);
         assert!(disabled.github_token.is_none());
         assert!(
             disabled
@@ -740,8 +827,12 @@ mod tests {
                 .iter()
                 .any(|name| name == "COPILOT_SDK_AUTH_TOKEN")
         );
-        let enabled =
-            authenticated_options(root.path(), &runtime, Some("fixture-sdk-token".into()));
+        let enabled = authenticated_options(
+            root.path(),
+            &runtime,
+            Some("fixture-sdk-token".into()),
+            true,
+        );
         assert_eq!(enabled.github_token.as_deref(), Some("fixture-sdk-token"));
         assert!(
             !enabled
@@ -774,6 +865,7 @@ mod tests {
             runtime: std::env::current_exe().unwrap(),
             model: "fixture-model".into(),
             copilot_credential_env: Some(env.clone()),
+            use_stored_login: false,
             servers: BTreeMap::new(),
         };
         config.validate().unwrap();
