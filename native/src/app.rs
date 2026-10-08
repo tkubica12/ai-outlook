@@ -73,6 +73,9 @@ pub struct Tomlook {
     tray: Option<crate::tray::Tray>,
     in_tray: bool,
     last_prepared: String,
+    startup: Option<crate::StartupTrace>,
+    startup_built: bool,
+    lifecycle: Option<Arc<std::sync::Mutex<crate::Lifecycle>>>,
 }
 
 impl Tomlook {
@@ -80,22 +83,29 @@ impl Tomlook {
         creation: &eframe::CreationContext<'_>,
         options: Options,
         shutdown: Arc<std::sync::Mutex<crate::Lifecycle>>,
+        startup: Option<crate::StartupTrace>,
+        preload: Option<tomlook::worker::Preload>,
     ) -> Self {
-        let (worker, mut error) = match Worker::start(options.clone(), creation.egui_ctx.clone()) {
-            Ok(mut worker) => {
-                if let Ok(mut handle) = shutdown.lock()
-                    && let Some(done) = worker.done.take()
-                {
-                    handle.storage = Some(tomlook::worker::Shutdown {
-                        commands: worker.commands.clone(),
-                        stop: worker.stop.clone(),
-                        done,
-                    });
+        let mut startup = startup;
+        if let Some(trace) = &mut startup {
+            trace.mark("window_and_gl_ready");
+        }
+        let (worker, mut error) =
+            match Worker::start_with(options.clone(), creation.egui_ctx.clone(), preload) {
+                Ok(mut worker) => {
+                    if let Ok(mut handle) = shutdown.lock()
+                        && let Some(done) = worker.done.take()
+                    {
+                        handle.storage = Some(tomlook::worker::Shutdown {
+                            commands: worker.commands.clone(),
+                            stop: worker.stop.clone(),
+                            done,
+                        });
+                    }
+                    (Some(worker), None)
                 }
-                (Some(worker), None)
-            }
-            Err(error) => (None, Some(error)),
-        };
+                Err(error) => (None, Some(error)),
+            };
         let ai = match Engine::start(
             options.state,
             options.demo.is_some(),
@@ -131,6 +141,9 @@ impl Tomlook {
         {
             error = Some(format!("Attach preparation engine: {problem}"));
         }
+        if let Some(trace) = &mut startup {
+            trace.mark("workers_started");
+        }
         let tray = match crate::tray::Tray::new(
             creation.egui_ctx.clone(),
             worker.as_ref().map(|worker| worker.commands.clone()),
@@ -143,6 +156,13 @@ impl Tomlook {
         };
         let mut app = Self::initial(worker, ai, error);
         app.tray = tray;
+        if startup.is_some() {
+            app.lifecycle = Some(shutdown);
+        }
+        if let Some(trace) = &mut startup {
+            trace.mark("constructor_complete");
+        }
+        app.startup = startup;
         app
     }
 
@@ -186,6 +206,9 @@ impl Tomlook {
             tray: None,
             in_tray: false,
             last_prepared: String::new(),
+            startup: None,
+            startup_built: false,
+            lifecycle: None,
         }
     }
 
@@ -276,6 +299,11 @@ impl Tomlook {
                     self.calendar = calendar;
                     self.preferences = preferences;
                     self.loading = false;
+                    if let Some(trace) = &mut self.startup
+                        && !self.startup_built
+                    {
+                        trace.mark("calendar_notice_received");
+                    }
                     if changed && let Some(index) = self.selected {
                         self.command(Command::Detail {
                             revision: self.detail_revision,
@@ -1565,6 +1593,35 @@ impl Tomlook {
 impl eframe::App for Tomlook {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        if self.startup_built
+            && let Some(mut trace) = self.startup.take()
+        {
+            trace.mark("next_frame_started");
+            let marks: serde_json::Map<String, serde_json::Value> = trace
+                .marks
+                .iter()
+                .map(|(name, ms)| ((*name).to_string(), (*ms).into()))
+                .collect();
+            let record = serde_json::json!({
+                "landmark": "Start of the frame following the first loaded-calendar frame; the loaded frame was already handed to presentation",
+                "marks_ms": marks,
+                "first_calendar_frame_presented_ms": trace.launched.elapsed().as_secs_f64() * 1000.0,
+                "first_calendar_frame_presented_unix_ms": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64() * 1000.0)
+                    .unwrap_or(f64::NAN),
+                "events": self.calendar.events.len(),
+                "coverage_days": self.calendar.coverage.len(),
+                "error": self.error,
+                "trace_path": trace.path,
+            });
+            if let Some(lifecycle) = &self.lifecycle
+                && let Ok(mut lifecycle) = lifecycle.lock()
+            {
+                lifecycle.startup = Some(record);
+            }
+            self.exit(&context);
+        }
         let viewport = context.input(|input| input.viewport().clone());
         if let Some(tray) = &self.tray {
             if viewport.close_requested()
@@ -1659,6 +1716,13 @@ impl eframe::App for Tomlook {
             }
         });
         self.overlays(&context);
+        if self.startup.is_some() && !self.startup_built && !self.loading {
+            self.startup_built = true;
+            if let Some(trace) = &mut self.startup {
+                trace.mark("loaded_frame_built");
+            }
+            context.request_repaint();
+        }
     }
 }
 

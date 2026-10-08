@@ -173,8 +173,62 @@ pub fn validate_prepared(raw: &str, key: &str) -> Result<serde_json::Value, Stri
     Ok(value)
 }
 
+type Loaded = Result<(Store, Arc<Calendar>, Preferences), String>;
+
+/// Calendar load started before native window creation so disk/parse work overlaps GPU setup.
+pub struct Preload(Receiver<Loaded>);
+
+impl Preload {
+    pub fn start(options: &Options) -> Result<Self, String> {
+        let options = options.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("tomlook-preload".into())
+            .spawn(move || {
+                let loaded = Store::open(&options.state).and_then(|mut store| {
+                    load(&mut store, &options)
+                        .map(|(calendar, preferences)| (store, calendar, preferences))
+                });
+                let _ = sender.send(loaded);
+            })
+            .map_err(|e| format!("Create calendar preload worker: {e}"))?;
+        Ok(Self(receiver))
+    }
+}
+
+fn load(store: &mut Store, options: &Options) -> Result<(Arc<Calendar>, Preferences), String> {
+    let preferences = store.preferences()?;
+    let calendar = if let Some(count) = options.demo {
+        let now = chrono::Local::now();
+        let coverage = (0..42)
+            .map(|i| calendar::monday(now.date_naive()) + chrono::Duration::days(i))
+            .collect();
+        Calendar::build(
+            calendar::demo(now, count),
+            coverage,
+            vec!["Synthetic preview - no live AI or work data".into()],
+        )?
+    } else {
+        let saved = store.calendar()?;
+        if saved.events.is_empty() {
+            store.import_legacy(&options.legacy_root)?.unwrap_or(saved)
+        } else {
+            saved
+        }
+    };
+    Ok((Arc::new(calendar), preferences))
+}
+
 impl Worker {
     pub fn start(options: Options, context: egui::Context) -> Result<Self, String> {
+        Self::start_with(options, context, None)
+    }
+
+    pub fn start_with(
+        options: Options,
+        context: egui::Context,
+        preload: Option<Preload>,
+    ) -> Result<Self, String> {
         let (commands, input) = mpsc::sync_channel(64);
         let notices = Arc::new(Notices::default());
         let output = notices.clone();
@@ -194,36 +248,16 @@ impl Worker {
                     result.is_ok()
                 };
                 let run = || -> Result<(), String> {
-                let mut store = match Store::open(&options.state) {
-                    Ok(store) => store,
-                    Err(error) => return Err(error),
+                let (mut store, calendar, preferences) = match preload.map(|preload| preload.0.recv()) {
+                    Some(Ok(loaded)) => loaded?,
+                    Some(Err(_)) => return Err("Calendar preload worker stopped unexpectedly".into()),
+                    None => {
+                        let mut store = Store::open(&options.state)?;
+                        let (calendar, preferences) = load(&mut store, &options)?;
+                        (store, calendar, preferences)
+                    }
                 };
-                let load = |store: &mut Store| -> Result<(Arc<Calendar>, Preferences), String> {
-                    let preferences = store.preferences()?;
-                    let calendar = if let Some(count) = options.demo {
-                        let now = chrono::Local::now();
-                        let coverage = (0..42)
-                            .map(|i| calendar::monday(now.date_naive()) + chrono::Duration::days(i))
-                            .collect();
-                        Calendar::build(
-                            calendar::demo(now, count),
-                            coverage,
-                            vec!["Synthetic preview - no live AI or work data".into()],
-                        )?
-                    } else {
-                        let saved = store.calendar()?;
-                        if saved.events.is_empty() {
-                            store.import_legacy(&options.legacy_root)?.unwrap_or(saved)
-                        } else {
-                            saved
-                        }
-                    };
-                    Ok((Arc::new(calendar), preferences))
-                };
-                let (mut calendar, mut preferences) = match load(&mut store) {
-                    Ok((calendar, preferences)) => { notify(Notice::Loaded { calendar: calendar.clone(), preferences: preferences.clone() }); (calendar, preferences) }
-                    Err(error) => return Err(error),
-                };
+                let (mut calendar, mut preferences) = { notify(Notice::Loaded { calendar: calendar.clone(), preferences: preferences.clone() }); (calendar, preferences) };
                 let mut queue = store.queue()?;
                 let (result_sender, mut results) = tokio::sync::mpsc::channel::<ai::Prepared>(2);
                 let mut sdk: Option<Sdk> = None;
@@ -359,7 +393,7 @@ impl Worker {
                             },
                             Err(error) => Err(error),
                         },
-                        Command::Reload => match load(&mut store) {
+                        Command::Reload => match load(&mut store, &options) {
                             Ok((next, next_preferences)) => {
                                 calendar = next;
                                 dirty = true;

@@ -7,13 +7,28 @@ mod tray;
 struct Lifecycle {
     ai: Option<tomlook::ai::Shutdown>,
     storage: Option<tomlook::worker::Shutdown>,
+    startup: Option<serde_json::Value>,
+}
+
+/// Opt-in measurement mode: records the first presented calendar frame, then exits normally.
+pub struct StartupTrace {
+    pub path: PathBuf,
+    pub launched: std::time::Instant,
+    pub marks: Vec<(&'static str, f64)>,
+}
+
+impl StartupTrace {
+    pub fn mark(&mut self, name: &'static str) {
+        self.marks
+            .push((name, self.launched.elapsed().as_secs_f64() * 1000.0));
+    }
 }
 
 use eframe::egui;
 use std::path::PathBuf;
 use tomlook::worker::Options;
 
-fn options() -> Result<Options, String> {
+fn options() -> Result<(Options, Option<PathBuf>), String> {
     let state = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .ok_or("LOCALAPPDATA is not defined; Windows application state is required")?
@@ -23,9 +38,17 @@ fn options() -> Result<Options, String> {
         legacy_root: std::env::current_dir().map_err(|e| e.to_string())?,
         demo: None,
     };
+    let mut trace = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
+            Some("--startup-trace") => {
+                trace = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or("--startup-trace needs a file path")?,
+                )
+            }
             Some("--state") => {
                 result.state = args
                     .next()
@@ -47,11 +70,16 @@ fn options() -> Result<Options, String> {
         .map_err(|e| format!("Resolve Tomlook state directory: {e}"))?;
     result.legacy_root = std::path::absolute(result.legacy_root)
         .map_err(|e| format!("Resolve legacy directory: {e}"))?;
-    Ok(result)
+    let trace = trace
+        .map(std::path::absolute)
+        .transpose()
+        .map_err(|e| format!("Resolve startup trace path: {e}"))?;
+    Ok((result, trace))
 }
 
 fn main() -> eframe::Result {
-    let options = match options() {
+    let launched = std::time::Instant::now();
+    let (options, trace) = match options() {
         Ok(options) => options,
         Err(error) => {
             show_error(error);
@@ -65,6 +93,7 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
     };
+    let preload = tomlook::worker::Preload::start(&options).ok();
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1366.0, 860.0])
@@ -74,14 +103,32 @@ fn main() -> eframe::Result {
     };
     let shutdown = std::sync::Arc::new(std::sync::Mutex::new(Lifecycle::default()));
     let on_shutdown = shutdown.clone();
+    let trace_path = trace.clone();
+    let startup = trace.map(|path| {
+        let mut trace = StartupTrace {
+            path,
+            launched,
+            marks: Vec::new(),
+        };
+        trace.mark("before_native_window");
+        trace
+    });
     let result = eframe::run_native(
         "Tomlook",
         native,
-        Box::new(move |creation| Ok(Box::new(app::Tomlook::new(creation, options, on_shutdown)))),
+        Box::new(move |creation| {
+            Ok(Box::new(app::Tomlook::new(
+                creation,
+                options,
+                on_shutdown,
+                startup,
+                preload,
+            )))
+        }),
     );
     // The UI is already closed; shutdown waiting never blocks a UI callback.
     let mut errors = Vec::new();
-    {
+    let startup_record = {
         let mut coordinator = match shutdown.lock() {
             Ok(coordinator) => coordinator,
             Err(poisoned) => {
@@ -112,6 +159,17 @@ fn main() -> eframe::Result {
                     errors.push(format!("Storage shutdown could not be verified: {error}"))
                 }
             }
+        }
+        coordinator.startup.take()
+    };
+    if let Some(path) = trace_path {
+        let mut record = startup_record.unwrap_or_else(|| {
+            serde_json::json!({ "error": "Window closed before a calendar frame was presented" })
+        });
+        record["shutdown_complete_ms"] = (launched.elapsed().as_secs_f64() * 1000.0).into();
+        record["shutdown_errors"] = errors.clone().into();
+        if let Err(error) = std::fs::write(&path, record.to_string()) {
+            errors.push(format!("Write startup trace: {error}"));
         }
     }
     if !errors.is_empty() {

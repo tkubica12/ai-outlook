@@ -201,3 +201,56 @@ fn duplicate_identity_is_rejected_not_silently_overwritten() {
     events[1].id = events[0].id.clone();
     assert!(Calendar::build(events, BTreeSet::new(), Vec::new()).is_err());
 }
+
+#[test]
+fn frozen_fixture_inventory_is_deterministic_and_fully_indexed() {
+    for count in [200, 5000] {
+        let events = calendar::fixture(count);
+        assert_eq!(events.len(), count);
+        let again = calendar::fixture(count);
+        assert!(events.iter().zip(&again).all(|(a, b)| {
+            a.id == b.id && a.title == b.title && a.start == b.start && a.end == b.end
+        }));
+        let all_day = events.iter().filter(|e| e.is_all_day).count();
+        let multi_day = events
+            .iter()
+            .filter(|e| e.title == "Multi-day offsite")
+            .count();
+        let dst: Vec<_> = events
+            .iter()
+            .filter(|e| e.title == "DST boundary checkpoint")
+            .collect();
+        let czech = events
+            .iter()
+            .filter(|e| e.title.contains("žluťoučký"))
+            .count();
+        assert_eq!(all_day, count / 50);
+        assert_eq!(multi_day, count / 50);
+        assert_eq!(dst.len(), count / 50);
+        assert!(czech >= count / 12);
+        assert!(dst.iter().all(|e| e.end - e.start == Duration::hours(3)
+            && e.start.offset().local_minus_utc() == 7200
+            && e.end.offset().local_minus_utc() == 3600));
+        let built = Calendar::build(events, calendar::fixture_coverage(), Vec::new()).unwrap();
+        assert_eq!(built.coverage.len(), 42);
+        assert!(built.coverage.first() == Some(&calendar::fixture_anchor()));
+        let indexed: BTreeSet<_> = built
+            .days
+            .values()
+            .flat_map(|day| day.events.iter().copied())
+            .collect();
+        assert_eq!(indexed.len(), count, "every event is reachable from a day");
+        assert!(
+            built
+                .days
+                .values()
+                .any(|day| day.timed.iter().any(|slot| slot.lanes > 1))
+        );
+        assert!(built.events.iter().all(|e| {
+            built
+                .coverage
+                .contains(&e.start.with_timezone(&Local).date_naive())
+                || e.title == "DST boundary checkpoint"
+        }));
+    }
+}

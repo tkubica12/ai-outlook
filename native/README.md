@@ -199,3 +199,31 @@ matrix still require their recorded product observations.
 Acceptance still requires the full cold/warm/interaction/DPI/input matrix,
 saturated live AI comparison, actual isolation/tray observations and owner
 approval. A small test corpus or one idle measurement is not that acceptance.
+
+## Startup measurement
+
+`calendar::fixture` is the frozen benchmark corpus (`tomlook-frozen-fixture-v1`):
+42 days from 5 October 2026, 200 or 5,000 events, with overlaps, all-day and
+multi-day events, long Czech text and a 25 October DST-end event. Offsets are
+fixed, so content does not depend on today's date. Seed a new, empty owned
+state directory (existing state is refused):
+
+```powershell
+cargo run --locked --release --bin seed-fixture -- D:\TomlookBench\state-5000 5000
+target\release\tomlook.exe --state D:\TomlookBench\state-5000 --legacy-root D:\TomlookBench\empty --startup-trace D:\TomlookBench\trace.json
+```
+
+`--startup-trace` records monotonic landmarks from `main`, the window/GL ready
+point, worker/tray construction, calendar receipt and the start of the frame
+after the first loaded-calendar frame. It then exits through the normal Exit
+path and writes JSON only after the window closes, never from a UI callback.
+Process creation time comes from the harness. It is opt-in and makes no AI calls.
+
+The cached calendar now loads on a preload thread started before the native
+window, overlapping SQLite read/parse/layout with window and OpenGL setup. The
+open store is handed to the storage worker, which remains its only later user.
+On the owner's laptop this cut the median 5,000-event wait after UI construction
+from about 92 ms to 2 ms. Window/OpenGL creation (about 130-190 ms median, with
+rare spikes inside that eframe stage above 800 ms shortly after resume from standby) and
+pre-`main` process loading now dominate. These are trial observations, not the
+full owner-approved startup matrix.

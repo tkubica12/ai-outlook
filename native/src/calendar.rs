@@ -270,6 +270,110 @@ impl Calendar {
     }
 }
 
+pub const FIXTURE_VERSION: &str = "tomlook-frozen-fixture-v1";
+
+pub fn fixture_anchor() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 10, 5).expect("valid fixture anchor")
+}
+
+/// Deterministic benchmark corpus independent of the current date and machine timezone.
+/// Offsets follow Central European rules; 25 October 2026 is the DST-end boundary.
+pub fn fixture(count: usize) -> Vec<Event> {
+    let anchor = fixture_anchor();
+    let dst_end = NaiveDate::from_ymd_opt(2026, 10, 25).expect("valid DST boundary");
+    let zoned = |date: NaiveDate, hour: u32, minute: u32| {
+        let offset = if date < dst_end || (date == dst_end && hour < 2) {
+            2
+        } else {
+            1
+        };
+        date.and_hms_opt(hour, minute, 0)
+            .expect("valid fixture time")
+            .and_local_timezone(FixedOffset::east_opt(offset * 3600).expect("valid offset"))
+            .single()
+            .expect("fixed offsets are unambiguous")
+    };
+    let subjects = [
+        "Product direction",
+        "Customer architecture review",
+        "Design focus",
+        "Delivery checkpoint",
+        "Engineering workshop",
+        "Weekly planning",
+    ];
+    let czech = "Česká porada – připravujeme další krok: přehled závazků, rizik, \
+                 rozpočtu a odpovědností pro žluťoučký kůň úpěl ďábelské ódy";
+    (0..count)
+        .map(|i| {
+            let kind = i % 50;
+            let date = anchor + Duration::days((i % 42) as i64);
+            let hour = 8 + ((i / 42) % 9) as u32;
+            let minute = if i % 3 == 0 { 15 } else { 0 };
+            let (start, end, all_day, title) = match kind {
+                0 => {
+                    let start = zoned(date, 0, 0);
+                    (
+                        start,
+                        zoned(date + Duration::days(1), 0, 0),
+                        true,
+                        "All-day planning".to_string(),
+                    )
+                }
+                1 => {
+                    let first = anchor + Duration::days((i % 40) as i64);
+                    (
+                        zoned(first, 9, 0),
+                        zoned(first + Duration::days(2), 17, 0),
+                        false,
+                        "Multi-day offsite".to_string(),
+                    )
+                }
+                2 => (
+                    zoned(dst_end, 1, 30),
+                    zoned(dst_end, 3, 30),
+                    false,
+                    "DST boundary checkpoint".to_string(),
+                ),
+                _ => {
+                    let start = zoned(date, hour, minute);
+                    let title = if i % 10 == 7 {
+                        format!("{czech} #{i}")
+                    } else {
+                        subjects[i % subjects.len()].to_string()
+                    };
+                    (
+                        start,
+                        start + Duration::minutes(if i % 5 == 0 { 90 } else { 45 }),
+                        false,
+                        title,
+                    )
+                }
+            };
+            Event {
+                id: format!("fixture-{i:05}"),
+                title,
+                start,
+                end,
+                category: ["Customer", "Internal", "Focus"][i % 3].into(),
+                attendees: vec!["Alex (synthetic)".into(), "Jamie (synthetic)".into()],
+                organizer: "Morgan (synthetic)".into(),
+                location: if i % 2 == 0 { "Online" } else { "Room 2" }.into(),
+                status: "accepted".into(),
+                briefing_status: "not_ready".into(),
+                is_all_day: all_day,
+                source_url: None,
+                extra: BTreeMap::new(),
+            }
+        })
+        .collect()
+}
+
+pub fn fixture_coverage() -> BTreeSet<NaiveDate> {
+    (0..42)
+        .map(|i| fixture_anchor() + Duration::days(i))
+        .collect()
+}
+
 pub fn demo(now: DateTime<Local>, count: usize) -> Vec<Event> {
     let subjects = [
         "Product direction",

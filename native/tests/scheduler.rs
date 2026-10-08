@@ -592,3 +592,50 @@ fn shutdown_acknowledgement_reports_failed_final_persistence() {
         .unwrap_err();
     assert!(error.contains("Fixture persistence failure"), "{error}");
 }
+
+#[test]
+fn preloaded_cached_calendar_is_handed_to_the_owning_worker() {
+    let root = tempfile::tempdir().unwrap();
+    let fixture = Calendar::build(
+        calendar::fixture(5000),
+        calendar::fixture_coverage(),
+        Vec::new(),
+    )
+    .unwrap();
+    Store::open(root.path())
+        .unwrap()
+        .save_calendar(&fixture)
+        .unwrap();
+    let options = Options {
+        state: root.path().to_owned(),
+        legacy_root: root.path().join("no-legacy"),
+        demo: None,
+    };
+    let preload = tomlook::worker::Preload::start(&options).unwrap();
+    let mut worker =
+        Worker::start_with(options, eframe::egui::Context::default(), Some(preload)).unwrap();
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    let loaded = loop {
+        if let Ok(tomlook::worker::Notice::Loaded { calendar, .. }) = worker.notices.try_recv() {
+            break calendar;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "preloaded calendar was not delivered"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert_eq!(loaded.events.len(), 5000);
+    assert_eq!(loaded.coverage, fixture.coverage);
+    worker
+        .stop
+        .store(true, std::sync::atomic::Ordering::Release);
+    let _ = worker.commands.try_send(Command::Wake);
+    worker
+        .done
+        .take()
+        .unwrap()
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+}
