@@ -40,6 +40,8 @@ pub struct Flight {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Queue {
     pub version: u32,
+    #[serde(default = "default_analysis_revision")]
+    pub analysis_revision: String,
     pub jobs: BTreeMap<String, Job>,
     pub flights: BTreeMap<u64, Flight>,
     pub sequence: u64,
@@ -51,6 +53,7 @@ impl Default for Queue {
     fn default() -> Self {
         Self {
             version: 1,
+            analysis_revision: default_analysis_revision(),
             jobs: BTreeMap::new(),
             flights: BTreeMap::new(),
             sequence: 0,
@@ -60,12 +63,23 @@ impl Default for Queue {
 }
 
 pub fn fingerprint(event: &Event) -> String {
+    fingerprint_for(event, PROFILE)
+}
+
+fn default_analysis_revision() -> String {
+    PROFILE.into()
+}
+
+fn fingerprint_for(event: &Event, analysis_revision: &str) -> String {
     // Exclude preparation status: publishing a briefing must not schedule itself again.
     let mut input = event.clone();
     input.briefing_status.clear();
     let json = serde_json::to_vec(&input).expect("Event contains only JSON-serializable values");
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest([PROFILE.as_bytes(), &json].concat()))
+    format!(
+        "{:x}",
+        Sha256::digest([analysis_revision.as_bytes(), &json].concat())
+    )
 }
 
 pub fn eligible(event: &Event, now: DateTime<FixedOffset>) -> bool {
@@ -79,6 +93,17 @@ pub fn eligible(event: &Event, now: DateTime<FixedOffset>) -> bool {
 }
 
 impl Queue {
+    pub fn set_analysis_revision(&mut self, revision: &str) -> Result<bool, String> {
+        if !valid_fingerprint(revision) {
+            return Err("Invalid active AI configuration identity; preparation is stopped".into());
+        }
+        if self.analysis_revision == revision {
+            return Ok(false);
+        }
+        self.analysis_revision = revision.into();
+        Ok(true)
+    }
+
     pub fn recover(&mut self) -> Result<(), String> {
         if self.version != 1 {
             return Err(format!(
@@ -88,6 +113,9 @@ impl Queue {
         }
         if self.sequence >= 1 << 63 {
             return Err("Preparation request identity limit reached".into());
+        }
+        if self.analysis_revision != PROFILE && !valid_fingerprint(&self.analysis_revision) {
+            return Err("Preparation ledger contains an invalid AI configuration identity".into());
         }
         if self.jobs.iter().any(|(id, job)| {
             id.is_empty()
@@ -161,7 +189,7 @@ impl Queue {
             }
         }
         for event in calendar.events.iter().filter(|event| eligible(event, now)) {
-            let key = fingerprint(event);
+            let key = fingerprint_for(event, &self.analysis_revision);
             let day = event.start.max(now).with_timezone(&Local).date_naive();
             let verified = calendar.coverage.contains(&day);
             let job = self.jobs.entry(event.id.clone()).or_insert_with(|| Job {
@@ -175,6 +203,7 @@ impl Queue {
                 message: String::new(),
             });
             if job.fingerprint != key {
+                let needs_retry = matches!(job.state, State::Failed | State::Interrupted);
                 *job = Job {
                     event_id: event.id.clone(),
                     fingerprint: key,
@@ -182,8 +211,12 @@ impl Queue {
                     foreground: job.foreground,
                     promotion: job.promotion,
                     verified,
-                    state: State::Deferred,
-                    message: "Meeting input changed".into(),
+                    state: if needs_retry { job.state } else { State::Deferred },
+                    message: if needs_retry {
+                        "Meeting or AI configuration changed; inspect the previous outcome before explicit retry"
+                    } else {
+                        "Meeting or AI configuration changed"
+                    }.into(),
                 };
             }
             job.verified = verified;

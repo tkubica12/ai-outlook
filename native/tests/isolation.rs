@@ -93,6 +93,7 @@ fn connection_configuration_rejects_ambient_credentials_unknown_servers_and_unsa
     let mut config = Config {
         runtime,
         model: "sample".into(),
+        copilot_credential_env: None,
         servers: Default::default(),
     };
     config.servers.insert(

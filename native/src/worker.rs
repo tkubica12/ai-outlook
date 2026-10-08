@@ -42,6 +42,7 @@ pub enum Command {
         ready: Arc<AtomicBool>,
         occupied: Arc<AtomicUsize>,
         terminated: Arc<AtomicBool>,
+        analysis_revision: Arc<std::sync::OnceLock<String>>,
     },
     Exit,
 }
@@ -127,6 +128,7 @@ struct Sdk {
     ready: Arc<AtomicBool>,
     occupied: Arc<AtomicUsize>,
     terminated: Arc<AtomicBool>,
+    analysis_revision: Arc<std::sync::OnceLock<String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -233,9 +235,15 @@ impl Worker {
                 let mut deadline = std::time::Instant::now();
                 loop {
                     exiting |= stopping.load(Ordering::Acquire);
+                    if let Some(profile) = sdk.as_ref().and_then(|sdk| sdk.analysis_revision.get()) {
+                        match queue.set_analysis_revision(profile) {
+                            Ok(changed) => dirty |= changed,
+                            Err(error) => failure = Some(error),
+                        }
+                    }
                     let now = chrono::Local::now().fixed_offset();
                     let dispatch_ready = !exiting && preferences.prepare_enabled && !preferences.paused && options.demo.is_none() && failure.is_none()
-                        && queue.can_dispatch() && sdk.as_ref().is_some_and(|sdk| sdk.ready.load(Ordering::Acquire) && !sdk.terminated.load(Ordering::Acquire) && sdk.occupied.load(Ordering::Acquire) < 2);
+                        && queue.can_dispatch() && sdk.as_ref().is_some_and(|sdk| sdk.ready.load(Ordering::Acquire) && sdk.analysis_revision.get() == Some(&queue.analysis_revision) && !sdk.terminated.load(Ordering::Acquire) && sdk.occupied.load(Ordering::Acquire) < 2);
                     let cancelled = if dirty || std::time::Instant::now() >= deadline || !results.is_empty() || exiting || dispatch_ready {
                         dirty = false;
                         deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -282,8 +290,8 @@ impl Worker {
                         failure = queue.failure.clone();
                     }
                     if !exiting && preferences.prepare_enabled && !preferences.paused && options.demo.is_none() && failure.is_none()
-                        && let Some(Sdk { commands, ready, occupied, terminated }) = &sdk
-                        && ready.load(Ordering::Acquire) && !terminated.load(Ordering::Acquire) && occupied.load(Ordering::Acquire) < 2
+                        && let Some(Sdk { commands, ready, occupied, terminated, analysis_revision }) = &sdk
+                        && ready.load(Ordering::Acquire) && analysis_revision.get() == Some(&queue.analysis_revision) && !terminated.load(Ordering::Acquire) && occupied.load(Ordering::Acquire) < 2
                             && let Some((id, flight)) = queue.dispatch() {
                                 match store.save_queue(&queue) {
                                     Ok(()) => {
@@ -365,9 +373,9 @@ impl Worker {
                         Command::Retry(id) => { if queue.retry(&id) { failure = None; } Ok(()) }
                         Command::TogglePause => { preferences.paused = !preferences.paused; store.save_preferences(&preferences) }
                         Command::Wake => Ok(()),
-                        Command::AttachAi { commands, ready, occupied, terminated } => {
+                        Command::AttachAi { commands, ready, occupied, terminated, analysis_revision } => {
                             let result = commands.try_send(ai::Command::AttachWake(wake.clone())).map_err(|e| format!("Attach preparation wake channel: {e}"));
-                            sdk = Some(Sdk { commands, ready, occupied, terminated });
+                            sdk = Some(Sdk { commands, ready, occupied, terminated, analysis_revision });
                             result
                         }
                         Command::Exit => { exiting = true; Ok(()) },

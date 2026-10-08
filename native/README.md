@@ -73,6 +73,17 @@ approval and credential entry by the owner. No sign-in or credential migration
 has been performed by the executor. `--demo` and `--stress` never start the
 SDK or connectors, even if Connect is clicked.
 
+`copilot_credential_env` is optional and defaults to `null`. An owner may instead
+name an explicitly supplied `TOMLOOK_COPILOT_TOKEN` environment variable in
+app-owned `connections.json`; never put the token value in that file. A missing
+or invalid configured credential fails before runtime launch, without fallback.
+The token goes through the SDK's explicit credential option, not CLI arguments;
+only its digest enters preparation identity. It is not copied from personal
+state. `use_logged_in_user=false` blocks automatic `gh` login; Empty mode also
+disables the shared system keychain in favor of the app-scoped profile.
+Both boundaries remain enabled for explicit tokens. This implements an
+authentication path, not evidence of a signed-in product or live integration.
+
 For a no-model, no-connector handshake/session probe from this package directory:
 
 ```powershell
@@ -105,6 +116,16 @@ validation. Input/analysis fingerprints reject obsolete completions. Publishing
 a validated result and its completed ledger is one transaction with exact
 payload read-back. Model-provided citations are explicitly **not independently
 verified**. Previous briefings survive failed or cancelled attempts.
+The connected harness freezes its model, connector endpoints, tool policy and
+resolved credential headers. A deterministic digest also includes prompt policy
+and runtime path/size/modification identity; only the digest enters the ledger.
+Changing configuration takes effect after restart and a new isolated connection.
+That connection invalidates old completions and rejects old in-flight results
+before new dispatch, including when the window is hidden. Failed/interrupted
+outcomes still require explicit retry; a configuration change cannot replay them.
+Legacy ledgers remain readable and are upgraded on connection. A ready SDK
+without its configuration identity cannot admit preparation. No credentials or
+resolved connector headers are written to the queue or briefings.
 Minute deadlines renew eligibility; metadata requests do not rescan all event
 fingerprints. Completed preparations reach storage even when no UI notices are
 consumed. Storage notices and SDK connection/focused-answer notices are bounded

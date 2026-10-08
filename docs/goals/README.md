@@ -40,12 +40,16 @@ tray controls, profile ownership and priority shutdown. Local fixtures cover
 hidden notification backpressure, obsolete results and interrupted recovery;
 they do not prove authenticated tray operation or the full latency contract.
 QUEUE-01 and ASSIST-01 are not complete; an assistant shell is not
-accepted live integration. The next offline assistant slice adds bounded
+accepted live integration. The delivered offline assistant slice adds bounded
 memory-only context drafts/last answers, isolated public topics, snapshot
 invalidation, guarded request identities/admission and focus routing. It does
 not establish persistent conversations, retrieved-source support, local
-proposals or a real-provider question. Private run records remain in the
-execution artifacts.
+proposals or a real-provider question. The subsequent offline follow-up binds
+preparation to the connected model/connector/credential/prompt configuration,
+preserves explicit retry after failed/interrupted operations, and adds an
+optional app-owned SDK credential slot without enabling ambient login.
+These repairs do not establish authenticated integration or full acceptance.
+Private run records remain in the execution artifacts.
 
 ## What changed and why
 

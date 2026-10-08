@@ -112,6 +112,7 @@ impl Tomlook {
                 ready: engine.ready.clone(),
                 occupied: engine.occupied.clone(),
                 terminated: engine.terminated.clone(),
+                analysis_revision: engine.analysis_revision.clone(),
             })
         {
             error = Some(format!("Attach preparation engine: {problem}"));
@@ -1444,6 +1445,7 @@ mod tests {
             ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             occupied: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             terminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            analysis_revision: Arc::new(std::sync::OnceLock::new()),
             stop,
         };
         let mut app = Tomlook::initial(None, Some(engine), None);
@@ -1465,6 +1467,7 @@ mod tests {
             ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             occupied: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             terminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            analysis_revision: Arc::new(std::sync::OnceLock::new()),
             stop,
         };
         let mut app = Tomlook::initial(None, Some(engine), None);

@@ -1,6 +1,6 @@
 use crate::{
     calendar::Event,
-    copilot::{Config, Harness},
+    copilot::{Config, Harness, PREPARATION_PROMPT},
 };
 use eframe::egui;
 use github_copilot_sdk::MessageOptions;
@@ -76,6 +76,7 @@ pub struct Engine {
     pub occupied: Arc<AtomicUsize>,
     pub terminated: Arc<AtomicBool>,
     pub stop: watch::Sender<bool>,
+    pub analysis_revision: Arc<std::sync::OnceLock<String>>,
 }
 
 pub struct Shutdown {
@@ -203,6 +204,8 @@ impl Engine {
         let active = occupied.clone();
         let terminated = Arc::new(AtomicBool::new(false));
         let ended = terminated.clone();
+        let analysis_revision = Arc::new(std::sync::OnceLock::new());
+        let profile = analysis_revision.clone();
         thread::Builder::new().name("tomlook-sdk".into()).spawn(move || {
             let notify = |notice| {
                 let result = output.send(notice);
@@ -265,7 +268,7 @@ impl Engine {
                                                 Ok(health) if health.authenticated => Ok(Arc::new(harness)),
                                                 Ok(_) => {
                                                     harness.stop().await?;
-                                                    Err("Isolated Copilot identity is missing. Sign in using the Tomlook-only COPILOT_HOME; personal tokens are never imported.".into())
+                                                    Err("Isolated Copilot identity is missing. Use the Tomlook-only profile or configure an explicit TOMLOOK_* Copilot credential variable; personal tokens and gh login are never imported.".into())
                                                 }
                                                 Err(error) => {
                                                     let stopped = harness.stop().await;
@@ -316,7 +319,7 @@ impl Engine {
                                         let context = context.clone();
                                         tasks.spawn(async move {
                                             let question = Question {
-                                                id, question: "Prepare a concise evidence-led meeting briefing. Return ONLY a JSON object with summary (string), sources (array of objects with title and url strings), and gaps (array of strings). Use supplied read-only workplace tools. Cite only original URLs actually returned by those tools. If evidence is unavailable, say so in gaps. Never send private meeting data to public web. No writes.".into(),
+                                                id, question: PREPARATION_PROMPT.into(),
                                                 meeting: Some(request.event.clone()), public_topic: None,
                                             };
                                             let result = ask(harness, question, cancelled, progress, context, false).await.map(Arc::new);
@@ -337,12 +340,17 @@ impl Engine {
                                     starting = false;
                                     match result {
                                         Ok(connected_harness) => {
+                                            if profile.set(connected_harness.analysis_revision.clone()).is_err() {
+                                                notify(Notice::Connection { ready: false, message: "Active AI configuration identity cannot be replaced; restart Tomlook".into() });
+                                                stopping = true;
+                                            }
                                             harness = Some(connected_harness);
                                             if !stopping { connected.store(true, Ordering::Release); }
                                             notify(Notice::Connection { ready: !stopping, message: if stopping { "Stopping the isolated SDK; no new work is admitted" } else { "Connected: isolated SDK, registered read-only tools" }.into() });
                                         }
                                         Err(error) => { notify(Notice::Connection { ready: false, message: error }); }
                                     }
+                                    if let Some(wake) = &wake { let _ = wake.try_send(crate::worker::Command::Wake); }
                                 }
                                 Some(Ok(Completion::Answer { id, result })) => {
                                     cancellations.remove(&id);
@@ -399,6 +407,7 @@ impl Engine {
             occupied,
             terminated,
             stop,
+            analysis_revision,
         })
     }
 }

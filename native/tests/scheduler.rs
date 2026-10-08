@@ -132,6 +132,56 @@ fn revisions_cancel_old_work_and_cannot_execute_two_copies_of_an_identity() {
 }
 
 #[test]
+fn configuration_revisions_invalidate_completion_and_flights_without_replaying_unknown_outcomes() {
+    let calendar = fixture(3);
+    let mut queue = Queue::default();
+    queue.reconcile(&calendar, clock());
+    let (completed, _) = queue.dispatch().unwrap();
+    queue.finish(completed, Ok(()));
+    let (failed, _) = queue.dispatch().unwrap();
+    queue.finish(failed, Err("Unknown fixture outcome".into()));
+    let (running, _) = queue.dispatch().unwrap();
+    let mut interrupted = queue.clone();
+    interrupted.recover().unwrap();
+    interrupted.set_analysis_revision(&"b".repeat(64)).unwrap();
+    interrupted.reconcile(&calendar, clock());
+    assert_eq!(interrupted.jobs["fixture-2"].state, State::Interrupted);
+    assert!(interrupted.failure.is_some());
+    let previous = queue.jobs["fixture-0"].fingerprint.clone();
+    assert!(queue.set_analysis_revision(&"a".repeat(64)).unwrap());
+    assert_eq!(queue.reconcile(&calendar, clock()), vec![running]);
+    assert_ne!(previous, queue.jobs["fixture-0"].fingerprint);
+    assert_eq!(queue.jobs["fixture-0"].state, State::Queued);
+    assert_eq!(queue.jobs["fixture-1"].state, State::Failed);
+    assert!(queue.failure.is_some());
+    assert!(queue.current(running).is_none());
+    queue.finish(running, Ok(()));
+    assert_ne!(queue.jobs["fixture-2"].state, State::Completed);
+    assert!(!queue.set_analysis_revision(&"a".repeat(64)).unwrap());
+    queue.reconcile(&calendar, clock());
+    assert_eq!(queue.jobs["fixture-1"].state, State::Failed);
+    let mut legacy = serde_json::to_value(Queue::default()).unwrap();
+    legacy.as_object_mut().unwrap().remove("analysis_revision");
+    let mut legacy: Queue = serde_json::from_value(legacy).unwrap();
+    legacy.recover().unwrap();
+    legacy.reconcile(&calendar, clock());
+    assert_eq!(legacy.jobs["fixture-0"].fingerprint, previous);
+    assert!(legacy.set_analysis_revision("bad").is_err());
+    legacy.analysis_revision = "bad".into();
+    assert!(legacy.recover().is_err());
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(root.path()).unwrap();
+    store.save_queue(&queue).unwrap();
+    let recovered = store.queue().unwrap();
+    assert_eq!(recovered.analysis_revision, "a".repeat(64));
+    assert_eq!(recovered.jobs["fixture-1"].state, State::Failed);
+    assert_eq!(
+        recovered.jobs["fixture-0"].fingerprint,
+        queue.jobs["fixture-0"].fingerprint
+    );
+}
+
+#[test]
 fn restart_requires_explicit_retry_and_saved_completion_is_atomic() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::open(root.path()).unwrap();
@@ -171,7 +221,7 @@ fn restart_requires_explicit_retry_and_saved_completion_is_atomic() {
 }
 
 #[test]
-fn storage_finishes_preparation_without_any_ui_notice_drain() {
+fn storage_waits_for_configuration_and_finishes_without_completion_notice_drain() {
     let root = tempfile::tempdir().unwrap();
     let now = Local::now().fixed_offset();
     let mut calendar = fixture(2);
@@ -202,6 +252,7 @@ fn storage_finishes_preparation_without_any_ui_notice_drain() {
     .unwrap();
     let (sender, mut commands) = tokio::sync::mpsc::channel(64);
     let terminated = Arc::new(AtomicBool::new(false));
+    let analysis_revision = Arc::new(std::sync::OnceLock::new());
     worker
         .commands
         .send(Command::AttachAi {
@@ -209,12 +260,40 @@ fn storage_finishes_preparation_without_any_ui_notice_drain() {
             ready: Arc::new(AtomicBool::new(true)),
             occupied: Arc::new(AtomicUsize::new(0)),
             terminated: terminated.clone(),
+            analysis_revision: analysis_revision.clone(),
         })
         .unwrap();
     assert!(matches!(
         commands.blocking_recv(),
         Some(ai::Command::AttachWake(_))
     ));
+    worker
+        .commands
+        .send(Command::Detail {
+            revision: 77,
+            id: "configuration-barrier".into(),
+        })
+        .unwrap();
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if matches!(
+            worker.notices.try_recv(),
+            Ok(tomlook::worker::Notice::Detail { revision: 77, .. })
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Storage did not process the configuration barrier"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        commands.try_recv().is_err(),
+        "Ready alone must not admit preparation without an active configuration identity"
+    );
+    analysis_revision.set("a".repeat(64)).unwrap();
+    worker.commands.send(Command::Wake).unwrap();
     let Some(ai::Command::Prepare(request)) = commands.blocking_recv() else {
         panic!("preparation not dispatched");
     };
@@ -262,6 +341,7 @@ fn storage_finishes_preparation_without_any_ui_notice_drain() {
         .unwrap()
         .unwrap();
     let store = Store::open(root.path()).unwrap();
+    assert_eq!(store.queue().unwrap().analysis_revision, "a".repeat(64));
     assert!(
         store
             .briefing(&request.event.id)
@@ -365,6 +445,7 @@ fn hidden_notice_backpressure_and_exit_do_not_lose_a_ready_completion() {
             ready: Arc::new(AtomicBool::new(true)),
             occupied: Arc::new(AtomicUsize::new(0)),
             terminated: Arc::new(AtomicBool::new(false)),
+            analysis_revision: Arc::new(std::sync::OnceLock::from("a".repeat(64))),
         })
         .unwrap();
     assert!(matches!(

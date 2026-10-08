@@ -26,6 +26,7 @@ async fn run() -> Result<(), String> {
     let config = Config {
         runtime,
         model: "gpt-5.6-terra".into(),
+        copilot_credential_env: None,
         servers: Default::default(),
     };
     let harness = Harness::start(&root, config).await?;
