@@ -33,6 +33,21 @@ streaming. Calendar navigation does not wait for a model or briefing.
 Ctrl+Space opens the assistant, Ctrl+Enter submits a question from its editor,
 and Escape closes it and requests cancellation. Global questions and captured
 meeting context are separate; changing a meeting invalidates its old answer.
+Draft questions, optional public topics and last answers are retained separately
+for up to 32 contexts in memory. Switching context never carries another
+context's public-web topic. A changed meeting snapshot invalidates its old
+answer; reopening the same snapshot does not cancel an ongoing question.
+At the memory limit, a new context is refused visibly instead of evicting
+drafts or submitting against the old meeting. Exit clears this state.
+Disk conversation retention has not been selected by the owner and is not
+enabled. Questions remain independent SDK requests, not a persistent
+multi-turn transcript sent to the model. Structured retrieved sources and
+local proposals still require their implementation and live checks.
+Opening the panel requests editor focus; closing it returns focus to search.
+Question/topic limits are checked as UTF-8 bytes before submission, request
+identities cannot collide with preparation, and an unadmitted question
+preserves the previous answer. Cancellation reports an uncertain provider
+outcome rather than claiming the operation definitely stopped.
 
 Use `connections.example.json` as a schema example, replace the placeholder
 runtime/endpoints, and save an app-owned `connections.json` in the `--state`

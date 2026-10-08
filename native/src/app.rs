@@ -1,6 +1,6 @@
 use chrono::{Datelike, Local, NaiveDate};
 use eframe::egui::{self, Color32, Id, Key, Modifiers, RichText, Stroke, Vec2};
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 use tomlook::{
     ai::{self, Engine, Question},
     calendar::{Calendar, Event, View, safe_url},
@@ -14,6 +14,17 @@ const ACCENTS: [(&str, [u8; 3], [u8; 3]); 4] = [
     ("Green", [43, 112, 54], [112, 195, 124]),
     ("Yellow", [131, 96, 0], [242, 197, 68]),
 ];
+
+const ASSISTANT_CONTEXT_LIMIT: usize = 32;
+
+#[derive(Default)]
+struct AssistantState {
+    question: String,
+    public_topic: String,
+    answer: Option<Arc<String>>,
+    error: Option<String>,
+    fingerprint: Option<String>,
+}
 
 pub struct Tomlook {
     worker: Option<Worker>,
@@ -35,6 +46,9 @@ pub struct Tomlook {
     ai_ready: bool,
     assistant: bool,
     assistant_context: Option<Event>,
+    assistant_states: BTreeMap<Option<String>, AssistantState>,
+    context_error: Option<String>,
+    focus_assistant: bool,
     question: String,
     public_topic: String,
     request_id: u64,
@@ -138,6 +152,9 @@ impl Tomlook {
             ai_ready: false,
             assistant: false,
             assistant_context: None,
+            assistant_states: BTreeMap::new(),
+            context_error: None,
+            focus_assistant: false,
             question: String::new(),
             public_topic: String::new(),
             request_id: 0,
@@ -215,10 +232,8 @@ impl Tomlook {
                         if updated.is_none_or(|event| event.fingerprint() != context.fingerprint())
                         {
                             let updated = updated.cloned();
-                            self.cancel_ai();
-                            self.answer = None;
+                            self.switch_assistant_context(updated);
                             self.ai_error = Some("The meeting changed or disappeared. The old result was invalidated and cancellation requested; review the updated context before asking again.".into());
-                            self.assistant_context = updated;
                         }
                     }
                     let id = self.selected.map(|i| self.calendar.events[i].id.clone());
@@ -274,9 +289,13 @@ impl Tomlook {
                 ai::Notice::Answer { id, result } if self.active_request == Some(id) => {
                     self.active_request = None;
                     match result {
-                        Ok(answer) => {
+                        Ok(answer) if answer.len() <= 64_000 => {
                             self.answer = Some(answer);
                             self.ai_error = None;
+                        }
+                        Ok(_) => {
+                            self.ai_error = Some("AI answer exceeded the 64 KiB response limit; no answer was published.".into());
+                            self.answer = None;
                         }
                         Err(error) => {
                             self.ai_error = Some(error);
@@ -299,9 +318,7 @@ impl Tomlook {
 
     fn select(&mut self, index: usize) {
         if self.assistant_context.is_some() {
-            self.cancel_ai();
-            self.assistant_context = Some(self.calendar.events[index].clone());
-            self.answer = None;
+            self.switch_assistant_context(Some(self.calendar.events[index].clone()));
         }
         self.selected = Some(index);
         self.detail_revision += 1;
@@ -371,8 +388,10 @@ impl Tomlook {
         }
         if consume(Modifiers::CTRL, Key::Space) {
             self.assistant = !self.assistant;
+            self.focus_assistant = self.assistant;
             if !self.assistant {
                 self.cancel_ai();
+                self.focus_search = true;
             }
         }
         if consume(Modifiers::NONE, Key::Escape) {
@@ -383,6 +402,7 @@ impl Tomlook {
             } else if self.assistant {
                 self.assistant = false;
                 self.cancel_ai();
+                self.focus_search = true;
             } else if self.selected.is_some() {
                 self.selected = None;
                 self.detail_revision += 1;
@@ -490,8 +510,10 @@ impl Tomlook {
                 }
                 if ui.button("Ask").on_hover_text("Ctrl+Space").clicked() {
                     self.assistant = !self.assistant;
+                    self.focus_assistant = self.assistant;
                     if !self.assistant {
                         self.cancel_ai();
+                        self.focus_search = true;
                     }
                 }
             });
@@ -917,10 +939,9 @@ impl Tomlook {
             ui.hyperlink_to("Open original meeting", url);
         }
         if ui.button("Ask about this meeting").clicked() {
-            self.cancel_ai();
             self.assistant = true;
-            self.assistant_context = Some(event.clone());
-            self.answer = None;
+            self.switch_assistant_context(Some(event.clone()));
+            self.focus_assistant = true;
         }
         ui.add_space(16.0);
         ui.separator();
@@ -1019,10 +1040,95 @@ impl Tomlook {
     }
 
     fn cancel_ai(&mut self) {
-        if let Some(id) = self.active_request.take()
-            && !self.ai_command(ai::Command::Cancel(id))
+        if let Some(id) = self.active_request.take() {
+            self.ai_error = Some("Cancellation requested; partial output is not a completed answer. Provider outcome may be unknown.".into());
+            if !self.ai_command(ai::Command::Cancel(id)) {
+                self.error = Some("AI cancellation could not be submitted. Its result will be discarded, but the provider request may continue until timeout or application exit.".into());
+            }
+        }
+    }
+
+    fn switch_assistant_context(&mut self, next: Option<Event>) -> bool {
+        let current_id = self
+            .assistant_context
+            .as_ref()
+            .map(|event| event.id.clone());
+        let next_id = next.as_ref().map(|event| event.id.clone());
+        let fingerprint = next.as_ref().map(Event::fingerprint);
+        if current_id == next_id {
+            self.context_error = None;
+            if self.assistant_context.as_ref().map(Event::fingerprint) != fingerprint {
+                self.cancel_ai();
+                self.answer = None;
+                self.ai_error = Some("Meeting context changed. The previous answer was invalidated; review your draft before asking again.".into());
+            }
+            self.assistant_context = next;
+            return true;
+        }
+        self.cancel_ai();
+        if !self.assistant_states.contains_key(&next_id)
+            && self.assistant_states.len() + 1 >= ASSISTANT_CONTEXT_LIMIT
         {
-            self.error = Some("AI cancellation could not be submitted. Its result will be discarded, but the provider request may continue until timeout or application exit.".into());
+            self.context_error = Some("Assistant memory holds 32 contexts. Return to an existing context or restart Tomlook to clear memory. No new question can be submitted for the requested context.".into());
+            return false;
+        }
+        let mut restored = self.assistant_states.remove(&next_id).unwrap_or_default();
+        self.assistant_states.insert(
+            current_id,
+            AssistantState {
+                question: std::mem::take(&mut self.question),
+                public_topic: std::mem::take(&mut self.public_topic),
+                answer: self.answer.take(),
+                error: self.ai_error.take(),
+                fingerprint: self.assistant_context.as_ref().map(Event::fingerprint),
+            },
+        );
+        if restored.fingerprint != fingerprint && restored.answer.is_some() {
+            restored.answer = None;
+            restored.error = Some("Meeting context changed. The previous answer was invalidated; review your draft before asking again.".into());
+        }
+        self.question = restored.question;
+        self.public_topic = restored.public_topic;
+        self.answer = restored.answer;
+        self.ai_error = restored.error;
+        self.assistant_context = next;
+        self.context_error = None;
+        self.focus_assistant = true;
+        true
+    }
+
+    fn ask_question(&mut self) {
+        if self.active_request.is_some() {
+            return;
+        }
+        if !self.ai_ready || self.context_error.is_some() {
+            self.ai_error = Some(
+                "Connect the isolated SDK and resolve the context warning before asking.".into(),
+            );
+            return;
+        }
+        if self.question.trim().is_empty()
+            || self.question.len() > 8000
+            || self.public_topic.len() > 2000
+        {
+            self.ai_error = Some("Use a nonempty question of at most 8,000 UTF-8 bytes and a public topic of at most 2,000 bytes.".into());
+            return;
+        }
+        let Some(id) = self.request_id.checked_add(1).filter(|id| *id < 1 << 63) else {
+            self.ai_error = Some("Assistant request identity limit reached. No question was submitted; restart Tomlook.".into());
+            return;
+        };
+        self.request_id = id;
+        self.ai_error = None;
+        if self.ai_command(ai::Command::Ask(Box::new(Question {
+            id,
+            question: self.question.clone(),
+            meeting: self.assistant_context.clone(),
+            public_topic: (!self.public_topic.trim().is_empty())
+                .then(|| self.public_topic.trim().to_owned()),
+        }))) {
+            self.active_request = Some(id);
+            self.answer = None;
         }
     }
 
@@ -1032,10 +1138,12 @@ impl Tomlook {
             if ui.button("Close").on_hover_text("Esc").clicked() {
                 self.assistant = false;
                 self.cancel_ai();
+                self.focus_search = true;
             }
         });
         ui.add_space(8.0);
         ui.label(&self.connection);
+        ui.weak("Memory only - drafts and last answers are cleared on Exit.");
         if !self.ai_ready && ui.button("Connect isolated SDK").clicked() {
             self.ai_command(ai::Command::Connect);
         }
@@ -1044,9 +1152,7 @@ impl Tomlook {
             ui.label(RichText::new(&event.title).strong());
             ui.weak("Meeting snapshot; no briefing prerequisite");
             if ui.button("Switch to global question").clicked() {
-                self.cancel_ai();
-                self.assistant_context = None;
-                self.answer = None;
+                self.switch_assistant_context(None);
             }
         } else {
             ui.label(RichText::new("Your workspace").strong());
@@ -1054,9 +1160,7 @@ impl Tomlook {
             if let Some(index) = self.selected
                 && ui.button("Use selected meeting").clicked()
             {
-                self.cancel_ai();
-                self.assistant_context = Some(self.calendar.events[index].clone());
-                self.answer = None;
+                self.switch_assistant_context(Some(self.calendar.events[index].clone()));
             }
         }
         ui.add_space(12.0);
@@ -1064,20 +1168,38 @@ impl Tomlook {
             egui::TextEdit::multiline(&mut self.question)
                 .id(Id::new("assistant-question"))
                 .hint_text("Ask a question...")
+                .char_limit(8000)
                 .desired_rows(4)
                 .desired_width(f32::INFINITY),
         );
+        if self.focus_assistant {
+            question.request_focus();
+            self.focus_assistant = false;
+        }
         ui.weak("Public web is off unless you supply a public topic.");
-        ui.add(
+        let topic = ui.add(
             egui::TextEdit::singleline(&mut self.public_topic)
                 .id(Id::new("public-topic"))
                 .hint_text("Public topic (optional)")
+                .char_limit(2000)
                 .desired_width(f32::INFINITY),
         );
-        let shortcut = question.has_focus()
+        let shortcut = (question.has_focus() || topic.has_focus())
             && ui.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Enter));
-        let can_ask =
-            self.ai_ready && !self.question.trim().is_empty() && self.active_request.is_none();
+        let can_ask = self.ai_ready
+            && !self.question.trim().is_empty()
+            && self.active_request.is_none()
+            && self.context_error.is_none()
+            && self.question.len() <= 8000
+            && self.public_topic.len() <= 2000;
+        if self.question.len() > 8000 || self.public_topic.len() > 2000 {
+            ui.label(
+                "Question/public topic exceeds its UTF-8 byte limit. Shorten it before asking.",
+            );
+        }
+        if let Some(error) = &self.context_error {
+            ui.label(RichText::new(error).strong());
+        }
         ui.horizontal(|ui| {
             let clicked = ui
                 .add_enabled(
@@ -1087,24 +1209,10 @@ impl Tomlook {
                 .on_hover_text("Ctrl+Enter")
                 .clicked();
             if (clicked || shortcut) && can_ask {
-                self.request_id += 1;
-                self.active_request = Some(self.request_id);
-                self.answer = None;
-                self.ai_error = None;
-                self.ai_command(ai::Command::Ask(Box::new(Question {
-                    id: self.request_id,
-                    question: self.question.clone(),
-                    meeting: self.assistant_context.clone(),
-                    public_topic: (!self.public_topic.trim().is_empty())
-                        .then(|| self.public_topic.trim().to_owned()),
-                })));
-                if self.ai_error.is_some() {
-                    self.active_request = None;
-                }
+                self.ask_question();
             }
             if self.active_request.is_some() && ui.button("Cancel").clicked() {
                 self.cancel_ai();
-                self.ai_error = Some("Cancelled; partial output is not a completed answer.".into());
             }
         });
         if let Some(error) = &self.ai_error {
@@ -1112,6 +1220,7 @@ impl Tomlook {
         }
         ui.separator();
         if let Some(answer) = &self.answer {
+            ui.weak("Last answer - model output, not independently verified sources.");
             ui.label(answer.as_str());
         }
         if let Some(id) = self.active_request {
@@ -1188,6 +1297,7 @@ impl Tomlook {
                     }
                     if ui.button("Open assistant").clicked() {
                         self.assistant = true;
+                        self.focus_assistant = true;
                         self.palette = false;
                     }
                     if ui
@@ -1318,6 +1428,29 @@ impl eframe::App for Tomlook {
 mod tests {
     use super::*;
 
+    fn assistant_fixture() -> (
+        Tomlook,
+        Arc<ai::Notices>,
+        tokio::sync::mpsc::Receiver<ai::Command>,
+    ) {
+        let notices = Arc::new(ai::Notices::default());
+        let (commands, input) = tokio::sync::mpsc::channel(64);
+        let (stop, _stopped) = tokio::sync::watch::channel(false);
+        let engine = Engine {
+            commands,
+            notices: notices.clone(),
+            progress: Arc::new(std::sync::Mutex::new(ai::Progress::default())),
+            done: None,
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            occupied: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            terminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop,
+        };
+        let mut app = Tomlook::initial(None, Some(engine), None);
+        app.ai_ready = true;
+        (app, notices, input)
+    }
+
     #[test]
     fn ai_notices_are_drained_without_storage_notices_and_stale_answers_are_ignored() {
         let output = Arc::new(ai::Notices::default());
@@ -1366,5 +1499,216 @@ mod tests {
             Some("Current request")
         );
         assert!(app.active_request.is_none());
+    }
+
+    #[test]
+    fn global_and_meeting_drafts_topics_and_last_answers_do_not_leak() {
+        let (mut app, _, _input) = assistant_fixture();
+        let meeting = tomlook::calendar::demo(Local::now(), 1).remove(0);
+        app.question = "Global question".into();
+        app.public_topic = "Rust".into();
+        app.answer = Some(Arc::new("Global answer".into()));
+        assert!(app.switch_assistant_context(Some(meeting.clone())));
+        assert!(app.question.is_empty());
+        assert!(app.public_topic.is_empty());
+        assert!(app.answer.is_none());
+        app.question = "Meeting question".into();
+        app.answer = Some(Arc::new("Meeting answer".into()));
+        assert!(app.switch_assistant_context(None));
+        assert_eq!(app.question, "Global question");
+        assert_eq!(app.public_topic, "Rust");
+        assert_eq!(app.answer.as_deref().unwrap(), "Global answer");
+        assert!(app.switch_assistant_context(Some(meeting)));
+        assert_eq!(app.question, "Meeting question");
+        assert!(app.public_topic.is_empty());
+        assert_eq!(app.answer.as_deref().unwrap(), "Meeting answer");
+    }
+
+    #[test]
+    fn switched_context_cancels_its_request_and_cannot_receive_its_late_answer() {
+        let (mut app, output, mut input) = assistant_fixture();
+        app.question = "Global question".into();
+        app.ask_question();
+        let Some(ai::Command::Ask(question)) = input.try_recv().ok() else {
+            panic!("question was not admitted");
+        };
+        let meeting = tomlook::calendar::demo(Local::now(), 1).remove(0);
+        assert!(app.switch_assistant_context(Some(meeting)));
+        assert!(matches!(input.try_recv().unwrap(), ai::Command::Cancel(id) if id == question.id));
+        output
+            .send(ai::Notice::Answer {
+                id: question.id,
+                result: Ok(Arc::new("Late global answer".into())),
+            })
+            .unwrap();
+        app.receive();
+        assert!(app.answer.is_none());
+        assert!(app.active_request.is_none());
+        assert!(app.switch_assistant_context(None));
+        assert_eq!(app.question, "Global question");
+        assert!(app.answer.is_none());
+        assert!(
+            app.ai_error
+                .as_ref()
+                .unwrap()
+                .contains("Cancellation requested")
+        );
+    }
+
+    #[test]
+    fn same_context_reopen_preserves_request_but_changed_snapshot_invalidates_answer() {
+        let (mut app, _, mut input) = assistant_fixture();
+        let mut meeting = tomlook::calendar::demo(Local::now(), 1).remove(0);
+        app.switch_assistant_context(Some(meeting.clone()));
+        app.question = "Question".into();
+        app.ask_question();
+        assert!(matches!(input.try_recv().unwrap(), ai::Command::Ask(_)));
+        let active = app.active_request;
+        assert!(app.switch_assistant_context(Some(meeting.clone())));
+        assert_eq!(app.active_request, active);
+        assert!(input.try_recv().is_err());
+        app.cancel_ai();
+        app.answer = Some(Arc::new("Previous answer".into()));
+        app.switch_assistant_context(None);
+        meeting.title = "Updated meeting".into();
+        app.switch_assistant_context(Some(meeting));
+        assert!(app.answer.is_none());
+        assert_eq!(app.question, "Question");
+        assert!(app.ai_error.as_ref().unwrap().contains("invalidated"));
+    }
+
+    #[test]
+    fn bounded_contexts_refuse_new_scope_without_evicting_drafts_or_allowing_a_question() {
+        let (mut app, _, mut input) = assistant_fixture();
+        let mut meeting = tomlook::calendar::demo(Local::now(), 1).remove(0);
+        app.question = "Preserved global draft".into();
+        for index in 0..ASSISTANT_CONTEXT_LIMIT - 1 {
+            meeting.id = format!("context-{index}");
+            assert!(app.switch_assistant_context(Some(meeting.clone())));
+        }
+        assert_eq!(app.assistant_states.len(), ASSISTANT_CONTEXT_LIMIT - 1);
+        meeting.id = "overflow".into();
+        assert!(!app.switch_assistant_context(Some(meeting)));
+        app.question = "Must not use the old meeting".into();
+        app.ask_question();
+        assert!(app.context_error.is_some());
+        assert!(app.active_request.is_none());
+        assert!(input.try_recv().is_err());
+        assert!(app.switch_assistant_context(None));
+        assert_eq!(app.question, "Preserved global draft");
+        assert!(app.context_error.is_none());
+    }
+
+    #[test]
+    fn admission_is_single_flight_and_rejection_preserves_the_last_answer() {
+        let (mut app, _, mut input) = assistant_fixture();
+        app.question = "Question".into();
+        app.ask_question();
+        app.ask_question();
+        assert!(matches!(input.try_recv().unwrap(), ai::Command::Ask(_)));
+        assert!(input.try_recv().is_err());
+        app.cancel_ai();
+        assert!(matches!(input.try_recv().unwrap(), ai::Command::Cancel(_)));
+        app.answer = Some(Arc::new("Last completed answer".into()));
+        drop(input);
+        app.ask_question();
+        assert!(app.active_request.is_none());
+        assert_eq!(app.answer.as_deref().unwrap(), "Last completed answer");
+        assert!(app.ai_error.as_ref().unwrap().contains("unavailable"));
+    }
+
+    #[test]
+    fn request_and_payload_limits_fail_before_submission_and_never_alias_preparation_ids() {
+        let (mut app, output, mut input) = assistant_fixture();
+        app.question = "\u{010D}".repeat(4001);
+        app.ask_question();
+        assert!(input.try_recv().is_err());
+        assert_eq!(app.request_id, 0);
+        app.question = "Question".into();
+        app.request_id = (1 << 63) - 1;
+        app.ask_question();
+        assert!(input.try_recv().is_err());
+        assert!(app.ai_error.as_ref().unwrap().contains("identity limit"));
+        app.active_request = Some(1);
+        output
+            .send(ai::Notice::Answer {
+                id: 1,
+                result: Ok(Arc::new("x".repeat(64_001))),
+            })
+            .unwrap();
+        app.receive();
+        assert!(app.answer.is_none());
+        assert!(app.active_request.is_none());
+        assert!(app.ai_error.as_ref().unwrap().contains("response limit"));
+    }
+
+    #[test]
+    fn opening_assistant_focuses_question_and_escape_returns_focus_to_search() {
+        let (mut app, _, _input) = assistant_fixture();
+        let context = egui::Context::default();
+        app.assistant = true;
+        app.focus_assistant = true;
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            app.assistant_panel(ui);
+        });
+        output.textures_delta.clear();
+        assert_eq!(
+            context.memory(|memory| memory.focused()),
+            Some(Id::new("assistant-question"))
+        );
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut output = context.run_ui(input, |ui| {
+            app.shortcuts(ui.ctx());
+            app.header(ui);
+        });
+        output.textures_delta.clear();
+        assert!(!app.assistant);
+        assert_eq!(
+            context.memory(|memory| memory.focused()),
+            Some(Id::new("calendar-search"))
+        );
+    }
+
+    #[test]
+    fn control_enter_from_public_topic_submits_once() {
+        let (mut app, _, mut commands) = assistant_fixture();
+        let context = egui::Context::default();
+        app.question = "Synthetic question".into();
+        app.public_topic = "Rust".into();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            app.assistant_panel(ui);
+        });
+        output.textures_delta.clear();
+        context.memory_mut(|memory| memory.request_focus(Id::new("public-topic")));
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::CTRL,
+                }],
+                ..Default::default()
+            };
+            let mut output = context.run_ui(input, |ui| {
+                app.assistant_panel(ui);
+            });
+            output.textures_delta.clear();
+        }
+        let ai::Command::Ask(question) = commands.try_recv().unwrap() else {
+            panic!("expected one question");
+        };
+        assert_eq!(question.public_topic.as_deref(), Some("Rust"));
+        assert!(commands.try_recv().is_err());
     }
 }

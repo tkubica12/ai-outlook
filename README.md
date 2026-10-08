@@ -56,6 +56,8 @@ global/meeting assistant pilot are now available. SDK work, streaming and
 cancellation run on a separate executor with bounded channels; opening the
 calendar or assistant does not start Copilot. See [native setup](native/README.md)
 for the separate identity/configuration boundary and remaining acceptance gates.
+The panel keeps each context's draft, public topic and last answer separate in
+bounded memory; Exit clears them. No disk conversation retention is enabled.
 The SDK still owns an installed proprietary Copilot runtime child, not a Rust
 rewrite of that runtime. Preparation requires isolated authentication and
 verified calendar coverage; fixture tests do not establish live readiness.

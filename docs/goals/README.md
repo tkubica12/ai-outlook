@@ -40,7 +40,12 @@ tray controls, profile ownership and priority shutdown. Local fixtures cover
 hidden notification backpressure, obsolete results and interrupted recovery;
 they do not prove authenticated tray operation or the full latency contract.
 QUEUE-01 and ASSIST-01 are not complete; an assistant shell is not
-accepted live integration. Private run records remain in the execution artifacts.
+accepted live integration. The next offline assistant slice adds bounded
+memory-only context drafts/last answers, isolated public topics, snapshot
+invalidation, guarded request identities/admission and focus routing. It does
+not establish persistent conversations, retrieved-source support, local
+proposals or a real-provider question. Private run records remain in the
+execution artifacts.
 
 ## What changed and why
 
