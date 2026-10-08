@@ -22,6 +22,12 @@ pub struct Question {
     pub public_topic: Option<String>,
 }
 
+#[derive(Clone)]
+pub struct Answer {
+    pub text: Arc<String>,
+    pub evidence: Arc<crate::evidence::Snapshot>,
+}
+
 pub enum Command {
     Connect,
     Ask(Box<Question>),
@@ -56,7 +62,7 @@ pub enum Notice {
     },
     Answer {
         id: u64,
-        result: Result<Arc<String>, String>,
+        result: Result<Answer, String>,
     },
     Stopped,
 }
@@ -181,7 +187,7 @@ enum Completion {
     Connection(Result<Arc<Harness>, String>),
     Answer {
         id: u64,
-        result: Result<Arc<String>, String>,
+        result: Result<Answer, String>,
     },
     Prepared {
         request: Box<Preparation>,
@@ -291,7 +297,7 @@ impl Engine {
                                         let context = context.clone();
                                         tasks.spawn(async move {
                                             let id = question.id;
-                                            let result = ask(harness, *question, cancelled, progress, context, true).await.map(Arc::new);
+                                            let result = ask(harness, *question, cancelled, progress, context, true).await;
                                             Completion::Answer { id, result }
                                         });
                                     } else {
@@ -322,7 +328,7 @@ impl Engine {
                                                 id, question: PREPARATION_PROMPT.into(),
                                                 meeting: Some(request.event.clone()), public_topic: None,
                                             };
-                                            let result = ask(harness, question, cancelled, progress, context, false).await.map(Arc::new);
+                                            let result = ask(harness, question, cancelled, progress, context, false).await.map(|answer| answer.text);
                                             Completion::Prepared { request, result }
                                         });
                                     }
@@ -412,6 +418,48 @@ impl Engine {
     }
 }
 
+fn question_prompt(
+    question: &Question,
+    redactor: &crate::evidence::Redactor,
+) -> Result<String, String> {
+    if question.question.trim().is_empty()
+        || question.question.len() > 8000
+        || question
+            .public_topic
+            .as_ref()
+            .is_some_and(|topic| topic.len() > 2000)
+    {
+        return Err(
+            "Question/public topic exceeds its bounds or is empty; nothing was submitted".into(),
+        );
+    }
+    let meeting = question
+        .meeting
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| format!("Encode meeting context: {e}"))?;
+    if meeting.as_ref().is_some_and(|data| data.len() > 32_000) {
+        return Err("Meeting context exceeds the 32 KiB limit; no AI request was made".into());
+    }
+    if redactor.contains(&question.question)
+        || question
+            .public_topic
+            .as_ref()
+            .is_some_and(|topic| redactor.contains(topic))
+        || meeting.as_ref().is_some_and(|data| redactor.contains(data))
+    {
+        return Err("Question, meeting or public topic contains an app credential; no SDK session or model request was created".into());
+    }
+    Ok(format!(
+        "Answer the question concisely (normally under 180 words). Cite original sources as markdown links when supplied by tools; never fabricate URLs. If relevant data is inaccessible, state that explicitly. No briefing is required to answer. No writes.\nMEETING_DATA: {}\nUSER_QUESTION: {}",
+        meeting
+            .as_deref()
+            .unwrap_or("No meeting selected - global question"),
+        question.question,
+    ))
+}
+
 async fn ask(
     harness: Arc<Harness>,
     question: Question,
@@ -419,32 +467,18 @@ async fn ask(
     progress: Arc<Mutex<Progress>>,
     context: egui::Context,
     stream: bool,
-) -> Result<String, String> {
-    if question.question.trim().is_empty() || question.question.len() > 8000 {
-        return Err("Question must contain 1-8000 bytes; nothing was submitted".into());
+) -> Result<Answer, String> {
+    let prompt = question_prompt(&question, &harness.redactor)?;
+    if *cancel.borrow() {
+        return Err("Cancelled before SDK session creation; no question was sent".into());
     }
-    let meeting = question
-        .meeting
-        .map(|event| serde_json::to_string(&event))
-        .transpose()
-        .map_err(|e| e.to_string())?;
-    if meeting.as_ref().is_some_and(|data| data.len() > 32_000) {
-        return Err("Meeting context exceeds the 32 KiB limit; no AI request was made".into());
-    }
-    let session = tokio::time::timeout(
+    let (session, recorder) = tokio::time::timeout(
         Duration::from_secs(30),
-        harness.session(question.public_topic),
+        harness.observed_session(question.public_topic),
     )
     .await
     .map_err(|_| "Creating the SDK session timed out".to_string())??;
     let mut subscription = session.subscribe();
-    let prompt = format!(
-        "Answer the question concisely (normally under 180 words). Cite original sources as markdown links when supplied by tools; never fabricate URLs. If relevant data is inaccessible, state that explicitly. No briefing is required to answer. No writes.\nMEETING_DATA: {}\nUSER_QUESTION: {}",
-        meeting
-            .as_deref()
-            .unwrap_or("No meeting selected - global question"),
-        question.question,
-    );
     let result = async {
         if *cancel.borrow() { return Err("Cancelled before sending".into()); }
         tokio::select! {
@@ -477,7 +511,9 @@ async fn ask(
                                 accumulated.push_str(delta);
                                 if stream && last_update.elapsed() >= Duration::from_millis(100) {
                                     let mut state = progress.lock().map_err(|_| "AI progress state is unavailable")?;
-                                    *state = Progress { id: question.id, text: Arc::new(accumulated.clone()) };
+                                    let text = harness.redactor.partial(&accumulated);
+                                    if text.len() > 64_000 { return Err("Redacted AI progress exceeded the 64 KiB limit".into()); }
+                                    *state = Progress { id: question.id, text: Arc::new(text) };
                                     drop(state);
                                     context.request_repaint();
                                     last_update = Instant::now();
@@ -511,7 +547,16 @@ async fn ask(
         .map_err(|_| "Detach SDK session timed out".to_string())
         .and_then(|r| r.map_err(|e| format!("Detach SDK session: {e}")));
     match (result, aborted, disconnected) {
-        (Ok(answer), Ok(()), Ok(())) => Ok(answer),
+        (Ok(answer), Ok(()), Ok(())) => {
+            let text = harness.redactor.text(&answer);
+            if text.len() > 64_000 {
+                return Err("Redacted AI answer exceeded the 64 KiB limit".into());
+            }
+            Ok(Answer {
+                text: Arc::new(text),
+                evidence: recorder.snapshot()?,
+            })
+        }
         (result, aborted, disconnected) => {
             let mut errors = Vec::new();
             if let Err(error) = result {
@@ -523,7 +568,62 @@ async fn ask(
             if let Err(error) = disconnected {
                 errors.push(error);
             }
-            Err(errors.join("; "))
+            Err(harness.redactor.text(&errors.join("; ")))
         }
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    #[test]
+    fn known_app_credentials_cannot_enter_question_meeting_or_public_topic_prompts() {
+        let redactor = crate::evidence::Redactor::new(["fixture-app-credential".into()]);
+        let mut question = Question {
+            id: 1,
+            question: "Safe fixture question".into(),
+            meeting: None,
+            public_topic: None,
+        };
+        assert!(
+            question_prompt(&question, &redactor)
+                .unwrap()
+                .contains("Safe fixture question")
+        );
+        question.question = "Question containing fixture-app-credential".into();
+        assert!(
+            question_prompt(&question, &redactor)
+                .unwrap_err()
+                .contains("no SDK session")
+        );
+        question.question = "Safe fixture question".into();
+        question.public_topic = Some("fixture-app-credential".into());
+        assert!(question_prompt(&question, &redactor).is_err());
+        question.public_topic = None;
+        let mut meeting = crate::calendar::demo(chrono::Local::now(), 1).remove(0);
+        meeting.title = "fixture-app-credential".into();
+        question.meeting = Some(meeting);
+        assert!(question_prompt(&question, &redactor).is_err());
+    }
+
+    #[test]
+    fn prompt_payload_limits_apply_before_sdk_session_creation() {
+        let redactor = crate::evidence::Redactor::default();
+        let mut question = Question {
+            id: 1,
+            question: "\u{010d}".repeat(4001),
+            meeting: None,
+            public_topic: None,
+        };
+        assert!(question_prompt(&question, &redactor).is_err());
+        question.question = "Safe fixture".into();
+        question.public_topic = Some("x".repeat(2001));
+        assert!(question_prompt(&question, &redactor).is_err());
+        question.public_topic = None;
+        let mut meeting = crate::calendar::demo(chrono::Local::now(), 1).remove(0);
+        meeting.title = "x".repeat(32_001);
+        question.meeting = Some(meeting);
+        assert!(question_prompt(&question, &redactor).is_err());
     }
 }

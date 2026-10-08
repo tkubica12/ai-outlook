@@ -1,8 +1,12 @@
+use crate::evidence::{Recorder, Redactor};
 use async_trait::async_trait;
 use github_copilot_sdk::{
     CliProgram, Client, ClientMode, ClientOptions, IndexMap, McpHttpServerConfig, McpServerConfig,
     PermissionRequestData, PermissionRequestKind, SessionConfig, SystemMessageConfig, Transport,
-    hooks::{HookContext, PreToolUseInput, PreToolUseOutput, SessionHooks},
+    hooks::{
+        HookContext, PostToolUseFailureInput, PostToolUseFailureOutput, PostToolUseInput,
+        PostToolUseOutput, PreToolUseInput, PreToolUseOutput, SessionHooks,
+    },
     session::Session,
 };
 use serde::{Deserialize, Serialize};
@@ -418,11 +422,71 @@ impl SessionHooks for Policy {
     }
 }
 
+struct ObservedPolicy {
+    policy: Policy,
+    recorder: Arc<Recorder>,
+}
+
+#[async_trait]
+impl SessionHooks for ObservedPolicy {
+    async fn on_pre_tool_use(
+        &self,
+        input: PreToolUseInput,
+        context: HookContext,
+    ) -> Option<PreToolUseOutput> {
+        if input.session_id.as_str() != &*context.session_id {
+            self.recorder.fail();
+            return Some(PreToolUseOutput {
+                permission_decision: Some("deny".into()),
+                permission_decision_reason: Some("Tool session identity mismatch".into()),
+                ..Default::default()
+            });
+        }
+        self.policy.on_pre_tool_use(input, context).await
+    }
+
+    async fn on_post_tool_use(
+        &self,
+        input: PostToolUseInput,
+        context: HookContext,
+    ) -> Option<PostToolUseOutput> {
+        if input.session_id.as_str() != &*context.session_id
+            || !self.policy.allows_tool(&input.tool_name, &input.tool_args)
+        {
+            self.recorder.fail();
+        } else {
+            self.recorder
+                .record(&input.tool_name, &input.tool_result, true);
+        }
+        None
+    }
+
+    async fn on_post_tool_use_failure(
+        &self,
+        input: PostToolUseFailureInput,
+        context: HookContext,
+    ) -> Option<PostToolUseFailureOutput> {
+        if input.session_id.as_str() != &*context.session_id
+            || !self.policy.allows_tool(&input.tool_name, &input.tool_args)
+        {
+            self.recorder.fail();
+        } else {
+            self.recorder.record(
+                &input.tool_name,
+                &serde_json::Value::String(input.error),
+                false,
+            );
+        }
+        None
+    }
+}
+
 pub struct Harness {
     pub client: Client,
     config: Config,
     servers: IndexMap<String, McpServerConfig>,
     pub analysis_revision: String,
+    pub redactor: Arc<Redactor>,
 }
 
 #[derive(Debug, Serialize)]
@@ -448,6 +512,18 @@ impl Harness {
             Ok(token)
         }).transpose()?;
         let analysis_revision = config.analysis_revision(&servers, token.as_deref())?;
+        let mut secrets = token.iter().cloned().collect::<Vec<_>>();
+        for server in servers.values() {
+            if let McpServerConfig::Http(server) = server {
+                for value in server.headers.values() {
+                    secrets.push(value.clone());
+                    if let Some(token) = value.strip_prefix("Bearer ") {
+                        secrets.push(token.into());
+                    }
+                }
+            }
+        }
+        let redactor = Arc::new(Redactor::new(secrets));
         std::fs::create_dir_all(root.join("workspace"))
             .map_err(|e| format!("Create isolated workspace: {e}"))?;
         std::fs::create_dir_all(root.join("copilot"))
@@ -458,12 +534,13 @@ impl Harness {
         }
         let client = tokio::time::timeout(Duration::from_secs(30), Client::start(options)).await
             .map_err(|_| "The isolated Copilot runtime did not complete its handshake in 30 seconds".to_string())?
-            .map_err(|e| format!("Isolated SDK handshake failed: {e}. A compatible installed runtime is required."))?;
+            .map_err(|e| redactor.text(&format!("Isolated SDK handshake failed: {e}. A compatible installed runtime is required.")))?;
         Ok(Self {
             client,
             config,
             servers,
             analysis_revision,
+            redactor,
         })
     }
 
@@ -474,11 +551,14 @@ impl Harness {
         )
         .await
         .map_err(|_| "SDK ping timed out".to_string())?
-        .map_err(|e| format!("SDK ping failed: {e}"))?;
+        .map_err(|e| self.redactor.text(&format!("SDK ping failed: {e}")))?;
         let auth = tokio::time::timeout(Duration::from_secs(15), self.client.get_auth_status())
             .await
             .map_err(|_| "SDK authentication check timed out".to_string())?
-            .map_err(|e| format!("SDK authentication check failed: {e}"))?;
+            .map_err(|e| {
+                self.redactor
+                    .text(&format!("SDK authentication check failed: {e}"))
+            })?;
         Ok(Health {
             authenticated: auth.is_authenticated,
             isolated: true,
@@ -487,11 +567,24 @@ impl Harness {
     }
 
     pub async fn session(&self, public_topic: Option<String>) -> Result<Session, String> {
+        self.observed_session(public_topic)
+            .await
+            .map(|(session, _)| session)
+    }
+
+    pub async fn observed_session(
+        &self,
+        public_topic: Option<String>,
+    ) -> Result<(Session, Arc<Recorder>), String> {
         let policy = Policy::for_config(&self.config, public_topic.clone());
         let permission_policy = policy.clone();
+        let recorder = Arc::new(Recorder::new(self.redactor.clone()));
         let mut config = SessionConfig::default()
             .approve_permissions_if(move |data| permission_policy.allows_permission(data))
-            .with_hooks(Arc::new(policy.clone()));
+            .with_hooks(Arc::new(ObservedPolicy {
+                policy: policy.clone(),
+                recorder: recorder.clone(),
+            }));
         config.model = Some(self.config.model.clone());
         config.streaming = Some(true);
         config.client_name = Some("Tomlook".into());
@@ -520,14 +613,21 @@ impl Harness {
         self.client
             .create_session(config)
             .await
-            .map_err(|e| format!("Create isolated SDK session: {e}"))
+            .map(|session| (session, recorder))
+            .map_err(|e| {
+                self.redactor
+                    .text(&format!("Create isolated SDK session: {e}"))
+            })
     }
 
     pub async fn stop(&self) -> Result<(), String> {
         tokio::time::timeout(Duration::from_secs(15), self.client.stop())
             .await
             .map_err(|_| "Stop isolated SDK runtime timed out".to_string())?
-            .map_err(|e| format!("Stop isolated SDK runtime: {e:?}"))
+            .map_err(|e| {
+                self.redactor
+                    .text(&format!("Stop isolated SDK runtime: {e:?}"))
+            })
     }
 }
 
@@ -693,5 +793,88 @@ mod tests {
             config.copilot_credential_env = Some(ambient.into());
             assert!(config.validate().is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn observed_hooks_keep_policy_and_capture_only_their_own_session_results() {
+        let recorder = Arc::new(Recorder::new(Arc::new(Redactor::new([
+            "fixture-secret".into()
+        ]))));
+        let observed = ObservedPolicy {
+            policy: Policy {
+                names: BTreeSet::from(["WorkIQ-Mail-GetMessage".into()]),
+                public_topic: None,
+            },
+            recorder: recorder.clone(),
+        };
+        let context = || HookContext {
+            session_id: "fixture-session".into(),
+        };
+        let pre = observed
+            .on_pre_tool_use(
+                PreToolUseInput {
+                    session_id: "fixture-session".into(),
+                    timestamp: 0.0,
+                    working_directory: PathBuf::new(),
+                    tool_name: "WorkIQ-Mail-GetMessage".into(),
+                    tool_args: serde_json::json!({"id":"fixture"}),
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pre.permission_decision.as_deref(), Some("allow"));
+        let denied = observed
+            .on_pre_tool_use(
+                PreToolUseInput {
+                    session_id: "fixture-session".into(),
+                    timestamp: 0.0,
+                    working_directory: PathBuf::new(),
+                    tool_name: "WorkIQ-Mail-SendEmailWithAttachments".into(),
+                    tool_args: serde_json::json!({}),
+                },
+                context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.permission_decision.as_deref(), Some("deny"));
+        observed.on_post_tool_use(PostToolUseInput {
+            session_id: "fixture-session".into(), timestamp: 0.0, working_directory: PathBuf::new(),
+            tool_name: "WorkIQ-Mail-GetMessage".into(), tool_args: serde_json::json!({"id":"fixture"}),
+            tool_result: serde_json::json!({"url":"https://example.com/source","body":"Fixture fixture-secret"}),
+        }, context()).await;
+        observed
+            .on_post_tool_use_failure(
+                PostToolUseFailureInput {
+                    session_id: "fixture-session".into(),
+                    timestamp: 0.0,
+                    working_directory: PathBuf::new(),
+                    tool_name: "WorkIQ-Mail-GetMessage".into(),
+                    tool_args: serde_json::json!({"id":"fixture"}),
+                    error: "Fixture retrieval failed".into(),
+                },
+                context(),
+            )
+            .await;
+        let snapshot = recorder.snapshot().unwrap();
+        assert_eq!(snapshot.records.len(), 2);
+        assert!(!snapshot.records[0].excerpt.contains("fixture-secret"));
+        assert!(!snapshot.records[1].succeeded);
+        let other = Recorder::new(Arc::new(Redactor::default()));
+        assert!(other.snapshot().unwrap().records.is_empty());
+        observed
+            .on_post_tool_use(
+                PostToolUseInput {
+                    session_id: "wrong-session".into(),
+                    timestamp: 0.0,
+                    working_directory: PathBuf::new(),
+                    tool_name: "WorkIQ-Mail-GetMessage".into(),
+                    tool_args: serde_json::json!({"id":"fixture"}),
+                    tool_result: serde_json::json!({"body":"Must not be accepted"}),
+                },
+                context(),
+            )
+            .await;
+        assert!(recorder.snapshot().is_err());
     }
 }

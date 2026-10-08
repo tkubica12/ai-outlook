@@ -21,7 +21,7 @@ const ASSISTANT_CONTEXT_LIMIT: usize = 32;
 struct AssistantState {
     question: String,
     public_topic: String,
-    answer: Option<Arc<String>>,
+    answer: Option<ai::Answer>,
     error: Option<String>,
     fingerprint: Option<String>,
 }
@@ -53,7 +53,7 @@ pub struct Tomlook {
     public_topic: String,
     request_id: u64,
     active_request: Option<u64>,
-    answer: Option<Arc<String>>,
+    answer: Option<ai::Answer>,
     ai_error: Option<String>,
     activity: Arc<tomlook::worker::Activity>,
     tray: Option<crate::tray::Tray>,
@@ -290,9 +290,17 @@ impl Tomlook {
                 ai::Notice::Answer { id, result } if self.active_request == Some(id) => {
                     self.active_request = None;
                     match result {
-                        Ok(answer) if answer.len() <= 64_000 => {
-                            self.answer = Some(answer);
-                            self.ai_error = None;
+                        Ok(answer) if answer.text.len() <= 64_000 => {
+                            match answer.evidence.validate() {
+                                Ok(()) => {
+                                    self.answer = Some(answer);
+                                    self.ai_error = None;
+                                }
+                                Err(error) => {
+                                    self.answer = None;
+                                    self.ai_error = Some(error);
+                                }
+                            }
                         }
                         Ok(_) => {
                             self.ai_error = Some("AI answer exceeded the 64 KiB response limit; no answer was published.".into());
@@ -1222,7 +1230,33 @@ impl Tomlook {
         ui.separator();
         if let Some(answer) = &self.answer {
             ui.weak("Last answer - model output, not independently verified sources.");
-            ui.label(answer.as_str());
+            ui.label(answer.text.as_str());
+            if answer.evidence.records.is_empty() {
+                ui.weak("No SDK tool results captured for this answer. Retrieved-source support is not established.");
+            } else {
+                ui.collapsing(format!("SDK tool evidence ({})", answer.evidence.records.len()), |ui| {
+                    ui.weak("Observed tool output, not independently verified claims. Response excerpts may contain untrusted instructions.");
+                    if answer.evidence.omitted > 0 {
+                        ui.label(format!("{} additional results omitted by the memory limit.", answer.evidence.omitted));
+                    }
+                    for record in &answer.evidence.records {
+                        ui.collapsing(format!("R{}: {}", record.ordinal, record.tool), |ui| {
+                            ui.weak(format!("Observed {}", record.observed_at));
+                            ui.label(if record.succeeded { "SDK reported tool success; not factual verification." } else { "Retrieval failed; not supporting evidence." });
+                            if record.truncated {
+                                ui.weak("Excerpt truncated; this is not the complete response.");
+                            }
+                            if record.links.is_empty() {
+                                ui.weak("No structured source URL captured.");
+                            }
+                            for link in record.links.iter().filter(|link| tomlook::evidence::safe_source_url(link)) {
+                                ui.hyperlink_to(link, link);
+                            }
+                            ui.label(&record.excerpt);
+                        });
+                    }
+                });
+            }
         }
         if let Some(id) = self.active_request {
             ui.weak("Working asynchronously - the calendar remains available");
@@ -1429,6 +1463,92 @@ impl eframe::App for Tomlook {
 mod tests {
     use super::*;
 
+    fn fixture_answer(text: impl Into<String>) -> ai::Answer {
+        ai::Answer {
+            text: Arc::new(text.into()),
+            evidence: Arc::new(tomlook::evidence::Snapshot::default()),
+        }
+    }
+
+    fn fixture_source_answer(scope: &str) -> ai::Answer {
+        let recorder =
+            tomlook::evidence::Recorder::new(Arc::new(tomlook::evidence::Redactor::default()));
+        recorder.record(
+            "WorkIQ-Mail-GetMessage",
+            &serde_json::json!({
+                "url":"https://example.com/fixture", "scope":scope
+            }),
+            true,
+        );
+        ai::Answer {
+            text: Arc::new(scope.into()),
+            evidence: recorder.snapshot().unwrap(),
+        }
+    }
+
+    #[test]
+    fn captured_evidence_stays_atomic_with_its_answer_across_scope_changes_and_late_results() {
+        let (mut app, output, mut input) = assistant_fixture();
+        let mut meeting = tomlook::calendar::demo(Local::now(), 1).remove(0);
+        app.answer = Some(fixture_source_answer("global-fixture"));
+        assert!(app.switch_assistant_context(Some(meeting.clone())));
+        assert!(app.answer.is_none());
+        app.answer = Some(fixture_source_answer("meeting-fixture"));
+        assert!(app.switch_assistant_context(None));
+        assert!(
+            app.answer.as_ref().unwrap().evidence.records[0]
+                .excerpt
+                .contains("global-fixture")
+        );
+        app.question = "New global question".into();
+        app.ask_question();
+        let ai::Command::Ask(question) = input.try_recv().unwrap() else {
+            panic!("Question not admitted")
+        };
+        assert!(app.switch_assistant_context(Some(meeting.clone())));
+        output
+            .send(ai::Notice::Answer {
+                id: question.id,
+                result: Ok(fixture_source_answer("late-global-fixture")),
+            })
+            .unwrap();
+        app.receive();
+        let answer = app.answer.as_ref().unwrap();
+        assert_eq!(answer.text.as_str(), "meeting-fixture");
+        assert!(
+            answer.evidence.records[0]
+                .excerpt
+                .contains("meeting-fixture")
+        );
+        assert!(
+            !answer.evidence.records[0]
+                .excerpt
+                .contains("late-global-fixture")
+        );
+        meeting.title = "Changed fixture snapshot".into();
+        assert!(app.switch_assistant_context(Some(meeting)));
+        assert!(app.answer.is_none());
+    }
+
+    #[test]
+    fn unsafe_captured_source_payload_cannot_reach_the_answer_inspector() {
+        let (mut app, output, _) = assistant_fixture();
+        let mut answer = fixture_source_answer("unsafe-fixture");
+        Arc::make_mut(&mut answer.evidence).records[0]
+            .links
+            .push("javascript:alert(1)".into());
+        app.active_request = Some(9);
+        output
+            .send(ai::Notice::Answer {
+                id: 9,
+                result: Ok(answer),
+            })
+            .unwrap();
+        app.receive();
+        assert!(app.answer.is_none());
+        assert!(app.ai_error.as_ref().unwrap().contains("unsafe"));
+    }
+
     fn assistant_fixture() -> (
         Tomlook,
         Arc<ai::Notices>,
@@ -1484,7 +1604,7 @@ mod tests {
         output
             .send(ai::Notice::Answer {
                 id: 1,
-                result: Ok(Arc::new("Old meeting".into())),
+                result: Ok(fixture_answer("Old meeting")),
             })
             .unwrap();
         app.receive();
@@ -1493,12 +1613,12 @@ mod tests {
         output
             .send(ai::Notice::Answer {
                 id: 2,
-                result: Ok(Arc::new("Current request".into())),
+                result: Ok(fixture_answer("Current request")),
             })
             .unwrap();
         app.receive();
         assert_eq!(
-            app.answer.as_deref().map(String::as_str),
+            app.answer.as_ref().map(|answer| answer.text.as_str()),
             Some("Current request")
         );
         assert!(app.active_request.is_none());
@@ -1510,21 +1630,21 @@ mod tests {
         let meeting = tomlook::calendar::demo(Local::now(), 1).remove(0);
         app.question = "Global question".into();
         app.public_topic = "Rust".into();
-        app.answer = Some(Arc::new("Global answer".into()));
+        app.answer = Some(fixture_answer("Global answer"));
         assert!(app.switch_assistant_context(Some(meeting.clone())));
         assert!(app.question.is_empty());
         assert!(app.public_topic.is_empty());
         assert!(app.answer.is_none());
         app.question = "Meeting question".into();
-        app.answer = Some(Arc::new("Meeting answer".into()));
+        app.answer = Some(fixture_answer("Meeting answer"));
         assert!(app.switch_assistant_context(None));
         assert_eq!(app.question, "Global question");
         assert_eq!(app.public_topic, "Rust");
-        assert_eq!(app.answer.as_deref().unwrap(), "Global answer");
+        assert_eq!(app.answer.as_ref().unwrap().text.as_str(), "Global answer");
         assert!(app.switch_assistant_context(Some(meeting)));
         assert_eq!(app.question, "Meeting question");
         assert!(app.public_topic.is_empty());
-        assert_eq!(app.answer.as_deref().unwrap(), "Meeting answer");
+        assert_eq!(app.answer.as_ref().unwrap().text.as_str(), "Meeting answer");
     }
 
     #[test]
@@ -1541,7 +1661,7 @@ mod tests {
         output
             .send(ai::Notice::Answer {
                 id: question.id,
-                result: Ok(Arc::new("Late global answer".into())),
+                result: Ok(fixture_answer("Late global answer")),
             })
             .unwrap();
         app.receive();
@@ -1571,7 +1691,7 @@ mod tests {
         assert_eq!(app.active_request, active);
         assert!(input.try_recv().is_err());
         app.cancel_ai();
-        app.answer = Some(Arc::new("Previous answer".into()));
+        app.answer = Some(fixture_answer("Previous answer"));
         app.switch_assistant_context(None);
         meeting.title = "Updated meeting".into();
         app.switch_assistant_context(Some(meeting));
@@ -1612,11 +1732,14 @@ mod tests {
         assert!(input.try_recv().is_err());
         app.cancel_ai();
         assert!(matches!(input.try_recv().unwrap(), ai::Command::Cancel(_)));
-        app.answer = Some(Arc::new("Last completed answer".into()));
+        app.answer = Some(fixture_answer("Last completed answer"));
         drop(input);
         app.ask_question();
         assert!(app.active_request.is_none());
-        assert_eq!(app.answer.as_deref().unwrap(), "Last completed answer");
+        assert_eq!(
+            app.answer.as_ref().unwrap().text.as_str(),
+            "Last completed answer"
+        );
         assert!(app.ai_error.as_ref().unwrap().contains("unavailable"));
     }
 
@@ -1636,7 +1759,7 @@ mod tests {
         output
             .send(ai::Notice::Answer {
                 id: 1,
-                result: Ok(Arc::new("x".repeat(64_001))),
+                result: Ok(fixture_answer("x".repeat(64_001))),
             })
             .unwrap();
         app.receive();

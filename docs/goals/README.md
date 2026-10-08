@@ -49,7 +49,12 @@ preparation to the connected model/connector/credential/prompt configuration,
 preserves explicit retry after failed/interrupted operations, and adds an
 optional app-owned SDK credential slot without enabling ambient login.
 These repairs do not establish authenticated integration or full acceptance.
-Private run records remain in the execution artifacts.
+The following source-inspection slice captures bounded SDK-observed tool
+success/failure results, redacted excerpts and safe original links in memory.
+It keeps evidence atomic with its context-bound answer and labels empty capture,
+truncation and unverified claims explicitly. Fixture coverage is not real
+WorkIQ/WebIQ retrieval or claim-to-passage acceptance. Private run records remain
+in the execution artifacts.
 
 ## What changed and why
 

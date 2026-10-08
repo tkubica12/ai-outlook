@@ -41,8 +41,8 @@ At the memory limit, a new context is refused visibly instead of evicting
 drafts or submitting against the old meeting. Exit clears this state.
 Disk conversation retention has not been selected by the owner and is not
 enabled. Questions remain independent SDK requests, not a persistent
-multi-turn transcript sent to the model. Structured retrieved sources and
-local proposals still require their implementation and live checks.
+multi-turn transcript sent to the model. Full claim-to-passage verification and
+typed local proposals still require their implementation and live checks.
 Opening the panel requests editor focus; closing it returns focus to search.
 Question/topic limits are checked as UTF-8 bytes before submission, request
 identities cannot collide with preparation, and an unadmitted question
@@ -97,10 +97,27 @@ profile, not the matching personal session path. This does **not** establish
 authenticated calendar/briefing/chat isolation after restart, regular App
 visibility, or live permission-request compatibility.
 
-Native live calendar retrieval, persistent conversation history, structured
-answer sources/proposals and full assistant acceptance are still pending.
-AI output is currently plain text, not verified
-source objects. The web prototype remains the live-data reference.
+Completed answers now carry a memory-only snapshot from the SDK's typed
+post-tool success/failure hooks. The collapsed **SDK tool evidence** inspector
+shows the tool, host-observed time, result/failure, response excerpt and original
+structured links. These are observed tool results, not model-produced source
+objects or independently verified claims. Empty capture explicitly says that
+retrieved-source support is not established. Tool arguments are not retained.
+Each request retains at most 16 results, 4,000 UTF-8 bytes per excerpt and four
+safe links per result; truncation and omitted results are visible. Bounded JSON
+projection and link extraction run on the SDK worker, not the UI thread.
+Answer and evidence travel as one context-bound object; cancellation, changed
+meeting snapshots and stale request IDs invalidate both together.
+Configured SDK/connector credentials are masked in output, bounded excerpts and
+streamed prefixes across chunk boundaries. A prompt containing a known app
+credential is refused before session creation. Credential-bearing link queries
+and unsafe URL schemes are not clickable. This is not a promise to detect every
+secret in arbitrary workplace content or in opaque runtime logs.
+
+Native live calendar retrieval, persistent conversation history, typed local
+proposals, claim-to-passage verification and full assistant acceptance are still
+pending. No live provider/source acceptance is inferred from fixture coverage.
+The web prototype remains the live-data reference.
 
 ## Durable preparation and Windows tray pilot
 
