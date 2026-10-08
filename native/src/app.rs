@@ -18,6 +18,10 @@ const ACCENTS: [(&str, [u8; 3], [u8; 3]); 4] = [
 
 const ASSISTANT_CONTEXT_LIMIT: usize = 32;
 
+fn draft_editor_id(draft: u64, field: &str) -> Id {
+    Id::new(("local-draft-editor", draft, field))
+}
+
 #[derive(Default)]
 struct AssistantState {
     question: String,
@@ -65,6 +69,7 @@ pub struct Tomlook {
     draft_error: Option<String>,
     activity: Arc<tomlook::worker::Activity>,
     draft_id: u64,
+    focus_draft: Option<u64>,
     tray: Option<crate::tray::Tray>,
     in_tray: bool,
     last_prepared: String,
@@ -176,6 +181,7 @@ impl Tomlook {
             drafts: Vec::new(),
             draft_error: None,
             draft_id: 0,
+            focus_draft: None,
             activity: Arc::new(tomlook::worker::Activity::default()),
             tray: None,
             in_tray: false,
@@ -444,10 +450,19 @@ impl Tomlook {
                 self.query.clear();
             }
         }
-        if context.memory(|memory| matches!(memory.focused(), Some(id) if id == Id::new("calendar-search") || id == Id::new("assistant-question") || id == Id::new("public-topic")))
-            || self.palette
-            || self.settings
-        {
+        let editing = context.memory(|memory| {
+            memory.focused().is_some_and(|id| {
+                ["calendar-search", "assistant-question", "public-topic"]
+                    .into_iter()
+                    .any(|name| id == Id::new(name))
+                    || self.drafts.iter().any(|draft| {
+                        ["title", "target", "body"]
+                            .into_iter()
+                            .any(|field| id == draft_editor_id(draft.id, field))
+                    })
+            })
+        });
+        if editing || self.palette || self.settings {
             return;
         }
         if consume(Modifiers::ALT, Key::ArrowLeft) {
@@ -1101,6 +1116,7 @@ impl Tomlook {
             return true;
         }
         self.cancel_ai();
+        self.focus_draft = None;
         if !self.assistant_states.contains_key(&next_id)
             && self.assistant_states.len() + 1 >= ASSISTANT_CONTEXT_LIMIT
         {
@@ -1210,6 +1226,7 @@ impl Tomlook {
             proposal,
             context_revision: self.assistant_revision.clone(),
         });
+        self.focus_draft = Some(id);
         self.draft_error = None;
     }
 
@@ -1267,18 +1284,22 @@ impl Tomlook {
         let mut discard = None;
         for (index, draft) in self.drafts.iter_mut().enumerate() {
             ui.push_id(("local-draft", draft.id), |ui| {
-                egui::CollapsingHeader::new(format!("Local draft {}", index + 1)).id_salt("editor").show(ui, |ui| {
+                egui::CollapsingHeader::new(format!("Local draft {}", index + 1)).id_salt("editor").open((self.focus_draft == Some(draft.id)).then_some(true)).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         for (kind, label) in Kind::ALL {
                             ui.selectable_value(&mut draft.proposal.kind, kind, label);
                         }
                     });
                     let title = ui.label("Title");
-                    ui.add(egui::TextEdit::singleline(&mut draft.proposal.title).char_limit(proposals::TITLE_LIMIT).desired_width(f32::INFINITY)).labelled_by(title.id);
+                    let editor = ui.add(egui::TextEdit::singleline(&mut draft.proposal.title).id(draft_editor_id(draft.id, "title")).char_limit(proposals::TITLE_LIMIT).desired_width(f32::INFINITY)).labelled_by(title.id);
+                    if self.focus_draft == Some(draft.id) {
+                        editor.request_focus();
+                        self.focus_draft = None;
+                    }
                     let target = ui.label("Proposed target - verify manually");
-                    ui.add(egui::TextEdit::singleline(&mut draft.proposal.target).char_limit(proposals::TARGET_LIMIT).desired_width(f32::INFINITY)).labelled_by(target.id);
+                    ui.add(egui::TextEdit::singleline(&mut draft.proposal.target).id(draft_editor_id(draft.id, "target")).char_limit(proposals::TARGET_LIMIT).desired_width(f32::INFINITY)).labelled_by(target.id);
                     let body = ui.label("Draft text / proposed change");
-                    ui.add(egui::TextEdit::multiline(&mut draft.proposal.body).char_limit(proposals::BODY_LIMIT).desired_rows(3).desired_width(f32::INFINITY)).labelled_by(body.id);
+                    ui.add(egui::TextEdit::multiline(&mut draft.proposal.body).id(draft_editor_id(draft.id, "body")).char_limit(proposals::BODY_LIMIT).desired_rows(3).desired_width(f32::INFINITY)).labelled_by(body.id);
                     let validation = draft.proposal.validate();
                     if let Err(error) = &validation {
                         ui.label(error);
@@ -1644,6 +1665,112 @@ impl eframe::App for Tomlook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_editors_keep_typing_and_cursor_keys_out_of_calendar_navigation() {
+        for field in ["title", "target", "body"] {
+            let (mut app, _, mut commands) = assistant_fixture();
+            app.keep_local_proposal(fixture_proposal("Fixture draft"));
+            app.assistant = true;
+            app.anchor = NaiveDate::from_ymd_opt(2026, 9, 7).unwrap();
+            let anchor = app.anchor;
+            let view = app.preferences.view;
+            let id = draft_editor_id(app.drafts[0].id, field);
+            let context = egui::Context::default();
+            for frame in 0..16 {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        time: Some(f64::from(frame) * 0.1),
+                        ..Default::default()
+                    },
+                    |ui| app.local_drafts(ui),
+                );
+                output.textures_delta.clear();
+            }
+            assert!(app.focus_draft.is_none());
+            assert_eq!(
+                context.memory(|memory| memory.focused()),
+                Some(draft_editor_id(app.drafts[0].id, "title"))
+            );
+            context.memory_mut(|memory| memory.request_focus(id));
+            let input = egui::RawInput {
+                time: Some(2.0),
+                events: vec![
+                    egui::Event::Key {
+                        key: Key::Num1,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    },
+                    egui::Event::Key {
+                        key: Key::T,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    },
+                    egui::Event::Text("1t".into()),
+                    egui::Event::Key {
+                        key: Key::ArrowDown,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::NONE,
+                    },
+                    egui::Event::Key {
+                        key: Key::ArrowLeft,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::ALT,
+                    },
+                ],
+                ..Default::default()
+            };
+            let mut output = context.run_ui(input, |ui| {
+                app.shortcuts(ui.ctx());
+                app.local_drafts(ui);
+            });
+            output.textures_delta.clear();
+            assert_eq!(
+                app.preferences.view, view,
+                "{field} changed the calendar view"
+            );
+            assert_eq!(app.anchor, anchor, "{field} navigated away from the period");
+            assert!(app.selected.is_none());
+            let value = match field {
+                "title" => &app.drafts[0].proposal.title,
+                "target" => &app.drafts[0].proposal.target,
+                _ => &app.drafts[0].proposal.body,
+            };
+            assert!(
+                value.contains("1t"),
+                "{field} did not receive ordinary text input"
+            );
+            assert!(commands.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn calendar_keyboard_commands_still_work_when_a_non_editor_control_has_focus() {
+        let (mut app, _, _) = assistant_fixture();
+        let context = egui::Context::default();
+        context.memory_mut(|memory| memory.request_focus(Id::new("fixture-button")));
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: Key::Num4,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut output = context.run_ui(input, |ui| app.shortcuts(ui.ctx()));
+        output.textures_delta.clear();
+        assert_eq!(app.preferences.view, View::Month);
+    }
 
     fn fixture_proposal(title: &str) -> Proposal {
         Proposal {

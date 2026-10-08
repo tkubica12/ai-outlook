@@ -58,6 +58,11 @@ If the meeting snapshot changes, existing drafts remain available but are
 flagged for explicit local review. A refused context blocks draft admission.
 Title/target/body limits are 200/512/4,000 UTF-8 bytes; invalid edits are
 identified inline. Discard removes only the selected in-memory draft.
+Draft editors retain ordinary typing and cursor/navigation keys rather than
+triggering calendar view/period/meeting shortcuts. Global panel/search commands
+and Escape remain available; calendar keyboard commands still work when a
+non-editor control has focus. New or explicitly kept drafts open their editor
+and focus the title; switching context clears an outstanding editor-focus request.
 
 Opt into **Suggest local drafts with the next answer** to request a typed
 response containing an answer and up to four `task`, `email` or `calendar`
