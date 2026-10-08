@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use tomlook::{
     ai::{self, Engine, Question},
     calendar::{Calendar, Event, View, safe_url},
+    proposals::{self, Draft, Kind, Proposal},
     storage::Preferences,
     worker::{Command, Notice, Options, Worker},
 };
@@ -24,6 +25,9 @@ struct AssistantState {
     answer: Option<ai::Answer>,
     error: Option<String>,
     fingerprint: Option<String>,
+    suggest_drafts: bool,
+    drafts: Vec<Draft>,
+    draft_error: Option<String>,
 }
 
 pub struct Tomlook {
@@ -46,6 +50,7 @@ pub struct Tomlook {
     ai_ready: bool,
     assistant: bool,
     assistant_context: Option<Event>,
+    assistant_revision: Option<String>,
     assistant_states: BTreeMap<Option<String>, AssistantState>,
     context_error: Option<String>,
     focus_assistant: bool,
@@ -55,7 +60,11 @@ pub struct Tomlook {
     active_request: Option<u64>,
     answer: Option<ai::Answer>,
     ai_error: Option<String>,
+    suggest_drafts: bool,
+    drafts: Vec<Draft>,
+    draft_error: Option<String>,
     activity: Arc<tomlook::worker::Activity>,
+    draft_id: u64,
     tray: Option<crate::tray::Tray>,
     in_tray: bool,
     last_prepared: String,
@@ -153,6 +162,7 @@ impl Tomlook {
             ai_ready: false,
             assistant: false,
             assistant_context: None,
+            assistant_revision: None,
             assistant_states: BTreeMap::new(),
             context_error: None,
             focus_assistant: false,
@@ -162,6 +172,10 @@ impl Tomlook {
             active_request: None,
             answer: None,
             ai_error: None,
+            suggest_drafts: false,
+            drafts: Vec::new(),
+            draft_error: None,
+            draft_id: 0,
             activity: Arc::new(tomlook::worker::Activity::default()),
             tray: None,
             in_tray: false,
@@ -291,7 +305,18 @@ impl Tomlook {
                     self.active_request = None;
                     match result {
                         Ok(answer) if answer.text.len() <= 64_000 => {
-                            match answer.evidence.validate() {
+                            let validation = answer.evidence.validate().and_then(|()| {
+                                if answer.proposals.len() > proposals::PROPOSAL_LIMIT {
+                                    return Err(
+                                        "AI response exceeded the local-proposal limit".into()
+                                    );
+                                }
+                                for proposal in answer.proposals.iter() {
+                                    proposal.validate()?;
+                                }
+                                Ok(())
+                            });
+                            match validation {
                                 Ok(()) => {
                                     self.answer = Some(answer);
                                     self.ai_error = None;
@@ -1072,6 +1097,7 @@ impl Tomlook {
                 self.ai_error = Some("Meeting context changed. The previous answer was invalidated; review your draft before asking again.".into());
             }
             self.assistant_context = next;
+            self.assistant_revision = fingerprint;
             return true;
         }
         self.cancel_ai();
@@ -1090,6 +1116,9 @@ impl Tomlook {
                 answer: self.answer.take(),
                 error: self.ai_error.take(),
                 fingerprint: self.assistant_context.as_ref().map(Event::fingerprint),
+                suggest_drafts: self.suggest_drafts,
+                drafts: std::mem::take(&mut self.drafts),
+                draft_error: self.draft_error.take(),
             },
         );
         if restored.fingerprint != fingerprint && restored.answer.is_some() {
@@ -1100,7 +1129,11 @@ impl Tomlook {
         self.public_topic = restored.public_topic;
         self.answer = restored.answer;
         self.ai_error = restored.error;
+        self.suggest_drafts = restored.suggest_drafts;
+        self.drafts = restored.drafts;
+        self.draft_error = restored.draft_error;
         self.assistant_context = next;
+        self.assistant_revision = fingerprint;
         self.context_error = None;
         self.focus_assistant = true;
         true
@@ -1135,9 +1168,137 @@ impl Tomlook {
             meeting: self.assistant_context.clone(),
             public_topic: (!self.public_topic.trim().is_empty())
                 .then(|| self.public_topic.trim().to_owned()),
+            suggest_drafts: self.suggest_drafts,
         }))) {
             self.active_request = Some(id);
             self.answer = None;
+        }
+    }
+
+    fn keep_local_proposal(&mut self, proposal: Proposal) {
+        if self.context_error.is_some() {
+            self.draft_error = Some(
+                "Resolve the assistant context warning before keeping a draft; nothing was kept"
+                    .into(),
+            );
+            return;
+        }
+        let result = proposal.validate().and_then(|()| {
+            if self.drafts.len() >= proposals::DRAFT_LIMIT {
+                Err("Eight local drafts already occupy this context; discard one before keeping another".into())
+            } else if self.drafts.iter().any(|draft| draft.proposal == proposal) {
+                Err("This proposal is already a local draft; nothing was duplicated".into())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = result {
+            self.draft_error = Some(error);
+            return;
+        }
+        self.push_local_draft(proposal);
+    }
+
+    fn push_local_draft(&mut self, proposal: Proposal) {
+        let Some(id) = self.draft_id.checked_add(1) else {
+            self.draft_error = Some("Local draft identity limit reached; nothing was added. Restart Tomlook to clear memory.".into());
+            return;
+        };
+        self.draft_id = id;
+        self.drafts.push(Draft {
+            id,
+            proposal,
+            context_revision: self.assistant_revision.clone(),
+        });
+        self.draft_error = None;
+    }
+
+    fn new_local_draft(&mut self) {
+        if self.context_error.is_some() {
+            self.draft_error = Some(
+                "Resolve the assistant context warning before adding a draft; nothing was added"
+                    .into(),
+            );
+            return;
+        }
+        if self.drafts.len() >= proposals::DRAFT_LIMIT {
+            self.draft_error = Some(
+                "Eight local drafts already occupy this context; discard one before adding another"
+                    .into(),
+            );
+            return;
+        }
+        let target = self
+            .assistant_context
+            .as_ref()
+            .and_then(|event| (event.id.len() <= proposals::TARGET_LIMIT).then(|| event.id.clone()))
+            .unwrap_or_default();
+        self.push_local_draft(Proposal {
+            title: "Local draft".into(),
+            target,
+            ..Default::default()
+        });
+    }
+
+    fn local_drafts(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.weak(format!(
+                "LOCAL DRAFTS ({}/{})",
+                self.drafts.len(),
+                proposals::DRAFT_LIMIT
+            ));
+            if ui
+                .add_enabled(
+                    self.drafts.len() < proposals::DRAFT_LIMIT && self.context_error.is_none(),
+                    egui::Button::new("New local draft"),
+                )
+                .clicked()
+            {
+                self.new_local_draft();
+            }
+        });
+        ui.weak(
+            "Memory only. Targets are unverified. Nothing is sent, scheduled or created remotely.",
+        );
+        if let Some(error) = &self.draft_error {
+            ui.label(RichText::new(error).strong());
+        }
+        let mut discard = None;
+        for (index, draft) in self.drafts.iter_mut().enumerate() {
+            ui.push_id(("local-draft", draft.id), |ui| {
+                egui::CollapsingHeader::new(format!("Local draft {}", index + 1)).id_salt("editor").show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for (kind, label) in Kind::ALL {
+                            ui.selectable_value(&mut draft.proposal.kind, kind, label);
+                        }
+                    });
+                    let title = ui.label("Title");
+                    ui.add(egui::TextEdit::singleline(&mut draft.proposal.title).char_limit(proposals::TITLE_LIMIT).desired_width(f32::INFINITY)).labelled_by(title.id);
+                    let target = ui.label("Proposed target - verify manually");
+                    ui.add(egui::TextEdit::singleline(&mut draft.proposal.target).char_limit(proposals::TARGET_LIMIT).desired_width(f32::INFINITY)).labelled_by(target.id);
+                    let body = ui.label("Draft text / proposed change");
+                    ui.add(egui::TextEdit::multiline(&mut draft.proposal.body).char_limit(proposals::BODY_LIMIT).desired_rows(3).desired_width(f32::INFINITY)).labelled_by(body.id);
+                    let validation = draft.proposal.validate();
+                    if let Err(error) = &validation {
+                        ui.label(error);
+                    }
+                    if draft.needs_review(&self.assistant_revision) {
+                        ui.label(RichText::new("Meeting changed since this draft was kept; review the target and text.").strong());
+                        if ui.add_enabled(validation.is_ok(), egui::Button::new("Mark reviewed locally")).clicked() {
+                            draft.context_revision = self.assistant_revision.clone();
+                        }
+                    }
+                    ui.weak("Kept only in this context's memory; cleared on Exit.");
+                    if ui.button("Discard local draft").clicked() {
+                        discard = Some(index);
+                    }
+                });
+            });
+        }
+        if let Some(index) = discard {
+            self.drafts.remove(index);
+            self.draft_error = None;
         }
     }
 
@@ -1193,6 +1354,10 @@ impl Tomlook {
                 .char_limit(2000)
                 .desired_width(f32::INFINITY),
         );
+        ui.checkbox(
+            &mut self.suggest_drafts,
+            "Suggest local drafts with the next answer",
+        );
         let shortcut = (question.has_focus() || topic.has_focus())
             && ui.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Enter));
         let can_ask = self.ai_ready
@@ -1228,6 +1393,7 @@ impl Tomlook {
             ui.label(RichText::new(error).strong());
         }
         ui.separator();
+        let mut keep = None;
         if let Some(answer) = &self.answer {
             ui.weak("Last answer - model output, not independently verified sources.");
             ui.label(answer.text.as_str());
@@ -1257,7 +1423,23 @@ impl Tomlook {
                     }
                 });
             }
+            for (index, proposal) in answer.proposals.iter().enumerate() {
+                ui.push_id(("proposal", index), |ui| {
+                    ui.collapsing(format!("Proposed {}: {}", proposal.kind.label(), proposal.title), |ui| {
+                        ui.weak("Model suggestion, not verified or approved. Keeping it has no remote effect.");
+                        ui.label(format!("Proposed target: {}", proposal.target));
+                        ui.label(&proposal.body);
+                        if ui.add_enabled(self.context_error.is_none(), egui::Button::new("Keep local draft")).clicked() {
+                            keep = Some(proposal.clone());
+                        }
+                    });
+                });
+            }
         }
+        if let Some(proposal) = keep {
+            self.keep_local_proposal(proposal);
+        }
+        self.local_drafts(ui);
         if let Some(id) = self.active_request {
             ui.weak("Working asynchronously - the calendar remains available");
             let preview = self.ai.as_ref().and_then(|engine| {
@@ -1463,10 +1645,147 @@ impl eframe::App for Tomlook {
 mod tests {
     use super::*;
 
+    fn fixture_proposal(title: &str) -> Proposal {
+        Proposal {
+            kind: Kind::Email,
+            target: "Unverified fixture message".into(),
+            title: title.into(),
+            body: "Fixture text, never sent".into(),
+        }
+    }
+
+    #[test]
+    fn local_drafts_are_bounded_deduplicated_and_never_dispatch_ai_or_storage_commands() {
+        let (mut app, _, mut input) = assistant_fixture();
+        app.keep_local_proposal(fixture_proposal("Fixture draft"));
+        app.keep_local_proposal(fixture_proposal("Fixture draft"));
+        assert_eq!(app.drafts.len(), 1);
+        assert!(app.draft_error.as_ref().unwrap().contains("duplicated"));
+        for index in 1..proposals::DRAFT_LIMIT {
+            app.keep_local_proposal(fixture_proposal(&format!("Fixture {index}")));
+        }
+        app.new_local_draft();
+        app.keep_local_proposal(fixture_proposal("Overflow"));
+        assert_eq!(app.drafts.len(), proposals::DRAFT_LIMIT);
+        assert!(app.draft_error.as_ref().unwrap().contains("Eight"));
+        assert!(input.try_recv().is_err());
+        assert!(app.worker.is_none());
+        assert!(app.active_request.is_none());
+    }
+
+    #[test]
+    fn drafts_and_suggestion_preferences_stay_scoped_and_changed_meetings_require_review() {
+        let (mut app, _, mut input) = assistant_fixture();
+        app.suggest_drafts = true;
+        app.keep_local_proposal(fixture_proposal("Global draft"));
+        let mut meeting = tomlook::calendar::demo(Local::now(), 1).remove(0);
+        app.switch_assistant_context(Some(meeting.clone()));
+        assert!(app.drafts.is_empty());
+        assert!(!app.suggest_drafts);
+        app.keep_local_proposal(fixture_proposal("Meeting draft"));
+        assert!(!app.drafts[0].needs_review(&app.assistant_revision));
+        meeting.title = "Changed fixture meeting".into();
+        app.switch_assistant_context(Some(meeting.clone()));
+        assert_eq!(app.drafts.len(), 1);
+        assert!(app.drafts[0].needs_review(&app.assistant_revision));
+        app.switch_assistant_context(None);
+        assert!(app.suggest_drafts);
+        assert_eq!(app.drafts[0].proposal.title, "Global draft");
+        app.switch_assistant_context(Some(meeting));
+        assert_eq!(app.drafts[0].proposal.title, "Meeting draft");
+        assert!(app.drafts[0].needs_review(&app.assistant_revision));
+        assert!(input.try_recv().is_err());
+    }
+
+    #[test]
+    fn asking_again_preserves_kept_drafts_and_freezes_the_suggestion_mode() {
+        let (mut app, _, mut input) = assistant_fixture();
+        app.keep_local_proposal(fixture_proposal("Keep across questions"));
+        app.suggest_drafts = true;
+        app.question = "Suggest a fixture follow-up".into();
+        app.ask_question();
+        let ai::Command::Ask(question) = input.try_recv().unwrap() else {
+            panic!("Question was not admitted")
+        };
+        assert!(question.suggest_drafts);
+        assert_eq!(app.drafts.len(), 1);
+        app.suggest_drafts = false;
+        assert!(question.suggest_drafts);
+    }
+
+    #[test]
+    fn invalid_typed_proposals_do_not_reach_the_native_panel() {
+        let (mut app, output, _) = assistant_fixture();
+        let mut answer = fixture_answer("Fixture");
+        answer.proposals = Arc::new(vec![Proposal::default()]);
+        app.active_request = Some(9);
+        output
+            .send(ai::Notice::Answer {
+                id: 9,
+                result: Ok(answer),
+            })
+            .unwrap();
+        app.receive();
+        assert!(app.answer.is_none());
+        assert!(app.ai_error.as_ref().unwrap().contains("Title"));
+    }
+
+    #[test]
+    fn model_proposals_need_explicit_local_keep_and_context_warnings_block_admission() {
+        let (mut app, output, mut input) = assistant_fixture();
+        let mut answer = fixture_answer("Nothing has been sent");
+        answer.proposals = Arc::new(vec![fixture_proposal("Candidate")]);
+        app.active_request = Some(10);
+        output
+            .send(ai::Notice::Answer {
+                id: 10,
+                result: Ok(answer),
+            })
+            .unwrap();
+        app.receive();
+        assert!(app.drafts.is_empty());
+        let proposal = app.answer.as_ref().unwrap().proposals[0].clone();
+        app.context_error = Some("Requested context could not be admitted".into());
+        app.keep_local_proposal(proposal.clone());
+        app.new_local_draft();
+        assert!(app.drafts.is_empty());
+        assert!(
+            app.draft_error
+                .as_ref()
+                .unwrap()
+                .contains("context warning")
+        );
+        app.context_error = None;
+        app.keep_local_proposal(proposal);
+        assert_eq!(app.drafts.len(), 1);
+        assert!(input.try_recv().is_err());
+    }
+
+    #[test]
+    fn draft_editor_identities_survive_removal_and_cannot_collide_across_contexts() {
+        let (mut app, _, _) = assistant_fixture();
+        app.new_local_draft();
+        app.new_local_draft();
+        let retained_id = app.drafts[1].id;
+        app.drafts.remove(0);
+        app.new_local_draft();
+        assert_eq!(app.drafts[0].id, retained_id);
+        assert!(app.drafts[1].id > retained_id);
+        let last_global_id = app.drafts[1].id;
+        app.switch_assistant_context(Some(tomlook::calendar::demo(Local::now(), 1).remove(0)));
+        app.new_local_draft();
+        assert!(app.drafts[0].id > last_global_id);
+        app.draft_id = u64::MAX;
+        app.new_local_draft();
+        assert_eq!(app.drafts.len(), 1);
+        assert!(app.draft_error.as_ref().unwrap().contains("identity limit"));
+    }
+
     fn fixture_answer(text: impl Into<String>) -> ai::Answer {
         ai::Answer {
             text: Arc::new(text.into()),
             evidence: Arc::new(tomlook::evidence::Snapshot::default()),
+            proposals: Arc::new(Vec::new()),
         }
     }
 
@@ -1483,6 +1802,7 @@ mod tests {
         ai::Answer {
             text: Arc::new(scope.into()),
             evidence: recorder.snapshot().unwrap(),
+            proposals: Arc::new(vec![fixture_proposal(scope)]),
         }
     }
 
@@ -1515,6 +1835,7 @@ mod tests {
         app.receive();
         let answer = app.answer.as_ref().unwrap();
         assert_eq!(answer.text.as_str(), "meeting-fixture");
+        assert_eq!(answer.proposals[0].title, "meeting-fixture");
         assert!(
             answer.evidence.records[0]
                 .excerpt

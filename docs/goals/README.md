@@ -53,8 +53,13 @@ The following source-inspection slice captures bounded SDK-observed tool
 success/failure results, redacted excerpts and safe original links in memory.
 It keeps evidence atomic with its context-bound answer and labels empty capture,
 truncation and unverified claims explicitly. Fixture coverage is not real
-WorkIQ/WebIQ retrieval or claim-to-passage acceptance. Private run records remain
-in the execution artifacts.
+WorkIQ/WebIQ retrieval or claim-to-passage acceptance. The subsequent local-draft
+slice adds editable memory-only task/email/calendar suggestions, bounded
+context-scoped retention, changed-snapshot review warnings and explicitly
+opted-in typed model proposals. Keeping or reviewing a draft has no remote
+effect and never grants write permission. Real-provider proposal checks and
+full goal acceptance remain pending. Private run records remain in the execution
+artifacts.
 
 ## What changed and why
 

@@ -18,6 +18,7 @@ fn preview_never_starts_a_runtime_and_shutdown_is_bounded() {
             question: "Synthetic question".into(),
             meeting: None,
             public_topic: None,
+            suggest_drafts: false,
         })))
         .unwrap();
     let notice = engine.notices.recv_timeout(Duration::from_secs(3)).unwrap();

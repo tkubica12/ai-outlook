@@ -42,12 +42,33 @@ drafts or submitting against the old meeting. Exit clears this state.
 Disk conversation retention has not been selected by the owner and is not
 enabled. Questions remain independent SDK requests, not a persistent
 multi-turn transcript sent to the model. Full claim-to-passage verification and
-typed local proposals still require their implementation and live checks.
+real-provider acceptance still require live checks.
 Opening the panel requests editor focus; closing it returns focus to search.
 Question/topic limits are checked as UTF-8 bytes before submission, request
 identities cannot collide with preparation, and an unadmitted question
 preserves the previous answer. Cancellation reports an uncertain provider
 outcome rather than claiming the operation definitely stopped.
+
+**Local drafts** work without connecting AI. Add an editable task note, email
+draft or calendar suggestion with a proposed target, title and body. These are
+plain local data: no send, schedule, remote draft, CRM record or execution path
+exists. Targets remain unverified. Keep at most eight drafts per assistant
+context in memory; new questions do not erase them, and Exit clears them.
+If the meeting snapshot changes, existing drafts remain available but are
+flagged for explicit local review. A refused context blocks draft admission.
+Title/target/body limits are 200/512/4,000 UTF-8 bytes; invalid edits are
+identified inline. Discard removes only the selected in-memory draft.
+
+Opt into **Suggest local drafts with the next answer** to request a typed
+response containing an answer and up to four `task`, `email` or `calendar`
+proposals. Strict decoding and validation run on the SDK worker; unknown fields,
+action kinds, approval flags, oversized fields and malformed responses fail
+visibly rather than becoming an action. Known app credentials are masked and
+post-redaction sizes are rechecked. Structured JSON is not streamed into the
+panel. Candidate proposals share the answer's context/stale-result guards and
+become editable drafts only after **Keep local draft**. This opt-in is scoped to
+the current context and does not change ordinary answers or preparation.
+Local review is not permission for a future remote write.
 
 Use `connections.example.json` as a schema example, replace the placeholder
 runtime/endpoints, and save an app-owned `connections.json` in the `--state`
@@ -114,8 +135,8 @@ credential is refused before session creation. Credential-bearing link queries
 and unsafe URL schemes are not clickable. This is not a promise to detect every
 secret in arbitrary workplace content or in opaque runtime logs.
 
-Native live calendar retrieval, persistent conversation history, typed local
-proposals, claim-to-passage verification and full assistant acceptance are still
+Native live calendar retrieval, persistent conversation history,
+real-provider proposal checks, claim-to-passage verification and full assistant acceptance are still
 pending. No live provider/source acceptance is inferred from fixture coverage.
 The web prototype remains the live-data reference.
 

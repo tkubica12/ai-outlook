@@ -20,12 +20,14 @@ pub struct Question {
     pub question: String,
     pub meeting: Option<Event>,
     pub public_topic: Option<String>,
+    pub suggest_drafts: bool,
 }
 
 #[derive(Clone)]
 pub struct Answer {
     pub text: Arc<String>,
     pub evidence: Arc<crate::evidence::Snapshot>,
+    pub proposals: Arc<Vec<crate::proposals::Proposal>>,
 }
 
 pub enum Command {
@@ -326,7 +328,7 @@ impl Engine {
                                         tasks.spawn(async move {
                                             let question = Question {
                                                 id, question: PREPARATION_PROMPT.into(),
-                                                meeting: Some(request.event.clone()), public_topic: None,
+                                                meeting: Some(request.event.clone()), public_topic: None, suggest_drafts: false,
                                             };
                                             let result = ask(harness, question, cancelled, progress, context, false).await.map(|answer| answer.text);
                                             Completion::Prepared { request, result }
@@ -451,13 +453,17 @@ fn question_prompt(
     {
         return Err("Question, meeting or public topic contains an app credential; no SDK session or model request was created".into());
     }
-    Ok(format!(
+    let mut prompt = format!(
         "Answer the question concisely (normally under 180 words). Cite original sources as markdown links when supplied by tools; never fabricate URLs. If relevant data is inaccessible, state that explicitly. No briefing is required to answer. No writes.\nMEETING_DATA: {}\nUSER_QUESTION: {}",
         meeting
             .as_deref()
             .unwrap_or("No meeting selected - global question"),
         question.question,
-    ))
+    );
+    if question.suggest_drafts {
+        prompt.push_str(crate::proposals::RESPONSE_INSTRUCTIONS);
+    }
+    Ok(prompt)
 }
 
 async fn ask(
@@ -509,7 +515,7 @@ async fn ask(
                             if let Some(delta) = event.data.get("deltaContent").and_then(|v| v.as_str()) {
                                 if accumulated.len() + delta.len() > 64_000 { return Err("AI answer exceeded the 64 KiB response limit".into()); }
                                 accumulated.push_str(delta);
-                                if stream && last_update.elapsed() >= Duration::from_millis(100) {
+                                if stream && !question.suggest_drafts && last_update.elapsed() >= Duration::from_millis(100) {
                                     let mut state = progress.lock().map_err(|_| "AI progress state is unavailable")?;
                                     let text = harness.redactor.partial(&accumulated);
                                     if text.len() > 64_000 { return Err("Redacted AI progress exceeded the 64 KiB limit".into()); }
@@ -548,13 +554,18 @@ async fn ask(
         .and_then(|r| r.map_err(|e| format!("Detach SDK session: {e}")));
     match (result, aborted, disconnected) {
         (Ok(answer), Ok(()), Ok(())) => {
-            let text = harness.redactor.text(&answer);
+            let (text, proposals) = if question.suggest_drafts {
+                crate::proposals::parse(&answer, &harness.redactor)?
+            } else {
+                (harness.redactor.text(&answer), Vec::new())
+            };
             if text.len() > 64_000 {
                 return Err("Redacted AI answer exceeded the 64 KiB limit".into());
             }
             Ok(Answer {
                 text: Arc::new(text),
                 evidence: recorder.snapshot()?,
+                proposals: Arc::new(proposals),
             })
         }
         (result, aborted, disconnected) => {
@@ -585,6 +596,7 @@ mod prompt_tests {
             question: "Safe fixture question".into(),
             meeting: None,
             public_topic: None,
+            suggest_drafts: false,
         };
         assert!(
             question_prompt(&question, &redactor)
@@ -615,6 +627,7 @@ mod prompt_tests {
             question: "\u{010d}".repeat(4001),
             meeting: None,
             public_topic: None,
+            suggest_drafts: false,
         };
         assert!(question_prompt(&question, &redactor).is_err());
         question.question = "Safe fixture".into();
@@ -625,5 +638,26 @@ mod prompt_tests {
         meeting.title = "x".repeat(32_001);
         question.meeting = Some(meeting);
         assert!(question_prompt(&question, &redactor).is_err());
+    }
+
+    #[test]
+    fn local_proposal_mode_is_explicit_and_does_not_change_preparation_or_plain_answers() {
+        let redactor = crate::evidence::Redactor::default();
+        let mut question = Question {
+            id: 1,
+            question: "Fixture question".into(),
+            meeting: None,
+            public_topic: None,
+            suggest_drafts: false,
+        };
+        assert!(
+            !question_prompt(&question, &redactor)
+                .unwrap()
+                .contains("LOCAL_DRAFTS:")
+        );
+        question.suggest_drafts = true;
+        let prompt = question_prompt(&question, &redactor).unwrap();
+        assert!(prompt.contains("LOCAL_DRAFTS:"));
+        assert!(prompt.contains("never actions or approvals"));
     }
 }
