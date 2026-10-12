@@ -4,6 +4,11 @@ See the root README for build/run instructions and the goal contracts for
 acceptance requirements. This package is the production migration target; the
 browser prototype remains intact until native parity and live integration pass.
 
+The portable Windows 10/11 x64 executable requires the current
+[Microsoft Visual C++ v14 Redistributable (x64)](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist),
+including `VCRUNTIME140.dll`. The archive does not install this runtime or the
+separate Copilot CLI runtime required for live AI.
+
 Tomlook uses the **Focus** identity: a T inside four rounded focus corners.
 The header draws the mark directly as vectors. Window and tray icons follow
 the selected light/dark accent and update only when that color changes.

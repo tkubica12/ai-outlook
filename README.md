@@ -43,6 +43,11 @@ for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable, unsigned,
 and does not install anything.
 
+Windows 10/11 x64 also needs the current
+[Microsoft Visual C++ v14 Redistributable (x64)](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
+If Windows reports a missing `VCRUNTIME140.dll`, install that runtime from
+Microsoft; do not download individual DLLs from third-party sites.
+
 Live AI requires a GitHub Copilot account and an installed Copilot CLI runtime;
 live Microsoft 365 data requires access to the supported WorkIQ MCP services
 and your organization's consent. WorkIQ/WebIQ availability and tenant policies
