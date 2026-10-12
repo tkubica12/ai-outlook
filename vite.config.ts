@@ -6,6 +6,10 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: { "/api": "http://127.0.0.1:8000" },
+    watch: {
+      // Native builds and backend state are not browser hot-reload inputs.
+      ignored: ["**/native/target/**", "**/.venv/**", "**/data/**"],
+    },
   },
   test: {
     environment: "jsdom",

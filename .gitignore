@@ -225,3 +225,8 @@ coverage/
 # Calendar snapshots, migration backups and databases contain private work data.
 data/
 *.tsbuildinfo
+
+# Native delivery: one current product, ignored builds and private connector settings.
+/release/
+/.build/
+/.mcp.json

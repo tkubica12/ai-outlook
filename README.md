@@ -1,7 +1,53 @@
 # Tomlook
 
-Tomlook is a local-first intelligent calendar that reads real Microsoft 365 data through
-remote MCP servers. It does not seed or fall back to synthetic meetings.
+Tomlook is a performance-first, native Windows calendar with an asynchronous AI
+assistant and meeting Insights. It reads Microsoft 365 data through remote MCP
+servers, keeps the calendar responsive, and supports English and Czech,
+light/dark themes, and a configurable accent.
+
+Production never seeds or falls back to synthetic meetings. An explicit,
+isolated **offline demo** is available for trying the interface and taking
+privacy-safe screenshots.
+
+## Preview
+
+![Tomlook: synthetic workweek with categories and sample meeting Insights](docs/images/tomlook-demo-dark.png)
+
+*Actual native application, using only fictional meetings, contacts and sample
+Insights. No personal calendar, customer records or live AI responses appear
+in this screenshot.*
+
+To reproduce the preview, run the following from the directory containing the
+extracted executable, using a **new, empty** local profile. The demo never
+imports the legacy calendar, signs in, starts Copilot,
+fetches data or changes a live calendar:
+
+```powershell
+$demo = Join-Path $env:TEMP ("tomlook-demo-" + [guid]::NewGuid().ToString("N"))
+.\Tomlook.exe --demo --state $demo
+```
+
+Select **Northstar / Architecture workshop** on Tuesday to see the bilingual
+sample Insights. The window and header are labelled **Demo**; Insights are
+explicitly labelled as illustrative, not AI-generated.
+Add `--demo-screenshot <new-file.png>` to select that workshop automatically
+and export the native calendar/Insights framebuffer as a PNG. Only demo mode
+supports this export; existing files are never overwritten, and PNG encoding
+and disk writes run on the storage worker rather than the UI thread.
+
+## Project status
+
+The first native Windows release is **[v0.1.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.1.0)**.
+Download **[Tomlook-v0.1.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.1.0/Tomlook-v0.1.0-win-x64.zip)**
+for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
+application and third-party/font license notices. It is portable, unsigned,
+and does not install anything.
+
+Live AI requires a GitHub Copilot account and an installed Copilot CLI runtime;
+live Microsoft 365 data requires access to the supported WorkIQ MCP services
+and your organization's consent. WorkIQ/WebIQ availability and tenant policies
+are not provided by this repository. The offline demo works without these
+connections. See [native setup](native/README.md) for sign-in and configuration.
 
 The [goal contracts](docs/goals/README.md) govern the authorized native Rust
 migration, isolated official Rust Copilot SDK, future-first tray preparation,
@@ -14,20 +60,61 @@ remain unchanged for configuration and stored-data compatibility.
 
 `native\` is a real Rust-rendered Windows application using egui/eframe,
 AccessKit and OpenGL; the UI needs no browser, WebView or Python/Node bridge.
+Its **Focus** identity pairs a T inside four focus corners with the Tomlook
+wordmark. The header, tray, window and embedded executable icons share that
+mark; runtime icons follow the chosen theme/accent. The web prototype uses
+the same mark in its header and favicon.
 It currently provides day/work-week/week/month calendars, category/search filters,
-meeting details and saved briefings, commands, and persisted light/dark appearance
+meeting details and saved Insights, commands, and persisted light/dark appearance
 with one of four accents. Disk access, SQLite, cache parsing and calendar layout
 indexing run on a dedicated bounded worker, not in UI callbacks.
+WebIQ key entry and GitHub App device sign-in are available from the native
+status bar, with Windows-user encrypted storage and quiet saved-login checks.
+See [native setup](native/README.md#webiq-and-github-sign-in) for the dedicated
+GitHub App registration and read-only repository permissions; never paste keys
+or client secrets into chat or the repository.
 
-Build with Rust 1.95+ and the x64 Visual Studio C++/Windows SDK environment:
+The current runnable product is **`release\Tomlook.exe`**. It is the only
+product in that directory; build caches and measurement executables are not
+deliveries. Rebuild/publish from the repository root with Rust 1.95+ and the
+installed x64 Visual Studio C++/Windows SDK toolchain:
 
 ```powershell
-Set-Location .\native
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-cargo build --locked --release
-.\target\release\tomlook.exe --legacy-root D:\ai-outlook
+.\scripts\publish-native.ps1
+.\release\Tomlook.exe --legacy-root D:\ai-outlook
 ```
+
+Publishing uses the lockfile and offline Cargo cache, never installs dependencies,
+and leaves the existing release intact on build/copy/replacement failure.
+Exit a running release before publishing. `release\`, `.build\` and Cargo
+`target\` outputs are ignored; `.build\` is for temporary checks/staging.
+Published binaries are versioned through GitHub Releases; the local `release\`
+directory still contains only the current executable. The native Cargo package
+version also sets the executable's Windows file/product version. Release
+automation is not required for the first manually verified delivery.
+Run native checks from `native\` with `cargo test --locked --offline` and
+`cargo clippy --locked --offline --all-targets -- -D warnings`.
+
+**EN/CZ** switches directly beside theme/accent. Controls, calendar dates,
+commands and tray labels share a tested catalog. AI answers follow the selected
+language; new meeting Insights save English and Czech from one shared research.
+Original meeting names, quotes, source excerpts and technical provider diagnostics
+are not rewritten. Older unchanged Insights in the automatic preparation horizon
+can gain Czech on a tool-free background translation; the original English and
+evidence remain intact, and the UI explicitly identifies translation-only results.
+Changed meetings and manually requested research get fresh bilingual research.
+
+Category keys are filled color markers. Preset views also update mini-calendar
+highlighting; the small chevron beside a week selects its five working days.
+Unconfirmed meetings are quiet, stripe-free ghosts by default; **Hide unconfirmed**
+filters all calendar views and keyboard navigation. Organizer/response metadata is
+used, never a title prefix or merely a free availability slot. When the provider
+does not expose Follow, Tomlook cannot reliably distinguish it from no response.
+Expanded Insights use section cards, action headings and source counts rather
+than one continuous text block.
+
+For browser GitHub login, follow the
+[Czech step-by-step registration guide](docs/github-sign-in.cs.md).
 
 Application state lives in `%LOCALAPPDATA%\Tomlook\tomlook.db`. On first use,
 the optional legacy-root cache and briefing/history database are imported
@@ -36,32 +123,52 @@ displayed as **Not synced**, never as proof that a day is free. Invalid/unzoned
 legacy events are reported, not displayed with invented timezone information.
 `--state <directory>` selects an isolated local profile.
 
-For explicitly synthetic, offline UI review, use `--demo` (200 meetings) or
-`--stress` (5,000 meetings), with a separate `--state` directory. These modes
-are clearly labelled and never replace production calendar data.
-Keyboard: Ctrl+F search, Ctrl+K commands, 1-4 views, T today, Alt+Left/Right
+For explicitly synthetic, offline UI review, use `--demo` (200 fictional meetings
+across six weeks, six categories and bilingual sample Insights) or `--stress`
+(5,000 meetings), with a **new, empty** `--state` directory. These modes are clearly
+labelled and reject existing profiles rather than reading personal calendar data.
+Keyboard: Ctrl+F search, Ctrl+Shift+P searchable commands, Alt+Left/Right
 period, Up/Down meeting, Escape close, Tab/Shift+Tab focus, and Ctrl+Shift+Q Exit.
 
-The calendar remains cache-first; native live synchronization is not implemented
-yet. A durable native scheduler and Windows tray now retain future preparation
-jobs and promote an opened unfinished meeting. Preparation is **disabled by
-default**; Settings provides enable/pause and **Exit Tomlook**; meeting details
-provide explicit retry. Closing/minimizing hides the calendar when its tray is
+The calendar remains cache-first; native WorkIQ sign-in and calendar refresh run
+asynchronously. A durable native scheduler and Windows tray retain preparation
+jobs. Once WorkIQ connects, an independent worker synchronizes one month back
+and six months ahead, with durable per-day freshness and retry/backoff. It
+continues in the tray; visible periods have priority over subsequent batches.
+Automatic AI preparation covers the six-month future horizon, nearest first,
+with bounded retries that do not let one failed meeting block the others.
+WorkIQ access tokens remain memory-only. With approved Windows-user-scoped
+DPAPI login storage, both connections restore quietly at startup and request
+authentication only when needed. **Research now** prioritizes the selected
+meeting; opening it does not start AI. Automatic Insights are enabled by default,
+but require matching connected identities and verified calendar coverage.
+Click the status-bar activity count to inspect waiting work or pause automatic
+research; **Research now** remains available while automatic work is paused.
+Commands includes **Exit Tomlook**; meeting details provide explicit retry.
+Closing/minimizing hides the calendar when its tray is
 available, rather than stopping it. Restore through
-the Tomlook tray icon; Exit stops the workers. Each state directory allows one
-native instance, preventing duplicate preparation from a second launch.
+the Tomlook tray icon, or open Tomlook again to request the existing window.
+Exit stops the workers. Each state directory allows one native instance;
+an ordinary second launch sends only a local window signal and does not start
+another scheduler or AI runtime. Measurement and diagnostic profiles keep
+exclusive ownership and do not request the product window.
 
 A lazy official Rust Copilot SDK adapter and native
 global/meeting assistant pilot are now available. SDK work, streaming and
 cancellation run on a separate executor with bounded channels; opening the
 calendar or assistant does not start Copilot. See [native setup](native/README.md)
 for the separate identity/configuration boundary and remaining acceptance gates.
-The panel keeps each context's draft, public topic and last answer separate in
+The panel keeps each context's draft and last answer separate in
 bounded memory; Exit clears them. No disk conversation retention is enabled.
 The SDK still owns an installed proprietary Copilot runtime child, not a Rust
 rewrite of that runtime. Preparation requires isolated authentication and
-verified calendar coverage; fixture tests do not establish live readiness.
-The retained web prototype below is still the live-data reference during migration.
+verified calendar coverage and a matching WorkIQ account. Enter asks a question,
+Shift+Enter adds a line. Theme and accent controls are in the header, connections
+share one status bar, and participant photos load lazily. Meeting research uses
+mail, Teams and previous meetings, with optional selected local folders and a
+read-only GitHub connector; fixture tests do not establish live provider readiness.
+The retained web prototype below remains available while final native acceptance
+is pending.
 
 ## Web prototype: connect live data
 
@@ -131,3 +238,7 @@ npm run lint
 npm run build
 npm run test:e2e
 ```
+
+The browser dev server watches frontend inputs, not generated native build
+directories, the Python environment or backend data. This keeps native builds
+and cache writes from overwhelming Vite's filesystem watcher.

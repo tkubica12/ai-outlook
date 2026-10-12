@@ -10,10 +10,13 @@ use tray_icon::{
 
 pub struct Tray {
     _icon: TrayIcon,
+    show: MenuItem,
+    pause: MenuItem,
+    exit: MenuItem,
     pub exiting: Arc<AtomicBool>,
 }
 
-fn restore(context: &Context) {
+pub(crate) fn restore(context: &Context) {
     context.send_viewport_cmd(ViewportCommand::Visible(true));
     context.send_viewport_cmd(ViewportCommand::Minimized(false));
     context.send_viewport_cmd(ViewportCommand::Focus);
@@ -28,24 +31,13 @@ impl Tray {
         let menu = Menu::new();
         let show = MenuItem::new("Open Tomlook", true, None);
         let exit = MenuItem::new("Exit Tomlook (stop AI)", true, None);
-        let pause = MenuItem::new("Pause / resume preparation", commands.is_some(), None);
+        let pause = MenuItem::new("Pause / resume Insights", commands.is_some(), None);
         menu.append_items(&[&show, &pause, &exit])
             .map_err(|e| format!("Create tray menu: {e}"))?;
-        let mut rgba = vec![0; 32 * 32 * 4];
-        for y in 4..28 {
-            for x in 4..28 {
-                let stroke = (y < 9 && (7..25).contains(&x)) || ((13..19).contains(&x) && y < 26);
-                let pixel = (y * 32 + x) * 4;
-                rgba[pixel..pixel + 4].copy_from_slice(if stroke {
-                    &[235, 235, 235, 255]
-                } else {
-                    &[35, 35, 35, 255]
-                });
-            }
-        }
+        let rgba = tomlook::brand::rgba(32);
         let icon = Icon::from_rgba(rgba, 32, 32).map_err(|e| format!("Create tray icon: {e}"))?;
         let icon = TrayIconBuilder::new()
-            .with_tooltip("Tomlook - open calendar; preparation status in Settings")
+            .with_tooltip("Tomlook - calendar and Insights")
             .with_icon(icon)
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
@@ -90,6 +82,9 @@ impl Tray {
         }));
         Ok(Self {
             _icon: icon,
+            show,
+            pause,
+            exit,
             exiting,
         })
     }
@@ -98,11 +93,62 @@ impl Tray {
         self.exiting.store(true, Ordering::Release);
         context.send_viewport_cmd(ViewportCommand::Close);
     }
+
+    pub fn set_color(&self, color: [u8; 3]) -> Result<(), String> {
+        let icon = Icon::from_rgba(tomlook::brand::rgba_with_color(32, color), 32, 32)
+            .map_err(|error| format!("Create Focus tray icon: {error}"))?;
+        self._icon
+            .set_icon(Some(icon))
+            .map_err(|error| format!("Update Focus tray icon: {error}"))
+    }
+
+    pub fn set_language(&self, language: tomlook::i18n::Language) -> Result<(), String> {
+        self.show.set_text(language.text("Open Tomlook"));
+        self.pause
+            .set_text(language.text("Pause / resume Insights"));
+        self.exit.set_text(language.text("Exit Tomlook (stop AI)"));
+        self._icon
+            .set_tooltip(Some(language.text("Tomlook - calendar and Insights")))
+            .map_err(|error| format!("Update tray language: {error}"))
+    }
 }
 
 impl Drop for Tray {
     fn drop(&mut self) {
         MenuEvent::set_event_handler(None::<fn(MenuEvent)>);
         TrayIconEvent::set_event_handler(None::<fn(TrayIconEvent)>);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_requests_visibility_unminimizing_and_focus_without_closing() {
+        let context = Context::default();
+        let mut output = context.run_ui(Default::default(), |ui| restore(ui.ctx()));
+        output.textures_delta.clear();
+        let commands = &output.viewport_output[&eframe::egui::ViewportId::ROOT].commands;
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, ViewportCommand::Visible(true)))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, ViewportCommand::Minimized(false)))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, ViewportCommand::Focus))
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| !matches!(command, ViewportCommand::Close))
+        );
     }
 }

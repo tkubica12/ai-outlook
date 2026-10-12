@@ -1,6 +1,6 @@
 use crate::calendar::{Calendar, Event, View};
 use chrono::NaiveDate;
-use rusqlite::{Connection, OpenFlags, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -15,9 +15,17 @@ type Result<T> = std::result::Result<T, String>;
 pub struct Preferences {
     pub dark: bool,
     pub accent: usize,
+    pub language: crate::i18n::Language,
+    pub hide_unconfirmed: bool,
     pub view: View,
     pub paused: bool,
     pub prepare_enabled: bool,
+    pub work_email: String,
+    pub github_client_id: String,
+    pub daily_ai_limit: u32,
+    pub context_folders: Vec<PathBuf>,
+    pub repository_collections: Vec<PathBuf>,
+    pub cloud_context_folder: String,
 }
 
 impl Default for Preferences {
@@ -25,9 +33,27 @@ impl Default for Preferences {
         Self {
             dark: true,
             accent: 0,
+            language: crate::i18n::Language::En,
+            hide_unconfirmed: false,
             view: View::WorkWeek,
             paused: false,
-            prepare_enabled: false,
+            prepare_enabled: true,
+            work_email: String::new(),
+            github_client_id: String::new(),
+            daily_ai_limit: crate::telemetry::DEFAULT_DAILY_LIMIT,
+            context_folders: Vec::new(),
+            repository_collections: Vec::new(),
+            cloud_context_folder: String::new(),
+        }
+    }
+}
+
+impl Preferences {
+    pub fn sources(&self) -> crate::source_index::Config {
+        crate::source_index::Config {
+            folders: self.context_folders.clone(),
+            repositories: self.repository_collections.clone(),
+            cloud_folder: self.cloud_context_folder.clone(),
         }
     }
 }
@@ -38,6 +64,225 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn recommendations(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, crate::recommendations::Recommendation>> {
+        use rusqlite::OptionalExtension;
+        let payload: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT payload FROM settings WHERE key='recommendation-inbox-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "Read recommendation inbox failed")?;
+        let mut inbox: std::collections::BTreeMap<String, crate::recommendations::Recommendation> =
+            match payload {
+                Some(payload) if payload.len() <= 4 * 1024 * 1024 => serde_json::from_str(&payload)
+                    .map_err(|_| "Saved recommendation inbox is invalid")?,
+                Some(_) => return Err("Saved recommendation inbox exceeds its safety limit".into()),
+                None => Default::default(),
+            };
+        if inbox.len() > 512 {
+            return Err("Saved recommendation inbox exceeds its entry limit".into());
+        }
+        for (id, recommendation) in &mut inbox {
+            if recommendation.suggestion.kind != crate::recommendations::Kind::Manual {
+                recommendation.suggestion.validate()?;
+            } else if recommendation.manual_change.is_none() {
+                return Err("Saved manual calendar action has no exact change".into());
+            }
+            if id != &recommendation.id
+                || id.len() != 64
+                || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err("Saved recommendation identity is invalid".into());
+            }
+            if recommendation.state == crate::recommendations::State::Dispatching {
+                recommendation.state = crate::recommendations::State::Review;
+                recommendation.message =
+                    crate::workiq::connection::calendar_write::UNCERTAIN.into();
+            }
+        }
+        Ok(inbox)
+    }
+
+    pub fn save_recommendations(
+        &self,
+        inbox: &std::collections::BTreeMap<String, crate::recommendations::Recommendation>,
+    ) -> Result<()> {
+        let mut next = inbox.clone();
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| "Begin recommendation storage failed")?;
+        let previous: Option<String> = transaction
+            .query_row(
+                "SELECT payload FROM settings WHERE key='recommendation-inbox-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "Read current recommendation states failed")?;
+        if let Some(previous) = previous {
+            let previous: std::collections::BTreeMap<
+                String,
+                crate::recommendations::Recommendation,
+            > = serde_json::from_str(&previous)
+                .map_err(|_| "Current recommendation states are invalid")?;
+            for (id, previous) in previous {
+                if let Some(next) = next.get_mut(&id) {
+                    use crate::recommendations::State;
+                    if (previous.state != State::Pending && next.state == State::Pending)
+                        || (matches!(previous.state, State::Applied | State::Dismissed)
+                            && next.state != State::Applied)
+                    {
+                        *next = previous;
+                    }
+                } else if !matches!(
+                    previous.state,
+                    crate::recommendations::State::Applied
+                        | crate::recommendations::State::Dismissed
+                        | crate::recommendations::State::Expired
+                ) || previous.created_at
+                    >= chrono::Local::now().fixed_offset() - chrono::Duration::days(30)
+                {
+                    next.insert(id, previous);
+                }
+            }
+        }
+        let payload =
+            serde_json::to_string(&next).map_err(|_| "Encode recommendation inbox failed")?;
+        if next.len() > 512 || payload.len() > 4 * 1024 * 1024 {
+            return Err("Recommendation inbox reached its safety limit".into());
+        }
+        transaction
+            .execute(
+                "INSERT INTO settings VALUES('recommendation-inbox-v1',?1)
+            ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                [payload],
+            )
+            .map_err(|_| "Persist recommendation inbox failed")?;
+        transaction
+            .commit()
+            .map_err(|_| "Commit recommendation inbox failed")?;
+        Ok(())
+    }
+
+    pub fn approve_recommendation(
+        &mut self,
+        operation: &crate::recommendations::Operation,
+    ) -> Result<()> {
+        operation.validate(&operation.recommendation.account)?;
+        if self.calendar_owner()?.as_deref() != Some(operation.recommendation.account.as_str()) {
+            return Err("Calendar account changed before confirmation".into());
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|_| "Lock calendar approval failed")?;
+        let previous: String = transaction
+            .query_row(
+                "SELECT payload FROM settings WHERE key='recommendation-inbox-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Read persisted calendar proposal failed")?;
+        let mut inbox: std::collections::BTreeMap<String, crate::recommendations::Recommendation> =
+            serde_json::from_str(&previous).map_err(|_| "Persisted calendar proposal is invalid")?;
+        let current = inbox
+            .get_mut(&operation.recommendation.id)
+            .ok_or("Calendar proposal no longer exists")?;
+        if !matches!(
+            current.state,
+            crate::recommendations::State::Pending | crate::recommendations::State::NotSent
+        ) || current.account != operation.recommendation.account
+            || current.fingerprint != operation.recommendation.fingerprint
+            || current.suggestion != operation.recommendation.suggestion
+            || current.manual_change != operation.recommendation.manual_change
+        {
+            return Err("Calendar approval was already consumed or its proposal changed".into());
+        }
+        *current = operation.recommendation.clone();
+        let payload = serde_json::to_string(&inbox)
+            .map_err(|_| "Encode confirmed calendar proposal failed")?;
+        transaction
+            .execute(
+                "UPDATE settings SET payload=?1 WHERE key='recommendation-inbox-v1'",
+                [payload],
+            )
+            .map_err(|_| "Persist calendar confirmation failed")?;
+        transaction.execute(
+            "INSERT INTO settings VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+            params![format!("calendar-approval-{}", operation.recommendation.id),
+                serde_json::to_string(operation).map_err(|_| "Encode calendar approval proof failed")?],
+        ).map_err(|_| "Persist exact calendar approval failed")?;
+        transaction
+            .commit()
+            .map_err(|_| "Commit calendar confirmation failed")?;
+        Ok(())
+    }
+
+    pub fn save_calendar_event(&mut self, event: &Event, account: &str) -> Result<Calendar> {
+        if self.calendar_owner()?.as_deref() != Some(account) {
+            return Err("Calendar account changed before local read-back storage".into());
+        }
+
+        event.validate()?;
+        let mut calendar = self.calendar()?;
+        calendar.events.retain(|previous| previous.id != event.id);
+        calendar.events.push(event.clone());
+        let calendar = Calendar::build(calendar.events, calendar.coverage, calendar.warnings)?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| "Begin calendar read-back storage failed")?;
+        Self::write_calendar(&transaction, &calendar)?;
+        transaction
+            .commit()
+            .map_err(|_| "Commit calendar read-back storage failed")?;
+        Ok(calendar)
+    }
+
+    pub fn calendar_approval(&self, id: &str) -> Result<crate::recommendations::Operation> {
+        if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("Invalid calendar approval identity".into());
+        }
+        let payload: String = self
+            .connection
+            .query_row(
+                "SELECT payload FROM settings WHERE key=?1",
+                [format!("calendar-approval-{id}")],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Read exact calendar approval failed")?;
+        let operation: crate::recommendations::Operation =
+            serde_json::from_str(&payload).map_err(|_| "Saved calendar approval is invalid")?;
+        if operation.recommendation.id != id {
+            return Err("Saved calendar approval is invalid".into());
+        }
+        Ok(operation)
+    }
+
+    pub fn remove_calendar_event(&mut self, id: &str, account: &str) -> Result<Calendar> {
+        if self.calendar_owner()?.as_deref() != Some(account) {
+            return Err("Calendar account changed before local read-back storage".into());
+        }
+        let mut calendar = self.calendar()?;
+        calendar.events.retain(|event| event.id != id);
+        let calendar = Calendar::build(calendar.events, calendar.coverage, calendar.warnings)?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|_| "Begin calendar read-back storage failed")?;
+        Self::write_calendar(&transaction, &calendar)?;
+        transaction
+            .commit()
+            .map_err(|_| "Commit calendar read-back storage failed")?;
+        Ok(calendar)
+    }
+
     pub fn open(root: &Path) -> Result<Self> {
         fs::create_dir_all(root).map_err(|e| format!("Create Tomlook state: {e}"))?;
         let connection = Connection::open(root.join("tomlook.db")).map_err(|e| e.to_string())?;
@@ -49,6 +294,7 @@ impl Store {
                 "PRAGMA journal_mode=WAL;
                  CREATE TABLE IF NOT EXISTS calendar(id TEXT PRIMARY KEY,payload TEXT NOT NULL);
                  CREATE TABLE IF NOT EXISTS coverage(day TEXT PRIMARY KEY);
+                 CREATE TABLE IF NOT EXISTS calendar_sync(day TEXT PRIMARY KEY,refreshed_at TEXT NOT NULL);
                  CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,payload TEXT NOT NULL);
                  CREATE TABLE IF NOT EXISTS briefings(
                    meeting_id TEXT NOT NULL,version INTEGER NOT NULL,payload TEXT NOT NULL,
@@ -128,7 +374,107 @@ impl Store {
     pub fn save_calendar(&mut self, calendar: &Calendar) -> Result<()> {
         let transaction = self.connection.transaction().map_err(|e| e.to_string())?;
         Self::write_calendar(&transaction, calendar)?;
+        transaction
+            .execute("DELETE FROM calendar_sync", [])
+            .map_err(|e| e.to_string())?;
+        transaction
+            .execute("DELETE FROM settings WHERE key='calendar_owner'", [])
+            .map_err(|e| e.to_string())?;
         transaction.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn calendar_owner(&self) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.connection
+            .query_row(
+                "SELECT payload FROM settings WHERE key='calendar_owner'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save_workiq_calendar(&mut self, next: &Calendar, account: &str) -> Result<Calendar> {
+        let owner = self.calendar_owner()?;
+        let current = if owner.as_deref() == Some(account) {
+            self.calendar()?
+        } else {
+            Calendar::default()
+        };
+        let (Some(first), Some(last)) = (next.coverage.first(), next.coverage.last()) else {
+            return Err("WorkIQ calendar snapshot has no verified coverage".into());
+        };
+        if (0..=(*last - *first).num_days()).any(|day| {
+            !next
+                .coverage
+                .contains(&(*first + chrono::Duration::days(day)))
+        }) {
+            return Err("WorkIQ calendar snapshot coverage is not contiguous".into());
+        }
+        let ids = next
+            .events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let events = current
+            .events
+            .into_iter()
+            .filter(|event| {
+                let start = event.start.with_timezone(&chrono::Local).date_naive();
+                let end = (event.end - chrono::Duration::milliseconds(1))
+                    .with_timezone(&chrono::Local)
+                    .date_naive();
+                (end < *first || start > *last) && !ids.contains(event.id.as_str())
+            })
+            .chain(next.events.iter().cloned())
+            .collect();
+        let coverage = current.coverage.union(&next.coverage).copied().collect();
+        let calendar = Calendar::build(events, coverage, Vec::new())?;
+        let transaction = self.connection.transaction().map_err(|e| e.to_string())?;
+        Self::write_calendar(&transaction, &calendar)?;
+        if owner.as_deref() != Some(account) {
+            transaction
+                .execute("DELETE FROM calendar_sync", [])
+                .map_err(|e| e.to_string())?;
+        }
+        let refreshed = chrono::Utc::now().to_rfc3339();
+        for day in &next.coverage {
+            transaction.execute(
+                "INSERT INTO calendar_sync VALUES(?1,?2) ON CONFLICT(day) DO UPDATE SET refreshed_at=excluded.refreshed_at",
+                params![day.to_string(), refreshed],
+            ).map_err(|e| e.to_string())?;
+        }
+        transaction.execute(
+            "INSERT INTO settings VALUES('calendar_owner',?1) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+            [account],
+        ).map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(calendar)
+    }
+
+    pub fn calendar_sync_days(&self) -> Result<crate::calendar_sync::Freshness> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT day,refreshed_at FROM calendar_sync")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut days = crate::calendar_sync::Freshness::new();
+        for row in rows {
+            let (day, refreshed) = row.map_err(|e| e.to_string())?;
+            days.insert(
+                day.parse()
+                    .map_err(|e| format!("Invalid synchronized day: {e}"))?,
+                refreshed
+                    .parse()
+                    .map_err(|e| format!("Invalid calendar refresh timestamp: {e}"))?,
+            );
+        }
+        Ok(days)
     }
 
     fn write_calendar(transaction: &Transaction<'_>, calendar: &Calendar) -> Result<()> {

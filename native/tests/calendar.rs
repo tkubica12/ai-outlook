@@ -23,6 +23,39 @@ fn monday_first_and_month_clamping() {
 }
 
 #[test]
+fn unconfirmed_meetings_include_tentative_follow_and_no_response_but_not_organizers() {
+    let mut event = calendar::fixture(1).remove(0);
+    for status in [
+        "tentativelyAccepted",
+        "tentative",
+        "notResponded",
+        "none",
+        "declined",
+        "follow",
+        "following",
+    ] {
+        event.status = status.into();
+        assert!(event.unconfirmed(), "{status}");
+    }
+    for status in ["accepted", "organizer", ""] {
+        event.status = status.into();
+        assert!(!event.unconfirmed(), "{status}");
+    }
+    event.status = "notResponded".into();
+    event.extra.insert("isOrganizer".into(), true.into());
+    assert!(!event.unconfirmed());
+    event.extra.remove("isOrganizer");
+    event.status.clear();
+    event.extra.insert("showAs".into(), "free".into());
+    assert!(!event.unconfirmed(), "Free is not proof of following");
+    event.title = "[Follow] A title is not a response".into();
+    assert!(!event.unconfirmed(), "Do not infer response from title");
+    event.extra.insert("isFollowing".into(), true.into());
+    assert!(event.unconfirmed());
+    assert_eq!(event.response_label(), "Following");
+}
+
+#[test]
 fn source_urls_reject_credentials_controls_and_non_web_schemes() {
     for unsafe_url in [
         "javascript:alert(1)",
@@ -47,6 +80,78 @@ fn categories_are_precomputed_deduplicated_and_sorted() {
 }
 
 #[test]
+fn identity_lookup_matches_sorted_events_and_rebuilds_without_stale_entries() {
+    let mut events = calendar::fixture(5000);
+    events.reverse();
+    let mut calendar = Calendar::build(events, BTreeSet::new(), Vec::new()).unwrap();
+    for (index, event) in calendar.events.iter().enumerate() {
+        assert_eq!(calendar.event_index(&event.id), Some(index));
+    }
+    assert_eq!(calendar.event_index("missing-fixture"), None);
+    let removed = calendar.events.remove(0).id;
+    let mut events = calendar.events;
+    events[0].id = "changed-fixture".into();
+    let rebuilt = Calendar::build(events, BTreeSet::new(), Vec::new()).unwrap();
+    assert_eq!(rebuilt.event_index(&removed), None);
+    assert_eq!(rebuilt.event_index("changed-fixture"), Some(0));
+    assert_eq!(Calendar::default().event_index("changed-fixture"), None);
+}
+
+#[test]
+fn category_arrays_preserve_names_and_tentative_meetings_are_filterable() {
+    let mut events = calendar::demo(Local::now(), 3);
+    events[0].category = "Legacy, combined".into();
+    events[0].extra.insert(
+        "categories".into(),
+        serde_json::json!(["Customer, Prague", "Azure"]),
+    );
+    events[1].category = "Work, Demo".into();
+    events[1].status = "tentativelyAccepted".into();
+    events[2].category.clear();
+    events[2]
+        .extra
+        .insert("showAs".into(), serde_json::json!("tentative"));
+    assert_eq!(events[0].tags(), ["Customer, Prague", "Azure"]);
+    assert_eq!(events[1].tags(), ["Work", "Demo", "nejisté"]);
+    assert_eq!(events[2].tags(), ["nejisté"]);
+    let calendar = Calendar::build(events, BTreeSet::new(), Vec::new()).unwrap();
+    assert_eq!(
+        calendar.categories,
+        ["Azure", "Customer, Prague", "Demo", "nejisté", "Work"]
+    );
+    assert_eq!(
+        (0..calendar.events.len())
+            .filter(|index| calendar.matches(*index, "", "Nejisté"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        (0..calendar.events.len())
+            .filter(|index| calendar.matches(*index, "", "Customer, Prague"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn outlook_categories_deduplicate_case_without_changing_cached_event_names() {
+    let mut events = calendar::fixture(3);
+    events[0].category = "nejisté".into();
+    events[0].status = "tentative".into();
+    events[1].category = "Nejisté".into();
+    events[1].status = "tentativelyAccepted".into();
+    events[2].category = "Office, office".into();
+    assert_eq!(events[0].tags(), ["nejisté"]);
+    assert_eq!(events[1].tags(), ["Nejisté"]);
+    let calendar = Calendar::build(events, BTreeSet::new(), Vec::new()).unwrap();
+    assert_eq!(calendar.categories, ["nejisté", "office"]);
+    assert_eq!(calendar.events[1].category, "Nejisté");
+    assert!(calendar.matches(0, "", "Nejisté"));
+    assert!(calendar.matches(1, "", "nejisté"));
+    assert!(calendar.matches(2, "", "OFFICE"));
+}
+
+#[test]
 fn aware_time_and_midnight_are_not_rounded_into_the_next_day() {
     let mut events = calendar::demo(Local::now(), 1);
     events[0].start = DateTime::parse_from_rfc3339("2026-10-07T00:00:00+02:00").unwrap();
@@ -60,6 +165,51 @@ fn aware_time_and_midnight_are_not_rounded_into_the_next_day() {
     assert!(calendar.days.contains_key(&first));
     assert!(calendar.days.contains_key(&last));
     assert!(!calendar.days.contains_key(&(last + Duration::days(1))));
+}
+
+#[test]
+fn all_day_dates_preserve_source_dates_and_exclude_midnight_end_in_every_zone() {
+    for (start, end, first, last) in [
+        (
+            "2026-11-02T00:00:00Z",
+            "2026-11-04T00:00:00Z",
+            "2026-11-02",
+            "2026-11-03",
+        ),
+        (
+            "2026-11-02T00:00:00+14:00",
+            "2026-11-04T00:00:00+14:00",
+            "2026-11-02",
+            "2026-11-03",
+        ),
+        (
+            "2026-11-02T00:00:00-08:00",
+            "2026-11-04T00:00:00-08:00",
+            "2026-11-02",
+            "2026-11-03",
+        ),
+        (
+            "2026-10-25T00:00:00+02:00",
+            "2026-10-26T00:00:00+01:00",
+            "2026-10-25",
+            "2026-10-25",
+        ),
+    ] {
+        let mut event = calendar::fixture(1).remove(0);
+        event.start = DateTime::parse_from_rfc3339(start).unwrap();
+        event.end = DateTime::parse_from_rfc3339(end).unwrap();
+        event.is_all_day = true;
+        let first: NaiveDate = first.parse().unwrap();
+        let last: NaiveDate = last.parse().unwrap();
+        assert_eq!(event.calendar_dates(), (first, last));
+        let built = Calendar::build(vec![event], BTreeSet::new(), Vec::new()).unwrap();
+        assert_eq!(built.days.first_key_value().unwrap().0, &first);
+        assert_eq!(built.days.last_key_value().unwrap().0, &last);
+        for day in built.days.values() {
+            assert_eq!(day.all_day, [0]);
+            assert!(day.timed.is_empty());
+        }
+    }
 }
 
 #[test]
@@ -114,6 +264,8 @@ fn cache_and_settings_survive_restart_without_claiming_coverage() {
             view: View::Month,
             paused: true,
             prepare_enabled: false,
+            github_client_id: "Iv23fixture".into(),
+            ..Preferences::default()
         })
         .unwrap();
     drop(store);
@@ -122,6 +274,16 @@ fn cache_and_settings_survive_restart_without_claiming_coverage() {
     assert_eq!(loaded.events.len(), 200);
     assert!(loaded.coverage.is_empty());
     assert_eq!(store.preferences().unwrap().view, View::Month);
+    assert_eq!(store.preferences().unwrap().github_client_id, "Iv23fixture");
+}
+
+#[test]
+fn old_preferences_load_without_a_github_client_id() {
+    let preferences: Preferences =
+        serde_json::from_str(r#"{"dark":false,"work_email":"fixture@example.test"}"#).unwrap();
+    assert!(preferences.github_client_id.is_empty());
+    assert_eq!(preferences.work_email, "fixture@example.test");
+    assert!(!preferences.dark);
 }
 
 #[test]

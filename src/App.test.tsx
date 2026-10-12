@@ -45,6 +45,16 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("calendar shell", () => {
+  it("shows the Focus identity independently of calendar data", async () => {
+    useApi();
+    await act(async () => {
+      render(<App />);
+    });
+    expect(screen.getByRole("link", { name: "Tomlook home" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Tomlook Focus logo" })).toBeInTheDocument();
+    expect(screen.getByText("Tomlook", { exact: true })).toBeInTheDocument();
+  });
+
   it("loads the connected calendar without demo labelling", async () => {
     useApi();
     render(<App />);

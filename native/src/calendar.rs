@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub const ALL_DAY_CONTEXT_POLICY: &str = "For all-day events, all_day_dates gives the actual inclusive calendar dates. The raw end is exclusive; do not shift these dates into another time zone or include the end date.";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Event {
     pub id: String,
@@ -30,6 +32,88 @@ pub struct Event {
 }
 
 impl Event {
+    pub fn unconfirmed(&self) -> bool {
+        if self
+            .extra
+            .get("isOrganizer")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            || self.status.eq_ignore_ascii_case("organizer")
+        {
+            return false;
+        }
+        matches!(
+            self.status.to_ascii_lowercase().as_str(),
+            "tentativelyaccepted"
+                | "tentative"
+                | "notresponded"
+                | "none"
+                | "declined"
+                | "follow"
+                | "following"
+        ) || self.extra.get("showAs").and_then(serde_json::Value::as_str) == Some("tentative")
+            || self
+                .extra
+                .get("isFollowing")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+    }
+
+    pub fn response_label(&self) -> &'static str {
+        match self.status.to_ascii_lowercase().as_str() {
+            "follow" | "following" => "Following",
+            "declined" => "Declined",
+            "tentativelyaccepted" | "tentative" => "Tentative",
+            _ if self
+                .extra
+                .get("isFollowing")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true) =>
+            {
+                "Following"
+            }
+            _ if self.unconfirmed() => "Unconfirmed",
+            _ => "Confirmed",
+        }
+    }
+
+    pub fn attendee_count(&self) -> usize {
+        self.extra
+            .get("tomlook_attendees_total")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .filter(|count| *count >= self.attendees.len())
+            .unwrap_or(self.attendees.len())
+    }
+
+    pub fn tags(&self) -> Vec<&str> {
+        let mut tags: Vec<_> = match self
+            .extra
+            .get("categories")
+            .and_then(serde_json::Value::as_array)
+        {
+            Some(values) => values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .collect(),
+            None => self
+                .category
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect(),
+        };
+        if (matches!(self.status.as_str(), "tentativelyAccepted" | "tentative")
+            || self.extra.get("showAs").and_then(serde_json::Value::as_str) == Some("tentative"))
+            && !tags
+                .iter()
+                .any(|tag| tag.trim().to_lowercase() == "nejisté")
+        {
+            tags.push("nejisté");
+        }
+        tags
+    }
     pub fn validate(&self) -> Result<(), String> {
         if self.id.is_empty() || self.title.trim().is_empty() || self.end <= self.start {
             return Err("Meeting requires an identity, title and increasing zoned times".into());
@@ -57,6 +141,13 @@ impl Event {
             digest.update(attendee.len().to_le_bytes());
             digest.update(attendee.as_bytes());
         }
+        if let Some(fingerprint) = self
+            .extra
+            .get("tomlook_attendees_fingerprint")
+            .and_then(serde_json::Value::as_str)
+        {
+            digest.update(fingerprint.as_bytes());
+        }
         digest.update(b"tomlook-readonly-v1");
         format!("{:x}", digest.finalize())
     }
@@ -68,6 +159,22 @@ impl Event {
                 != (self.end - Duration::milliseconds(1))
                     .with_timezone(&Local)
                     .date_naive()
+    }
+
+    pub fn calendar_dates(&self) -> (NaiveDate, NaiveDate) {
+        // All-day boundaries are calendar dates, not instants to shift into the viewer's zone.
+        let (start, end) = if self.is_all_day {
+            (self.start, self.end)
+        } else {
+            (
+                self.start.with_timezone(&Local).fixed_offset(),
+                self.end.with_timezone(&Local).fixed_offset(),
+            )
+        };
+        (
+            start.date_naive(),
+            (end - Duration::nanoseconds(1)).date_naive(),
+        )
     }
 }
 
@@ -153,10 +260,12 @@ pub struct Day {
 #[derive(Default, Clone)]
 pub struct Calendar {
     pub events: Vec<Event>,
+    event_indices: BTreeMap<String, usize>,
     pub days: BTreeMap<NaiveDate, Day>,
     pub coverage: BTreeSet<NaiveDate>,
     pub search: Vec<String>,
     pub categories: Vec<String>,
+    category_keys: Vec<Vec<String>>,
     pub warnings: Vec<String>,
 }
 
@@ -180,15 +289,32 @@ impl Calendar {
             warnings,
             ..Default::default()
         };
-        result.categories = result
+        let mut categories = BTreeMap::new();
+        for category in result
             .events
             .iter()
-            .map(|event| event.category.clone())
+            .flat_map(Event::tags)
+            .map(str::trim)
             .filter(|category| !category.is_empty())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        {
+            let key = category.to_lowercase();
+            let label = categories
+                .entry(key.clone())
+                .or_insert_with(|| category.to_owned());
+            if category == key {
+                *label = category.to_owned();
+            }
+        }
+        result.categories = categories.into_values().collect();
         for (index, event) in result.events.iter().enumerate() {
+            result.category_keys.push(
+                event
+                    .tags()
+                    .into_iter()
+                    .map(|tag| tag.trim().to_lowercase())
+                    .collect(),
+            );
+            result.event_indices.insert(event.id.clone(), index);
             result.search.push(
                 format!(
                     "{} {} {} {} {}",
@@ -202,8 +328,7 @@ impl Calendar {
             );
             let start = event.start.with_timezone(&Local);
             let end = event.end.with_timezone(&Local);
-            let last = (end - Duration::milliseconds(1)).date_naive();
-            let mut date = start.date_naive();
+            let (mut date, last) = event.calendar_dates();
             while date <= last {
                 let day = result.days.entry(date).or_default();
                 day.events.push(index);
@@ -226,47 +351,60 @@ impl Calendar {
             }
         }
         for day in result.days.values_mut() {
-            let mut group_start = 0;
-            let mut group_end = -1.0_f32;
-            let mut lane_ends = Vec::<f32>::new();
-            for position in 0..day.timed.len() {
-                let slot = &day.timed[position];
-                if slot.start_minute >= group_end && position > group_start {
-                    let lanes = lane_ends.len();
-                    for prior in &mut day.timed[group_start..position] {
-                        prior.lanes = lanes;
-                    }
-                    lane_ends.clear();
-                    group_start = position;
-                }
-                let slot = &mut day.timed[position];
-                let lane = lane_ends
-                    .iter()
-                    .position(|end| *end <= slot.start_minute)
-                    .unwrap_or(lane_ends.len());
-                if lane == lane_ends.len() {
-                    lane_ends.push(slot.end_minute);
-                } else {
-                    lane_ends[lane] = slot.end_minute;
-                }
-                slot.lane = lane;
-                group_end = if position == group_start {
-                    slot.end_minute
-                } else {
-                    group_end.max(slot.end_minute)
-                };
-            }
-            let lanes = lane_ends.len();
-            for slot in &mut day.timed[group_start..] {
-                slot.lanes = lanes;
-            }
+            Self::layout_slots(&mut day.timed);
         }
         Ok(result)
     }
 
+    pub fn event_index(&self, id: &str) -> Option<usize> {
+        self.event_indices.get(id).copied()
+    }
+
+    /// Pack start-time-ordered slots, including a filtered subset, into non-overlapping lanes.
+    pub fn layout_slots(slots: &mut [Slot]) {
+        let mut group_start = 0;
+        let mut group_end = -1.0_f32;
+        let mut lane_ends = Vec::<f32>::new();
+        for position in 0..slots.len() {
+            let slot = &slots[position];
+            if slot.start_minute >= group_end && position > group_start {
+                let lanes = lane_ends.len();
+                for prior in &mut slots[group_start..position] {
+                    prior.lanes = lanes;
+                }
+                lane_ends.clear();
+                group_start = position;
+            }
+            let slot = &mut slots[position];
+            let lane = lane_ends
+                .iter()
+                .position(|end| *end <= slot.start_minute)
+                .unwrap_or(lane_ends.len());
+            if lane == lane_ends.len() {
+                lane_ends.push(slot.end_minute);
+            } else {
+                lane_ends[lane] = slot.end_minute;
+            }
+            slot.lane = lane;
+            group_end = if position == group_start {
+                slot.end_minute
+            } else {
+                group_end.max(slot.end_minute)
+            };
+        }
+        let lanes = lane_ends.len();
+        for slot in &mut slots[group_start..] {
+            slot.lanes = lanes;
+        }
+    }
+
     pub fn matches(&self, index: usize, query: &str, category: &str) -> bool {
         self.search[index].contains(query)
-            && (category.is_empty() || self.events[index].category == category)
+            && (category.is_empty()
+                || self.category_keys[index].iter().any(|tag| {
+                    tag.chars()
+                        .eq(category.trim().chars().flat_map(char::to_lowercase))
+                }))
     }
 }
 

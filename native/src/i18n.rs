@@ -1,0 +1,1473 @@
+use chrono::{Datelike, NaiveDate};
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Language {
+    #[default]
+    En,
+    Cs,
+}
+
+impl Language {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::En => "EN",
+            Self::Cs => "CZ",
+        }
+    }
+
+    pub fn other(self) -> Self {
+        match self {
+            Self::En => Self::Cs,
+            Self::Cs => Self::En,
+        }
+    }
+
+    pub fn text<'a>(self, text: &'a str) -> Cow<'a, str> {
+        if self == Self::En || text.is_empty() {
+            return Cow::Borrowed(text);
+        }
+        for &(en, cs) in TEXTS {
+            if text == en {
+                return Cow::Borrowed(cs);
+            }
+        }
+        if text.contains('\n') {
+            return Cow::Owned(
+                text.lines()
+                    .map(|line| self.text(line))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        for &(en, cs) in PATTERNS {
+            if let Some(values) = capture(en, text) {
+                let mut translated = String::with_capacity(text.len());
+                let mut remaining = cs;
+                while let Some(start) = remaining.find('{') {
+                    translated.push_str(&remaining[..start]);
+                    let (index, tail) = remaining[start + 1..]
+                        .split_once('}')
+                        .expect("Catalog has balanced placeholders");
+                    let index: usize = index.parse().expect("Catalog placeholders are numbered");
+                    translated.push_str(&self.text(values[index]));
+                    remaining = tail;
+                }
+                translated.push_str(remaining);
+                return Cow::Owned(translated);
+            }
+        }
+        Cow::Borrowed(text)
+    }
+
+    pub fn month(self, date: NaiveDate) -> String {
+        const MONTHS: [&str; 12] = [
+            "leden",
+            "únor",
+            "březen",
+            "duben",
+            "květen",
+            "červen",
+            "červenec",
+            "srpen",
+            "září",
+            "říjen",
+            "listopad",
+            "prosinec",
+        ];
+        match self {
+            Self::En => date.format("%B %Y").to_string(),
+            Self::Cs => format!("{} {}", MONTHS[date.month0() as usize], date.year()),
+        }
+    }
+
+    pub fn date(self, date: NaiveDate, full: bool) -> String {
+        const DAYS: [&str; 7] = ["Po", "Út", "St", "Čt", "Pá", "So", "Ne"];
+        const FULL: [&str; 7] = [
+            "pondělí",
+            "úterý",
+            "středa",
+            "čtvrtek",
+            "pátek",
+            "sobota",
+            "neděle",
+        ];
+        match self {
+            Self::En => date
+                .format(if full { "%A, %e %B %Y" } else { "%a %e" })
+                .to_string(),
+            Self::Cs if full => format!(
+                "{}, {}. {}. {}",
+                FULL[date.weekday().num_days_from_monday() as usize],
+                date.day(),
+                date.month(),
+                date.year()
+            ),
+            Self::Cs => format!(
+                "{} {}.",
+                DAYS[date.weekday().num_days_from_monday() as usize],
+                date.day()
+            ),
+        }
+    }
+
+    pub fn range(self, first: NaiveDate, last: NaiveDate) -> String {
+        match self {
+            Self::En => format!("{} - {}", first.format("%e %b"), last.format("%e %b %Y")),
+            Self::Cs => format!(
+                "{}. {}. – {}. {}. {}",
+                first.day(),
+                first.month(),
+                last.day(),
+                last.month(),
+                last.year()
+            ),
+        }
+    }
+
+    pub fn insight(self, value: &serde_json::Value) -> Option<&serde_json::Value> {
+        if self == Self::En {
+            Some(value)
+        } else {
+            value.get("cs").filter(|value| value.is_object())
+        }
+    }
+}
+
+fn capture<'a>(pattern: &str, text: &'a str) -> Option<Vec<&'a str>> {
+    let mut parts = pattern.split("{}").peekable();
+    let mut remaining = text.strip_prefix(parts.next()?)?;
+    let mut values = Vec::new();
+    while let Some(suffix) = parts.next() {
+        if suffix.is_empty() && parts.peek().is_none() {
+            values.push(remaining);
+            remaining = "";
+        } else {
+            let end = remaining.find(suffix)?;
+            values.push(&remaining[..end]);
+            remaining = &remaining[end + suffix.len()..];
+        }
+    }
+    remaining.is_empty().then_some(values)
+}
+
+pub const TEXTS: &[(&str, &str)] = &[
+    ("Demo", "Demo"),
+    (
+        "Offline demo - fictional calendar",
+        "Offline demo - smyšlený kalendář",
+    ),
+    (
+        "Sample Insights - not generated by AI",
+        "Ukázkový přehled - bez generování AI",
+    ),
+    ("Meeting actions", "Akce schůzky"),
+    ("Meeting action", "Změna schůzky"),
+    ("Check calendar result", "Ověřit výsledek změny"),
+    (
+        "Calendar verification could not be queued; no write was repeated",
+        "Ověření změny se nepodařilo zařadit do fronty. Žádný zápis se neopakoval.",
+    ),
+    (
+        "Calendar verification timed out; no write was repeated",
+        "Ověření změny překročilo časový limit. Žádný zápis se neopakoval.",
+    ),
+    (
+        "Calendar verification is unavailable or busy; no write was repeated",
+        "Ověření změny teď není dostupné nebo právě probíhá jiná operace. Žádný zápis se neopakoval.",
+    ),
+    (
+        "Checking the previous calendar result; no write will be repeated",
+        "Ověřuji výsledek předchozí změny. Žádný zápis se nebude opakovat.",
+    ),
+    (
+        "Read exact calendar approval failed",
+        "Nepodařilo se načíst přesné schválení změny.",
+    ),
+    (
+        "Saved calendar approval is invalid",
+        "Uložené schválení změny není platné.",
+    ),
+    (
+        "Saved manual calendar action has no exact change",
+        "Uložená akce schůzky neobsahuje přesnou změnu.",
+    ),
+    (
+        "Calendar removal identity did not match its approval",
+        "Smazaná událost neodpovídá schválené změně.",
+    ),
+    (
+        "Confirmed calendar approval disappeared",
+        "Uložené schválení změny kalendáře není dostupné.",
+    ),
+    ("Confirm meeting action", "Potvrzení změny schůzky"),
+    ("Change category", "Změnit kategorii"),
+    ("Remove category", "Odebrat kategorii"),
+    ("Accept invitation", "Přijmout pozvánku"),
+    ("Tentatively accept", "Přijmout nezávazně"),
+    ("Decline invitation", "Odmítnout pozvánku"),
+    ("Cancel organized meeting", "Zrušit schůzku pro všechny"),
+    ("Delete own appointment", "Smazat vlastní událost"),
+    ("Account", "Účet"),
+    ("Organizer", "Organizátor"),
+    ("Shift+F10: meeting actions", "Shift+F10: akce schůzky"),
+    ("Comment (optional)", "Komentář (nepovinný)"),
+    ("Delete event", "Smazat událost"),
+    ("Delete", "Smazat"),
+    ("Back", "Zpět"),
+    ("Ask AI", "Zeptat se AI"),
+    ("More options", "Další možnosti"),
+    ("Copy answer", "Kopírovat odpověď"),
+    ("Thinking...", "Přemýšlím…"),
+    ("This occurrence only", "Jen tento výskyt"),
+    ("Notifies all attendees.", "Oznámí se všem účastníkům."),
+    (
+        "Send response to organizer",
+        "Odeslat odpověď organizátorovi",
+    ),
+    (
+        "Confirmation sends this response and comment.",
+        "Potvrzením odešlete tuto odpověď a komentář.",
+    ),
+    (
+        "No message will be sent to the organizer.",
+        "Organizátorovi se neodešle žádná zpráva.",
+    ),
+    (
+        "Only this occurrence will change, never the whole series.",
+        "Změní se jen tato událost nebo výskyt, nikdy celá série.",
+    ),
+    (
+        "Cancels your meeting and notifies all attendees.",
+        "Zruší vaši schůzku a odešle oznámení všem účastníkům.",
+    ),
+    (
+        "Removes your own appointment. There are no attendees to notify.",
+        "Smaže vaši vlastní událost. Nemá žádné účastníky, kterým by se odesílalo oznámení.",
+    ),
+    (
+        "All existing categories will be removed.",
+        "Odeberou se všechny dosavadní kategorie.",
+    ),
+    (
+        "Meeting or account changed; close this dialog and review the current meeting.",
+        "Schůzka nebo účet se změnily. Zavřete dialog a zkontrolujte aktuální schůzku.",
+    ),
+    (
+        "Refresh the calendar first; actions require one verified occurrence, not a whole series",
+        "Nejdřív obnovte kalendář. Akce vyžadují ověřenou jednotlivou událost nebo výskyt, ne celou sérii.",
+    ),
+    (
+        "Cancelled meetings cannot be changed",
+        "Zrušené schůzky nelze měnit.",
+    ),
+    (
+        "Comment exceeds its 4096-byte limit or contains unsupported control characters",
+        "Komentář je příliš dlouhý (limit 4096 bajtů) nebo obsahuje nepodporované řídicí znaky.",
+    ),
+    (
+        "A comment requires sending the response",
+        "Komentář lze přidat jen k odesílané odpovědi.",
+    ),
+    (
+        "Meeting action does not match your organizer or attendee role",
+        "Tuto akci nelze provést v roli, kterou u schůzky máte.",
+    ),
+    (
+        "Calendar provider has no verified meeting action capability",
+        "Poskytovatel nemá ověřenou podporu této akce. Nic nebylo odesláno.",
+    ),
+    (
+        "Review the previous calendar operation before confirming another change",
+        "Před další změnou zkontrolujte výsledek předchozí operace s kalendářem.",
+    ),
+    (
+        "The meeting already has no category; no write was submitted",
+        "Schůzka už nemá kategorii. Žádný zápis nebyl odeslán.",
+    ),
+    (
+        "The meeting already has this response; no write was submitted",
+        "Schůzka už má tuto odpověď. Nic nebylo odesláno.",
+    ),
+    ("Category", "Kategorie"),
+    (
+        "Calendar coverage is incomplete; no write was submitted",
+        "Kalendář není načtený pro celý navržený čas. Žádný zápis nebyl odeslán.",
+    ),
+    ("Recommendations", "Doporučení"),
+    ("Diagnostics", "Diagnostika"),
+    ("Preparation", "Příprava"),
+    ("Travel buffer", "Rezerva na přejezd"),
+    ("Missing materials", "Chybějící podklady"),
+    ("Priority conflict", "Souběh důležitých schůzek"),
+    ("Follow-up", "Připomenutí po schůzce"),
+    ("Meeting transition", "Přechod mezi schůzkami"),
+    ("Why?", "Proč?"),
+    ("None", "Žádná"),
+    ("Previous", "Předchozí"),
+    ("Next", "Další"),
+    ("Confirm calendar change", "Potvrdit změnu kalendáře"),
+    ("Open Insights", "Otevřít přehled"),
+    ("Draft follow-up", "Připravit navazující koncept"),
+    (
+        "Prepare a local follow-up draft for this meeting using saved Insights and retrieved evidence. Separate verified outcomes from pre-meeting plans; use placeholders for unknown decisions, owners and dates. Do not send any message, invite attendees or modify the calendar.",
+        "Připrav lokální koncept navazující zprávy k této schůzce podle uloženého přehledu a získaných podkladů. Odděl ověřené výsledky od plánů před schůzkou; pro neznámá rozhodnutí, odpovědné osoby a termíny použij zástupná místa. Nic neodesílej, nezvi účastníky ani neměň kalendář.",
+    ),
+    (
+        "An unsent question is already saved for this meeting; it was preserved. Review it before asking for a follow-up draft.",
+        "U této schůzky už máš rozepsaný dotaz. Zůstal zachovaný; před přípravou navazujícího konceptu ho zkontroluj.",
+    ),
+    (
+        "Recommendation changed or is no longer available; refresh Insights before preparing a draft.",
+        "Doporučení se změnilo nebo už není dostupné. Před přípravou konceptu obnov přehled schůzky.",
+    ),
+    (
+        "Meeting is no longer in the current calendar.",
+        "Schůzka už není v aktuálním kalendáři.",
+    ),
+    (
+        "Replaces all previous categories with this single category.",
+        "Nahradí všechny původní kategorie touto jedinou.",
+    ),
+    (
+        "Suggested slots use weekdays, 08:00-18:00 local time.",
+        "Návrhy používají pracovní dny od 8 do 18 hodin místního času.",
+    ),
+    (
+        "Free in the confirmed calendar; actual availability is not verified.",
+        "Mezi potvrzenými schůzkami je volno. Skutečná dostupnost není ověřená.",
+    ),
+    (
+        "Travel duration is an estimate; live traffic has not been verified.",
+        "Doba přejezdu je odhad. Aktuální provoz není ověřený.",
+    ),
+    (
+        "No free interval fits the proposed buffer; adjust the calendar first",
+        "Pro navrženou rezervu není volný úsek. Nejdřív upravte kalendář.",
+    ),
+    (
+        "Recommendation expired after a calendar change",
+        "Po změně kalendáře už doporučení není aktuální.",
+    ),
+    (
+        "Calendar change verified by read-back",
+        "Změna kalendáře byla ověřená opětovným načtením.",
+    ),
+    (
+        "Confirmed calendar change is running",
+        "Provádí se potvrzená změna kalendáře.",
+    ),
+    (
+        "Calendar change was not queued; nothing was submitted",
+        "Změna se nedostala do fronty. Do kalendáře nebyl odeslán žádný zápis.",
+    ),
+    (
+        "Calendar writes are unavailable or busy; nothing was submitted",
+        "Zápis do kalendáře není dostupný nebo právě probíhá jiný zápis. Nic nebylo odesláno.",
+    ),
+    (
+        "Tomlook is stopping; no calendar write was submitted",
+        "Tomlook se ukončuje. Do kalendáře nebyl odeslán žádný zápis.",
+    ),
+    (
+        "Connect WorkIQ before confirming a calendar change",
+        "Před potvrzením změny kalendáře připojte WorkIQ.",
+    ),
+    (
+        "Calendar approval was already consumed; inspect the previous outcome",
+        "Toto potvrzení už bylo použité. Zkontrolujte předchozí výsledek.",
+    ),
+    (
+        "The proposed interval or action changed; review the current recommendation before confirming",
+        "Navržený čas nebo změna už nejsou stejné. Před potvrzením si prohlédněte aktuální doporučení.",
+    ),
+    (
+        "Meeting changed after the recommendation; no calendar write was submitted",
+        "Schůzka se od vytvoření doporučení změnila. Žádný zápis nebyl odeslán.",
+    ),
+    (
+        "The meeting already has the proposed category; no write was submitted",
+        "Schůzka už má navrženou kategorii. Žádný zápis nebyl odeslán.",
+    ),
+    (
+        "The proposed interval is no longer free; no calendar write was submitted",
+        "Navržený čas už není volný. Žádný zápis nebyl odeslán.",
+    ),
+    (
+        "WorkIQ denied this calendar change. Your tenant may block mutations; an administrator must enable calendar writes. Nothing was changed by this request.",
+        "WorkIQ tuto změnu odmítl. Zápisy může blokovat pravidlo organizace; povolit je musí správce. Tento požadavek nic nezměnil.",
+    ),
+    (
+        "Calendar write outcome is uncertain. Inspect Outlook before proposing another change; this operation will not be replayed automatically.",
+        "Výsledek zápisu do kalendáře není jistý. Před další změnou zkontrolujte Outlook. Tento zápis se automaticky neopakuje.",
+    ),
+    (
+        "Calendar write was returned but read-back did not verify the exact change. Inspect Outlook; the operation will not be replayed automatically.",
+        "Zápis dostal odpověď, ale opětovné načtení nepotvrdilo přesnou změnu. Zkontrolujte Outlook. Zápis se automaticky neopakuje.",
+    ),
+    (
+        "WorkIQ has no compatible calendar write tool; read-only research remains available",
+        "WorkIQ nenabízí kompatibilní nástroj pro zápis do kalendáře. Čtení a hledání souvislostí zůstává dostupné.",
+    ),
+    (
+        "Calendar schema discovery timed out",
+        "Vypršel čas pro ověření rozhraní kalendáře.",
+    ),
+    (
+        "Calendar schema discovery failed; no write was submitted",
+        "Rozhraní kalendáře se nepodařilo ověřit. Žádný zápis nebyl odeslán.",
+    ),
+    (
+        "Calendar provider did not return a compatible JSON schema; no write was submitted",
+        "Poskytovatel nevrátil kompatibilní popis rozhraní kalendáře. Žádný zápis nebyl odeslán.",
+    ),
+    (
+        "Recommendation inbox reached its safety limit",
+        "Schránka doporučení dosáhla bezpečnostního limitu.",
+    ),
+    ("AI usage", "Spotřeba AI"),
+    ("Daily AI request limit", "Denní limit AI požadavků"),
+    ("Requests", "Požadavky"),
+    ("Input tokens", "Vstupní tokeny"),
+    ("Cache read tokens", "Tokeny načtené z cache"),
+    ("Cache write tokens", "Tokeny uložené do cache"),
+    ("Output tokens", "Výstupní tokeny"),
+    ("Unavailable", "Není k dispozici"),
+    (
+        "Requests with reported usage",
+        "Požadavky s nahlášenou spotřebou",
+    ),
+    (
+        "Measured SDK tokens only; missing usage is not zero or a currency estimate.",
+        "Pouze tokeny nahlášené SDK. Chybějící údaj neznamená nulu ani odhad ceny.",
+    ),
+    (
+        "Usage accounting is loading.",
+        "Načítá se přehled spotřeby.",
+    ),
+    (
+        "Retrying saved sign-in...",
+        "Obnovuje se uložené připojení...",
+    ),
+    (
+        "Unconfirmed meeting: prepare explicitly when needed",
+        "Nepotvrzená schůzka: přípravu spusťte podle potřeby",
+    ),
+    (
+        "Daily AI request limit reached; queued research is deferred until tomorrow.",
+        "Denní limit AI požadavků byl vyčerpán. Příprava ve frontě bude pokračovat zítra.",
+    ),
+    (
+        "AI diagnostics or usage could not be saved completely; inspect the application log before relying on totals.",
+        "Diagnostiku nebo spotřebu AI se nepodařilo uložit úplně. Před použitím součtů zkontrolujte protokol aplikace.",
+    ),
+    ("Today", "Dnes"),
+    ("Task note", "Poznámka k úkolu"),
+    ("Email draft", "Koncept e-mailu"),
+    ("Calendar suggestion", "Návrh do kalendáře"),
+    ("Target", "Cíl"),
+    ("Body", "Text"),
+    (
+        "Workplace search summary",
+        "Souhrn hledání v pracovních zdrojích",
+    ),
+    ("Message read", "Původní zpráva"),
+    ("Meeting read", "Původní schůzka"),
+    ("Mail search results", "Výsledky hledání v poště"),
+    ("Calendar results", "Výsledky z kalendáře"),
+    ("Mail and meetings", "Pošta a schůzky"),
+    ("Customer documents", "Dokumenty zákazníka"),
+    ("Local demos and repositories", "Místní dema a repozitáře"),
+    ("Local document", "Místní dokument"),
+    ("Checking saved sign-in...", "Ověřuji uložené přihlášení…"),
+    (
+        "Sign-in expired; sign in again",
+        "Přihlášení vypršelo. Přihlaste se znovu.",
+    ),
+    ("Indexing local sources...", "Načítám místní zdroje…"),
+    (
+        "No local sources configured; cloud research uses WorkIQ",
+        "Místní zdroje nejsou nastavené. Podklady v cloudu se hledají přes WorkIQ.",
+    ),
+    (
+        "Preview does not connect to providers",
+        "Náhled se nepřipojuje ke službám",
+    ),
+    ("Connection is already busy", "Připojení už pracuje"),
+    (
+        "Saved sign-in removal is already in progress",
+        "Uložené přihlášení se už maže",
+    ),
+    (
+        "AI is already connected or connecting.",
+        "AI je už připojená nebo se připojuje.",
+    ),
+    (
+        "Starting isolated SDK browser sign-in; no terminal or model request...",
+        "Spouštím přihlášení izolovaného SDK v prohlížeči. Bez terminálu a dotazu na AI…",
+    ),
+    (
+        "WorkIQ is connected or busy; disconnect before changing accounts.",
+        "WorkIQ je připojené nebo pracuje. Před změnou účtu jej odpojte.",
+    ),
+    ("Connecting WorkIQ...", "Připojuji WorkIQ…"),
+    (
+        "Removing WorkIQ sign-in; cached calendar retained.",
+        "Mažu přihlášení k WorkIQ. Uložený kalendář zůstane zachovaný.",
+    ),
+    (
+        "Sign in to WorkIQ before refreshing the calendar.",
+        "Před aktualizací kalendáře se přihlaste k WorkIQ.",
+    ),
+    ("Connecting isolated SDK...", "Připojuji izolované SDK…"),
+    (
+        "Isolated SDK is already connected",
+        "Izolované SDK je už připojené",
+    ),
+    (
+        "Connecting isolated SDK on its own worker...",
+        "Připojuji izolované SDK na pozadí…",
+    ),
+    (
+        "Disconnected; saved sign-in removed",
+        "Odpojeno. Uložené přihlášení bylo smazáno.",
+    ),
+    (
+        "WorkIQ connection cancelled; no new reads are admitted.",
+        "Připojení WorkIQ bylo zrušeno. Další načítání se nespustí.",
+    ),
+    (
+        "WorkIQ refresh cancelled after disconnect; no calendar was published.",
+        "Po odpojení byla aktualizace WorkIQ zrušena. Kalendář se nezměnil.",
+    ),
+    (
+        "WorkIQ disconnected. Cached calendar retained; work credentials released.",
+        "WorkIQ je odpojené. Uložený kalendář zůstává dostupný a přihlašovací údaje byly uvolněny.",
+    ),
+    (
+        "AI sign-in finished; see the connection status.",
+        "Přihlašování k AI skončilo. Zkontrolujte stav připojení.",
+    ),
+    ("Stopping...", "Ukončuji…"),
+    (
+        "WorkIQ disconnected; sign in again",
+        "WorkIQ je odpojené. Přihlaste se znovu.",
+    ),
+    (
+        "WorkIQ connection expired or failed during the answer; sign in again.",
+        "Během zpracování odpovědi připojení WorkIQ vypršelo nebo selhalo. Přihlaste se znovu.",
+    ),
+    (
+        "Meeting removed, cancelled, elapsed or outside preparation horizon",
+        "Schůzka zmizela, byla zrušena, skončila nebo je mimo období přípravy",
+    ),
+    (
+        "Meeting or AI configuration changed; inspect the previous outcome before explicit retry",
+        "Schůzka nebo nastavení AI se změnily. Před opakováním zkontrolujte předchozí výsledek.",
+    ),
+    (
+        "Meeting or AI configuration changed",
+        "Schůzka nebo nastavení AI se změnily",
+    ),
+    (
+        "Refreshing upcoming meeting context",
+        "Obnovuji souvislosti k nadcházející schůzce",
+    ),
+    (
+        "Calendar coverage is unverified; no automatic analysis",
+        "Kalendář v tomto období ještě není ověřený. Automatická analýza se nespustí.",
+    ),
+    (
+        "Waiting for an execution slot",
+        "Čeká na volné místo pro zpracování",
+    ),
+    (
+        "Deferred: bounded queue is full",
+        "Odloženo: fronta je plná",
+    ),
+    (
+        "Refresh this meeting's calendar before preparing it.",
+        "Před zjištěním souvislostí aktualizujte kalendář této schůzky.",
+    ),
+    (
+        "This meeting is already being prepared.",
+        "Souvislosti k této schůzce se už zjišťují.",
+    ),
+    (
+        "Preparation could not be queued.",
+        "Zjištění souvislostí se nepodařilo zařadit do fronty.",
+    ),
+    (
+        "Yielded to an explicit meeting preparation",
+        "Uvolněno pro ručně vyžádané zjištění souvislostí",
+    ),
+    ("AI is not connected", "AI není připojená"),
+    (
+        "Execution capacity is reserved or busy",
+        "Zpracování je obsazené nebo vyhrazené",
+    ),
+    (
+        "Saved result validated; citations are not independently verified",
+        "Uložený výsledek prošel kontrolou formátu. Odkazy nejsou nezávisle ověřené.",
+    ),
+    ("Switch language", "Přepnout jazyk"),
+    ("Refresh", "Obnovit"),
+    ("Tomlook Focus logo", "Logo Tomlook Focus"),
+    ("Ask about this meeting", "Zeptat se na tuto schůzku"),
+    (
+        "Translated saved Insights; no new research was performed.",
+        "Přeložený uložený přehled. Nové podklady se nedohledávaly.",
+    ),
+    (
+        "Czech version is not saved yet. Research now can create both languages.",
+        "Česká verze zatím není uložená. Zjištění souvislostí vytvoří obě jazykové verze.",
+    ),
+    ("Sources not indexed yet", "Zdroje zatím nejsou načtené"),
+    (
+        "WorkIQ authentication has not been tested",
+        "Přihlášení k WorkIQ zatím nebylo ověřené",
+    ),
+    (
+        "Local queue is full. Nothing was submitted; try again.",
+        "Místní fronta je plná. Nic se neodeslalo, zkuste to znovu.",
+    ),
+    (
+        "The storage worker is unavailable. Restart Tomlook.",
+        "Ukládání není dostupné. Restartujte Tomlook.",
+    ),
+    (
+        "AI shutdown coordinator is unavailable",
+        "Řízené ukončení AI není dostupné",
+    ),
+    (
+        "The meeting changed or disappeared. The old result was invalidated and cancellation requested; review the updated context before asking again.",
+        "Schůzka se změnila nebo zmizela. Předchozí odpověď už není platná a bylo vyžádáno zrušení dotazu. Než se znovu zeptáte, zkontrolujte souvislosti.",
+    ),
+    (
+        "Company icon exceeds its display limit",
+        "Ikona společnosti překračuje limit pro zobrazení",
+    ),
+    (
+        "No icon found on the company's own website",
+        "Na webu společnosti nebyla nalezena ikona",
+    ),
+    (
+        "Photo exceeds its display limit",
+        "Fotografie překračuje limit pro zobrazení",
+    ),
+    (
+        "Photo lookup could not be admitted",
+        "Načtení fotografie se nepodařilo zařadit do fronty",
+    ),
+    (
+        "AI response exceeded the local-proposal limit",
+        "Odpověď AI obsahuje příliš mnoho místních návrhů",
+    ),
+    (
+        "AI answer exceeded the 64 KiB response limit; no answer was published.",
+        "Odpověď AI překročila limit 64 KiB a nebyla zobrazena.",
+    ),
+    ("AI stopped", "AI byla zastavena"),
+    ("Messages", "Zprávy"),
+    ("No messages.", "Žádné zprávy."),
+    ("Review interrupted jobs", "Zkontrolovat přerušené úlohy"),
+    (
+        "Renewing saved GitHub sign-in...",
+        "Obnovuji přihlášení ke GitHubu…",
+    ),
+    (
+        "AI executor stopped before an outcome was recorded; inspect saved evidence before explicit retry",
+        "AI skončila bez uloženého výsledku. Zkontrolujte podklady; tuto úlohu spusťte znovu ručně.",
+    ),
+    (
+        "Saved GitHub sign-in has no refresh token; sign in once to enable automatic renewal",
+        "Starší přihlášení ke GitHubu neobsahuje obnovovací token. Přihlaste se jednou znovu, další obnova už bude automatická.",
+    ),
+    (
+        "Saved GitHub refresh credentials are incomplete; sign in again",
+        "Obnovovací údaje GitHubu nejsou úplné. Přihlaste se znovu.",
+    ),
+    (
+        "GitHub token renewal was rejected; sign in again",
+        "GitHub odmítl obnovu přihlášení. Přihlaste se znovu.",
+    ),
+    (
+        "Saved GitHub sign-in cannot be renewed; sign in again",
+        "Uložené přihlášení ke GitHubu nelze obnovit. Přihlaste se znovu.",
+    ),
+    (
+        "GitHub refresh token expired; sign in again",
+        "Platnost obnovovacího tokenu GitHubu skončila. Přihlaste se znovu.",
+    ),
+    (
+        "GitHub token renewal could not reach the provider; retrying shortly",
+        "GitHub není pro obnovu přihlášení dostupný. Obnovu zkusíme znovu.",
+    ),
+    (
+        "GitHub token renewal returned no refresh token; sign in again",
+        "GitHub při obnově nevrátil obnovovací token. Přihlaste se znovu.",
+    ),
+    (
+        "GitHub returned an invalid token lifetime",
+        "GitHub vrátil neplatnou dobu platnosti tokenu.",
+    ),
+    (
+        "Preparation outcome delivery timed out; inspect the interrupted ledger",
+        "Předání výsledku přehledu překročilo časový limit. Zkontrolujte přerušenou úlohu.",
+    ),
+    (
+        "Preparation outcome could not reach storage; inspect the interrupted ledger",
+        "Výsledek přehledu se nepodařilo předat úložišti. Zkontrolujte přerušenou úlohu.",
+    ),
+    (
+        "Connector configuration could not reach storage; restart before new research",
+        "Nastavení připojení se nepodařilo předat úložišti. Před dalším výzkumem restartujte Tomlook.",
+    ),
+    (
+        "AI is stopping; the previous result was discarded",
+        "AI se ukončuje; nedokončený výsledek nebyl zveřejněn",
+    ),
+    (
+        "Cancelled before the question was sent",
+        "Zrušeno před odesláním dotazu",
+    ),
+    (
+        "AI stopped without a completed answer; provider outcome may be unknown",
+        "AI skončila bez úplné odpovědi. Výsledek u poskytovatele nemusí být známý.",
+    ),
+    (
+        "AI command queue is full; nothing was submitted. Try again.",
+        "Fronta AI je plná. Nic se neodeslalo, zkuste to znovu.",
+    ),
+    (
+        "The AI worker is unavailable. Restart Tomlook.",
+        "AI není dostupná. Restartujte Tomlook.",
+    ),
+    (
+        "Cancellation requested; partial output is not a completed answer. Provider outcome may be unknown.",
+        "Bylo vyžádáno zrušení dotazu. Částečný výstup není hotová odpověď a výsledek u poskytovatele nemusí být známý.",
+    ),
+    (
+        "AI cancellation could not be submitted. Its result will be discarded, but the provider request may continue until timeout or application exit.",
+        "Zrušení dotazu se nepodařilo odeslat. Odpověď bude zahozena, ale požadavek u poskytovatele může pokračovat až do vypršení limitu nebo ukončení aplikace.",
+    ),
+    (
+        "Meeting context changed. The previous answer was invalidated; review your draft before asking again.",
+        "Souvislosti schůzky se změnily. Předchozí odpověď už není platná. Než se znovu zeptáte, zkontrolujte rozepsaný dotaz.",
+    ),
+    (
+        "Assistant memory holds 32 contexts. Return to an existing context or restart Tomlook to clear memory. No new question can be submitted for the requested context.",
+        "Asistent má v paměti 32 kontextů. Vraťte se k některému z nich nebo restartujte Tomlook. Pro nový kontext zatím nelze odeslat dotaz.",
+    ),
+    (
+        "Use a nonempty question of at most 8,000 bytes.",
+        "Napište dotaz o délce nejvýše 8 000 bajtů.",
+    ),
+    (
+        "Assistant request identity limit reached. No question was submitted; restart Tomlook.",
+        "Byl dosažen limit dotazů asistenta. Nic se neodeslalo. Restartujte Tomlook.",
+    ),
+    (
+        "Resolve the assistant context warning before keeping a draft; nothing was kept",
+        "Než uložíte koncept, vyřešte upozornění na kontext asistenta. Nic nebylo uloženo.",
+    ),
+    (
+        "Eight local drafts already occupy this context; discard one before keeping another",
+        "V tomto kontextu už je osm konceptů. Před uložením dalšího některý zahoďte.",
+    ),
+    (
+        "This proposal is already a local draft; nothing was duplicated",
+        "Tento návrh už je uložený jako koncept. Další kopie nevznikla.",
+    ),
+    (
+        "Local draft identity limit reached; nothing was added. Restart Tomlook to clear memory.",
+        "Byl dosažen limit místních konceptů. Nic nepřibylo. Paměť uvolníte restartem Tomlooku.",
+    ),
+    (
+        "Resolve the assistant context warning before adding a draft; nothing was added",
+        "Než přidáte koncept, vyřešte upozornění na kontext asistenta. Nic nepřibylo.",
+    ),
+    (
+        "Eight local drafts already occupy this context; discard one before adding another",
+        "V tomto kontextu už je osm konceptů. Před přidáním dalšího některý zahoďte.",
+    ),
+    (
+        "Calendar view has no first day",
+        "Zobrazení kalendáře nemá první den",
+    ),
+    (
+        "Calendar view has no last day",
+        "Zobrazení kalendáře nemá poslední den",
+    ),
+    (
+        "Calendar refresh queued...",
+        "Aktualizace kalendáře čeká ve frontě…",
+    ),
+    (
+        "AI browser sign-in queued...",
+        "Přihlášení k AI čeká ve frontě…",
+    ),
+    ("Removing saved sign-in...", "Mažu uložené přihlášení…"),
+    (
+        "WorkIQ connection queued...",
+        "Připojení WorkIQ čeká ve frontě…",
+    ),
+    (
+        "Removing saved WorkIQ sign-in...",
+        "Mažu uložené přihlášení k WorkIQ…",
+    ),
+    (
+        "Use up to eight specific document folders and four absolute repository collection paths.",
+        "Zadejte nejvýše osm konkrétních složek s dokumenty a čtyři absolutní cesty ke složkám s repozitáři.",
+    ),
+    ("Day", "Den"),
+    ("Work week", "Pracovní týden"),
+    ("Week", "Týden"),
+    ("Month", "Měsíc"),
+    ("Monday", "Pondělí"),
+    ("Tuesday", "Úterý"),
+    ("Wednesday", "Středa"),
+    ("Thursday", "Čtvrtek"),
+    ("Friday", "Pátek"),
+    ("Saturday", "Sobota"),
+    ("Sunday", "Neděle"),
+    ("Commands", "Příkazy"),
+    ("Accent", "Barva"),
+    ("Blue", "Modrá"),
+    ("Red", "Červená"),
+    ("Green", "Zelená"),
+    ("Yellow", "Žlutá"),
+    ("Light", "Světlý"),
+    ("Dark", "Tmavý"),
+    ("Ask", "Zeptat se"),
+    ("Clear", "Vymazat"),
+    ("Search meetings", "Hledat schůzky"),
+    ("Search commands...", "Hledat příkazy…"),
+    ("No matching commands", "Žádné odpovídající příkazy"),
+    ("Previous period - Alt+Left", "Předchozí období – Alt+vlevo"),
+    ("Next period - Alt+Right", "Další období – Alt+vpravo"),
+    ("Show this work week", "Zobrazit tento pracovní týden"),
+    ("Hide unconfirmed", "Skrýt nepotvrzené"),
+    ("Unconfirmed", "Nepotvrzeno"),
+    ("Confirmed", "Potvrzeno"),
+    ("Tentative", "Nezávazně"),
+    ("Following", "Sledováno"),
+    ("Declined", "Odmítnuto"),
+    ("All day", "Celý den"),
+    ("Not synced", "Nenačteno"),
+    ("CATEGORIES", "KATEGORIE"),
+    ("All meetings", "Všechny schůzky"),
+    ("KEYBOARD", "KLÁVESOVÉ ZKRATKY"),
+    ("Ctrl+F   Search", "Ctrl+F   Hledání"),
+    ("Ctrl+Shift+P   Commands", "Ctrl+Shift+P   Příkazy"),
+    ("Ctrl+Space   Ask", "Ctrl+Space   Dotaz"),
+    ("Alt+Left / Right   Period", "Alt+vlevo / vpravo   Období"),
+    ("Up / Down   Meeting", "Nahoru / dolů   Schůzka"),
+    ("Esc   Close", "Esc   Zavřít"),
+    ("Tab / Shift+Tab   Focus", "Tab / Shift+Tab   Přechod"),
+    ("Reload local cache", "Načíst uložený kalendář"),
+    ("MEETING", "SCHŮZKA"),
+    ("Close", "Zavřít"),
+    ("Guests", "Hosté"),
+    ("People", "Účastníci"),
+    ("Researching...", "Zjišťuji souvislosti…"),
+    ("Research now", "Zjistit souvislosti"),
+    ("Insights", "Přehled"),
+    ("Expand", "Rozbalit"),
+    ("Meeting Insights", "Přehled ke schůzce"),
+    ("Prepare", "Co připravit"),
+    ("Talking points", "Témata k diskusi"),
+    ("Open questions", "Otevřené otázky"),
+    ("Risks", "Na co si dát pozor"),
+    ("Evidence gaps", "Co se nepodařilo ověřit"),
+    ("SOURCES", "ZDROJE"),
+    ("Sources", "Zdroje"),
+    ("Retrieved context", "Dohledané souvislosti"),
+    ("Source", "Zdroj"),
+    ("Untitled source", "Zdroj bez názvu"),
+    (
+        "Referenced in captured results",
+        "Odkaz nalezen v dohledaných výsledcích",
+    ),
+    (
+        "A matching URL is not verification of the source's claims.",
+        "Nalezený odkaz sám o sobě nepotvrzuje tvrzení zdroje.",
+    ),
+    (
+        "Not found in captured results",
+        "Odkaz není v uložených výsledcích",
+    ),
+    (
+        "Capture is bounded. This does not mean the source does not exist.",
+        "Ukládáme omezené množství výsledků. Zdroj přesto může existovat.",
+    ),
+    ("Unverified citation", "Neověřený odkaz"),
+    ("Retrieval failed", "Načtení se nezdařilo"),
+    (
+        "Excerpt only, not the complete source.",
+        "Jen výňatek, nikoli celý zdroj.",
+    ),
+    ("Open cited source", "Otevřít původní zdroj"),
+    (
+        "Automatic Insights are disabled.",
+        "Automatické přehledy jsou vypnuté.",
+    ),
+    (
+        "Automatic Insights are paused.",
+        "Automatické přehledy jsou pozastavené.",
+    ),
+    (
+        "AI is not connected yet; Research now queues this meeting.",
+        "AI zatím není připojena. Schůzku můžete zařadit do fronty.",
+    ),
+    ("Retry Insights", "Zkusit znovu"),
+    (
+        "Previous saved Insights; research is not complete yet.",
+        "Dříve uložený přehled. Nový výzkum ještě není hotový.",
+    ),
+    (
+        "No saved Insights yet. Research now prioritizes this meeting.",
+        "Přehled zatím není hotový. Zjištění souvislostí dá této schůzce přednost.",
+    ),
+    (
+        "Czech version is being prepared in the background.",
+        "Česká verze se připravuje na pozadí.",
+    ),
+    ("Overview", "To podstatné"),
+    ("Next steps", "Další kroky"),
+    ("Questions", "Otázky"),
+    ("Evidence", "Podklady"),
+    ("ASSISTANT", "ASISTENT"),
+    ("Your workspace", "Váš pracovní prostor"),
+    (
+        "Switch to global question",
+        "Zeptat se bez vazby na schůzku",
+    ),
+    ("Use selected meeting", "Použít vybranou schůzku"),
+    ("Ask a question...", "Na co se chcete zeptat?"),
+    ("Suggest drafts", "Navrhovat koncepty"),
+    (
+        "Enter to ask; Shift+Enter for a new line",
+        "Enter odešle dotaz, Shift+Enter vloží nový řádek",
+    ),
+    ("Cancel", "Zrušit"),
+    (
+        "Shorten the question to 8,000 bytes.",
+        "Zkraťte dotaz na nejvýše 8 000 bajtů.",
+    ),
+    ("No sources retrieved.", "Nebyly dohledány žádné zdroje."),
+    (
+        "Check important claims against the original sources.",
+        "Důležitá tvrzení ověřte v původních zdrojích.",
+    ),
+    ("Retrieved", "Načteno"),
+    (
+        "No structured source URL captured.",
+        "Výsledek neobsahuje odkaz na původní zdroj.",
+    ),
+    (
+        "Excerpt truncated; this is not the complete response.",
+        "Výňatek je zkrácený, nejde o celou odpověď.",
+    ),
+    (
+        "Working asynchronously - the calendar remains available",
+        "Pracuji na pozadí – kalendář můžete dál používat",
+    ),
+    ("New local draft", "Nový místní koncept"),
+    ("Title", "Název"),
+    ("Local draft", "Místní koncept"),
+    (
+        "Proposed target - verify manually",
+        "Navržený cíl – ověřte ručně",
+    ),
+    (
+        "Draft text / proposed change",
+        "Text konceptu / navržená změna",
+    ),
+    ("Mark reviewed locally", "Označit jako zkontrolované"),
+    ("Discard local draft", "Zahodit místní koncept"),
+    ("Keep local draft", "Uložit místní koncept"),
+    (
+        "Kept only in this context's memory; cleared on Exit.",
+        "Jen v paměti tohoto kontextu. Ukončení aplikace koncept smaže.",
+    ),
+    (
+        "Memory only. Targets are unverified. Nothing is sent, scheduled or created remotely.",
+        "Jen v paměti. Cíle nejsou ověřené. Nic se neodesílá ani nevytváří v jiných službách.",
+    ),
+    (
+        "Meeting changed since this draft was kept; review the target and text.",
+        "Schůzka se změnila. Zkontrolujte cíl i text konceptu.",
+    ),
+    (
+        "Model suggestion, not verified or approved. Keeping it has no remote effect.",
+        "Návrh AI není ověřený ani schválený. Uložení konceptu nic nemění v jiných službách.",
+    ),
+    ("AI connection", "Připojení AI"),
+    ("WorkIQ connection", "Připojení WorkIQ"),
+    ("WebIQ connection", "Připojení WebIQ"),
+    ("GitHub connection", "Připojení GitHubu"),
+    (
+        "Connector has no supported verification read",
+        "Konektor nenabízí podporovaný nástroj pro ověření přístupu.",
+    ),
+    (
+        "GitHub MCP did not expose the account verification tool (get_me). Check the context toolset; this is not a rejected sign-in.",
+        "GitHub MCP nenabízí nástroj pro ověření účtu (get_me). Zkontrolujte sadu nástrojů context; nejde o odmítnuté přihlášení.",
+    ),
+    ("Cancel AI sign-in", "Zrušit přihlašování"),
+    ("Sign in", "Přihlásit se"),
+    ("Not connected", "Nepřipojeno"),
+    ("Connected", "Připojeno"),
+    ("Browser sign-in", "Přihlášení v prohlížeči"),
+    ("Personal token", "Osobní token"),
+    ("API key", "Klíč API"),
+    ("Personal access token", "Osobní přístupový token"),
+    ("GitHub App Client ID", "Client ID aplikace GitHub"),
+    ("Create token", "Vytvořit token"),
+    ("GitHub App setup", "Registrace aplikace GitHub"),
+    ("Connect and save key", "Připojit a uložit klíč"),
+    ("Connect and save token", "Připojit a uložit token"),
+    ("Disconnect and forget", "Odpojit a smazat přihlášení"),
+    ("Remove saved sign-in", "Smazat uložené přihlášení"),
+    ("Keep sign-in", "Ponechat přihlášení"),
+    (
+        "Remove this saved sign-in from Tomlook? Your provider account is not deleted.",
+        "Smazat uložené přihlášení z Tomlooku? Účet u poskytovatele zůstane zachovaný.",
+    ),
+    ("Work email", "Pracovní e-mail"),
+    (
+        "Disconnect and forget sign-in",
+        "Odpojit a smazat přihlášení",
+    ),
+    ("Forget saved sign-in", "Smazat uložené přihlášení"),
+    (
+        "The key is encrypted for your Windows account. Public web queries only.",
+        "Klíč je zašifrovaný pro váš účet Windows. Slouží jen k veřejnému webovému hledání.",
+    ),
+    (
+        "No app registration. Use a fine-grained token for selected repositories with Contents, Issues and Pull requests set to Read-only.",
+        "Registrace aplikace není potřeba. Vytvořte token pro vybrané repozitáře a nastavte Contents, Issues a Pull requests na Read-only.",
+    ),
+    (
+        "Use a GitHub App with Device flow enabled and read-only access to selected repositories. No client secret is needed.",
+        "Použijte aplikaci GitHub s povoleným Device flow a čtením vybraných repozitářů. Client secret není potřeba.",
+    ),
+    ("Insights activity", "Průběh zjišťování"),
+    ("Automatic Insights", "Automatické přehledy"),
+    ("Pause Insights", "Pozastavit přehledy"),
+    ("All", "Vše"),
+    ("Working", "Probíhá"),
+    ("Waiting", "Čeká"),
+    ("Problems", "Potíže"),
+    ("Ready", "Hotovo"),
+    ("Later", "Později"),
+    ("Researching", "Zjišťuji souvislosti"),
+    ("Failed", "Nezdařilo se"),
+    ("Needs retry", "Zkusit znovu"),
+    ("Cancelled", "Zrušeno"),
+    (
+        "Interrupted provider operation; inspect saved evidence and explicitly retry before resuming preparation",
+        "Zjišťování bylo přerušeno. Prohlédněte uložené podklady a teprve potom je výslovně spusťte znovu.",
+    ),
+    (
+        "Interrupted provider operation; inspect saved evidence before explicit retry",
+        "Zjišťování bylo přerušeno. Před novým pokusem prohlédněte uložené podklady.",
+    ),
+    (
+        "credential rejected; check the key or sign-in",
+        "přihlášení bylo odmítnuto; zkontrolujte klíč nebo se znovu přihlaste",
+    ),
+    (
+        "access denied; check provider permissions",
+        "přístup byl zamítnut; zkontrolujte oprávnění u poskytovatele",
+    ),
+    (
+        "provider rate limit; retry later",
+        "poskytovatel omezil počet požadavků; zkuste to později",
+    ),
+    (
+        "provider unavailable; retry later",
+        "poskytovatel je nedostupný; zkuste to později",
+    ),
+    ("provider request failed", "požadavek se nezdařil"),
+    ("transport failed", "spojení se nezdařilo"),
+    (
+        "HTTP request timed out",
+        "vypršel časový limit požadavku HTTP",
+    ),
+    ("cannot reach the provider", "poskytovatel je nedostupný"),
+    (
+        "provider returned an invalid MCP response",
+        "poskytovatel vrátil neplatnou odpověď MCP",
+    ),
+    (
+        "provider returned an unsupported response type",
+        "poskytovatel vrátil nepodporovaný typ odpovědi",
+    ),
+    (
+        "MCP session expired; reconnect",
+        "relace MCP vypršela; připojte se znovu",
+    ),
+    (
+        "provider returned invalid MCP data",
+        "poskytovatel vrátil neplatná data MCP",
+    ),
+    ("transport/protocol failed", "chyba spojení nebo protokolu"),
+    (
+        "no compatible MCP protocol",
+        "žádná podporovaná verze protokolu MCP",
+    ),
+    (
+        "invalid MCP initialization response",
+        "neplatná odpověď při navazování spojení MCP",
+    ),
+    (
+        "invalid tool arguments (MCP code -32602); not a rejected key",
+        "neplatné parametry nástroje (kód MCP -32602); nejde o odmítnutí klíče",
+    ),
+    (
+        "MCP transport closed before the response",
+        "spojení MCP bylo ukončeno před přijetím odpovědi",
+    ),
+    (
+        "MCP request timed out",
+        "vypršel časový limit požadavku MCP",
+    ),
+    (
+        "provider returned unexpected MCP data",
+        "poskytovatel vrátil neočekávaná data MCP",
+    ),
+    ("MCP request failed", "požadavek MCP se nezdařil"),
+    (" (partial)", " (neúplné)"),
+    (" - source errors", " – chyby zdrojů"),
+    (" (partial) - source errors", " (neúplné) – chyby zdrojů"),
+    ("No matching jobs.", "Žádné odpovídající schůzky."),
+    (
+        "Repository collections (one per line)",
+        "Složky s repozitáři (jedna na řádek)",
+    ),
+    ("Local document folders", "Místní složky s dokumenty"),
+    (
+        "Customer folder in OneDrive (WorkIQ)",
+        "Složka zákazníků na OneDrivu (WorkIQ)",
+    ),
+    ("Save sources", "Uložit zdroje"),
+    (
+        "Resume other queued jobs",
+        "Pokračovat s ostatními schůzkami",
+    ),
+    ("Exit Tomlook", "Ukončit Tomlook"),
+    ("Dismiss", "Zavřít"),
+    ("AI: signing in...", "AI: přihlašuji…"),
+    ("AI: connected", "AI: připojeno"),
+    ("AI: disconnected", "AI: nepřipojeno"),
+    ("WorkIQ: working...", "WorkIQ: pracuje…"),
+    ("WorkIQ: connected", "WorkIQ: připojeno"),
+    ("WorkIQ: disconnected", "WorkIQ: nepřipojeno"),
+    ("connecting...", "připojuji…"),
+    ("disconnecting...", "odpojuji…"),
+    ("connected", "připojeno"),
+    ("disconnected", "nepřipojeno"),
+    ("Connecting...", "Připojuji…"),
+    ("Open Tomlook", "Otevřít Tomlook"),
+    ("Exit Tomlook (stop AI)", "Ukončit Tomlook (zastavit AI)"),
+    ("Pause / resume Insights", "Pozastavit / obnovit přehledy"),
+    (
+        "Tomlook - calendar and Insights",
+        "Tomlook – kalendář a přehledy",
+    ),
+    ("Select a meeting first.", "Nejdřív vyberte schůzku."),
+    ("Connect AI before asking.", "Nejdřív připojte AI."),
+    ("Show day", "Zobrazit den"),
+    ("Show work week", "Zobrazit pracovní týden"),
+    ("Show week", "Zobrazit týden"),
+    ("Show month", "Zobrazit měsíc"),
+    ("Go to today", "Přejít na dnešek"),
+    ("Ask a question", "Položit dotaz"),
+    (
+        "Research selected meeting now",
+        "Zjistit souvislosti k vybrané schůzce",
+    ),
+    ("Toggle dark / light", "Přepnout světlý / tmavý vzhled"),
+    ("Refresh calendar", "Obnovit kalendář"),
+    (
+        "Select at most 42 consecutive days.",
+        "Vyberte nejvýše 42 po sobě jdoucích dnů.",
+    ),
+    ("No synchronized days yet.", "Zatím nebyl načten žádný den."),
+    (
+        "Show meetings, queue and local context",
+        "Schůzky, fronta a místní zdroje",
+    ),
+    (
+        "Local calendar cache; no connected account assigned.",
+        "Místní kalendář. Zatím není přiřazen připojený účet.",
+    ),
+    (
+        "Participant list is limited to 500. Open the original meeting for the full list.",
+        "Zobrazujeme nejvýše 500 účastníků. Úplný seznam najdete v původní schůzce.",
+    ),
+    ("Open original meeting", "Otevřít původní schůzku"),
+    (
+        "Model-supplied citations; not independently verified",
+        "Odkazy navržené AI nejsou nezávisle ověřené",
+    ),
+    (
+        "Tool results captured; no cited links. Claims remain unverified.",
+        "Výsledky byly uloženy, ale bez odkazů. Tvrzení zůstávají neověřená.",
+    ),
+];
+
+const PATTERNS: &[(&str, &str)] = &[
+    (
+        "Calendar provider rejected the write with HTTP {}; nothing was changed by this request",
+        "Poskytovatel odmítl zápis (HTTP {0}). Tento požadavek nic nezměnil.",
+    ),
+    ("AI stopped: {}", "AI byla zastavena: {0}"),
+    (
+        "Insights cancelled: {}. Previously saved Insights are unchanged.",
+        "Zjišťování souvislostí bylo zrušeno: {0}. Dříve uložený přehled zůstává zachovaný.",
+    ),
+    (
+        "Preparation stopped after a failed operation: {}. Inspect saved evidence and explicitly retry.",
+        "Zjišťování souvislostí skončilo chybou: {0}. Zkontrolujte uložené podklady a zkuste to znovu.",
+    ),
+    ("HTTP {}: {}", "HTTP {0}: {1}"),
+    ("MCP code {}", "Kód MCP {0}"),
+    (
+        "{} initialization failed: {}",
+        "{0}: navázání spojení se nezdařilo: {1}",
+    ),
+    (
+        "{} verification read failed: {}",
+        "{0}: ověření čtením se nezdařilo: {1}",
+    ),
+    (
+        "{} tool discovery failed: {}",
+        "{0}: načtení nástrojů se nezdařilo: {1}",
+    ),
+    (
+        "{} repos, {} indexed documents, {} excluded{}",
+        "Repozitáře: {0}, indexované dokumenty: {1}, vynecháno: {2}{3}",
+    ),
+    ("Show work week of {}", "Zobrazit pracovní týden od {0}"),
+    ("R{}: {}", "R{0}: {1}"),
+    ("Proposed {}: {}", "Návrh – {0}: {1}"),
+    (
+        "One month back, six months ahead through {}.",
+        "Měsíc zpět a šest měsíců dopředu, do {0}.",
+    ),
+    (
+        "Refreshing calendar {} through {}...",
+        "Načítám kalendář od {0} do {1}…",
+    ),
+    (
+        "Preparation failed: {}. Retry {}/3 in {}s.",
+        "Zjištění souvislostí se nezdařilo: {0}. Pokus {1}/3 za {2} s.",
+    ),
+    (
+        "{} must contain 1-{} UTF-8 bytes without unsupported control characters",
+        "{0} musí mít 1–{1} bajtů v UTF-8 bez nepodporovaných řídicích znaků",
+    ),
+    ("+{} more", "+{0} dalších"),
+    ("People ({})", "Účastníci ({0})"),
+    ("People ({} of {})", "Účastníci ({0} z {1})"),
+    (
+        "+{} companies in People",
+        "Dalších {0} společností v seznamu účastníků",
+    ),
+    ("Icon from {}'s own website", "Ikona z webu {0}"),
+    ("{} cached meetings", "Uložené schůzky: {0}"),
+    ("Sources ({})", "Zdroje ({0})"),
+    (
+        "{} ready | {} researching | {} waiting | {} to review",
+        "Hotovo {0} | Probíhá {1} | Čeká {2} | Ke kontrole {3}",
+    ),
+    ("{}: connected", "{0}: připojeno"),
+    ("{}: disconnected", "{0}: nepřipojeno"),
+    ("{}: connecting...", "{0}: připojuji…"),
+    ("{}: disconnecting...", "{0}: odpojuji…"),
+    (
+        "{} additional tool results not retained.",
+        "Dalších {0} výsledků nebylo uloženo.",
+    ),
+    ("Retrieved {}", "Načteno {0}"),
+    ("Observed {}", "Zaznamenáno {0}"),
+    (
+        "{} additional results omitted by the memory limit.",
+        "Dalších {0} výsledků se nevešlo do paměťového limitu.",
+    ),
+    ("LOCAL DRAFTS ({}/{})", "MÍSTNÍ KONCEPTY ({0}/{1})"),
+    ("Local draft {}", "Místní koncept {0}"),
+    ("Proposed target: {}", "Navržený cíl: {0}"),
+    ("Connected as {}", "Připojeno jako {0}"),
+    (
+        "{}/{} cited links in captured results. Claims remain unverified.",
+        "Odkazy v uložených výsledcích: {0}/{1}. Tvrzení zůstávají neověřená.",
+    ),
+    (
+        "Locally saved calendar owned by {}; retained when disconnected.",
+        "Místně uložený kalendář účtu {0}. Zůstává dostupný i bez připojení.",
+    ),
+    (
+        "Last saved refresh: {}.",
+        "Poslední uložená aktualizace: {0}.",
+    ),
+    ("Sync {}/{} · offline", "Načteno {0}/{1} · bez připojení"),
+    ("Sync {}/{} · retrying", "Načteno {0}/{1} · opakuji"),
+    ("Sync {}/{}", "Načteno {0}/{1}"),
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_static_controls_are_in_the_shared_catalog() {
+        let app = include_str!("app.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        for rest in app.split("language.text(\"").skip(1) {
+            let key = rest.split('"').next().unwrap();
+            if !key.chars().any(|ch| ch.is_ascii_alphabetic())
+                || key.starts_with("Ctrl+")
+                || key == "Esc"
+                || key == "Tomlook"
+            {
+                continue;
+            }
+            assert!(
+                TEXTS.iter().any(|(en, _)| *en == key),
+                "Missing Czech UI label: {key}"
+            );
+        }
+        assert_eq!(Language::Cs.text("R2: Message read"), "R2: Původní zpráva");
+        assert_eq!(
+            Language::Cs.text("Proposed {1}: Calendar suggestion"),
+            "Návrh – {1}: Návrh do kalendáře"
+        );
+        assert_eq!(
+            Language::Cs.text("Waiting\nWaiting for an execution slot"),
+            "Čeká\nČeká na volné místo pro zpracování"
+        );
+    }
+
+    #[test]
+    fn appearance_language_and_ghost_preference_survive_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let preferences = crate::storage::Preferences {
+            language: Language::Cs,
+            hide_unconfirmed: true,
+            dark: false,
+            accent: 2,
+            ..Default::default()
+        };
+        crate::storage::Store::open(root.path())
+            .unwrap()
+            .save_preferences(&preferences)
+            .unwrap();
+        let restored = crate::storage::Store::open(root.path())
+            .unwrap()
+            .preferences()
+            .unwrap();
+        assert_eq!(restored.language, Language::Cs);
+        assert!(restored.hide_unconfirmed);
+        assert!(!restored.dark);
+        assert_eq!(restored.accent, 2);
+    }
+
+    #[test]
+    fn recovery_connector_and_source_statuses_are_localized_without_changing_codes() {
+        assert_eq!(
+            Language::Cs.text("Connector has no supported verification read"),
+            "Konektor nenabízí podporovaný nástroj pro ověření přístupu."
+        );
+        assert_eq!(
+            Language::Cs.text(
+                "GitHub MCP did not expose the account verification tool (get_me). Check the context toolset; this is not a rejected sign-in."
+            ),
+            "GitHub MCP nenabízí nástroj pro ověření účtu (get_me). Zkontrolujte sadu nástrojů context; nejde o odmítnuté přihlášení."
+        );
+        assert_eq!(
+            Language::Cs.text(
+                "Interrupted provider operation; inspect saved evidence and explicitly retry before resuming preparation"
+            ),
+            "Zjišťování bylo přerušeno. Prohlédněte uložené podklady a teprve potom je výslovně spusťte znovu."
+        );
+        assert_eq!(
+            Language::Cs
+                .text("WebIQ verification read failed: HTTP 429: provider rate limit; retry later"),
+            "WebIQ: ověření čtením se nezdařilo: HTTP 429: poskytovatel omezil počet požadavků; zkuste to později"
+        );
+        for (partial, errors, suffix) in [
+            (false, false, ""),
+            (true, false, " (neúplné)"),
+            (false, true, " – chyby zdrojů"),
+            (true, true, " (neúplné) – chyby zdrojů"),
+        ] {
+            let report = crate::source_index::Report {
+                repositories: 134,
+                documents: 32985,
+                skipped: 7,
+                truncated: partial,
+                errors: if errors {
+                    vec!["Original provider detail".into()]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            };
+            assert_eq!(
+                Language::Cs.text(&report.label()),
+                format!("Repozitáře: 134, indexované dokumenty: 32985, vynecháno: 7{suffix}")
+            );
+        }
+        assert_eq!(
+            Language::Cs.text("Original provider detail: request-id abc"),
+            "Original provider detail: request-id abc"
+        );
+    }
+
+    #[test]
+    fn catalogs_are_unique_nonempty_and_templates_preserve_arguments() {
+        let mut seen = std::collections::BTreeSet::new();
+        for &(en, cs) in TEXTS {
+            assert!(seen.insert(en), "Duplicate English key: {en}");
+            assert!(!cs.trim().is_empty());
+            assert_eq!(Language::En.text(en), en);
+            assert_eq!(Language::Cs.text(en), cs);
+        }
+        for &(en, cs) in PATTERNS {
+            let count = en.matches("{}").count();
+            for index in 0..count {
+                assert!(cs.contains(&format!("{{{index}}}")));
+            }
+        }
+        assert_eq!(
+            Language::Cs.text("13 ready | 1 researching | 394 waiting | 1 to review"),
+            "Hotovo 13 | Probíhá 1 | Čeká 394 | Ke kontrole 1"
+        );
+        assert_eq!(
+            Language::Cs.text("A customer-provided title"),
+            "A customer-provided title"
+        );
+        assert_eq!(
+            Language::Cs.text("Insights cancelled: Cancelled before the question was sent. Previously saved Insights are unchanged."),
+            "Zjišťování souvislostí bylo zrušeno: Zrušeno před odesláním dotazu. Dříve uložený přehled zůstává zachovaný."
+        );
+    }
+
+    #[test]
+    fn legacy_preferences_default_to_english_and_ghosts_remain_visible() {
+        let preferences: crate::storage::Preferences =
+            serde_json::from_str(r#"{"dark":false}"#).unwrap();
+        assert_eq!(preferences.language, Language::En);
+        assert!(!preferences.hide_unconfirmed);
+        let date = NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
+        assert_eq!(Language::Cs.month(date), "říjen 2026");
+        assert_eq!(Language::Cs.date(date, true), "neděle, 11. 10. 2026");
+    }
+}

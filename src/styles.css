@@ -82,10 +82,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   position: relative; z-index: 30;
 }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 232px; text-decoration: none; color: var(--text); font: 700 17px Manrope, sans-serif; }
-.brand-mark { display: grid; place-items: center; width: 34px; height: 34px; color: white; border-radius: 10px; background: linear-gradient(145deg, #6b58ea, #4231c5); box-shadow: 0 7px 16px rgba(82, 63, 209, .25); }
-.duckpilot-logo { width: 48px; height: 48px; filter: drop-shadow(0 3px 5px rgba(34, 27, 82, .18)); }
-.duckpilot-logo.compact { width: 31px; height: 31px; }
-.brand-mark:has(.duckpilot-logo) { overflow: visible; background: linear-gradient(145deg, #f6f2ff, #ddd5ff); }
+.brand-mark { display: grid; place-items: center; width: 34px; height: 34px; color: var(--primary); }
+.tomlook-logo { display: block; width: 48px; height: 48px; }
+.tomlook-logo.compact { width: 32px; height: 32px; }
 .nav-generated-icon { width: 25px; height: 25px; object-fit: contain; margin-left: -3px; }
 .event-ready-generated { width: 19px; height: 19px; object-fit: contain; filter: drop-shadow(0 1px 2px rgba(42, 31, 83, .18)); }
 .briefing-indicator.ready { top: 4px; right: 4px; }

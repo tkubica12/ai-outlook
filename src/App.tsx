@@ -19,7 +19,7 @@ import { CalendarSyncStatus } from "./components/CalendarSyncStatus";
 import { BriefingsView } from "./components/BriefingsView";
 import { ConnectionSetup } from "./components/ConnectionSetup";
 import { Diagnostics } from "./components/Diagnostics";
-import { DuckPilotLogo } from "./components/DuckPilotLogo";
+import { TomlookLogo } from "./components/TomlookLogo";
 import { MeetingPanel } from "./components/MeetingPanel";
 import { MiniCalendar } from "./components/MiniCalendar";
 import { useCalendarSync } from "./useCalendarSync";
@@ -336,7 +336,7 @@ function App() {
         </button>
         <a className="brand" href="#calendar" aria-label={`${PRODUCT_NAME} home`}>
           <span className="brand-mark">
-            <DuckPilotLogo compact />
+            <TomlookLogo compact />
           </span>
           <span>{PRODUCT_NAME}</span>
           <span className="preview-pill">Preview</span>

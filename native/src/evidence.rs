@@ -24,6 +24,15 @@ struct Secret {
 }
 
 impl Redactor {
+    pub fn extended(&self, additional: impl IntoIterator<Item = String>) -> Self {
+        Self::new(
+            self.secrets
+                .iter()
+                .map(|secret| secret.value.clone())
+                .chain(additional),
+        )
+    }
+
     pub fn new(secrets: impl IntoIterator<Item = String>) -> Self {
         let mut values = BTreeSet::new();
         for secret in secrets.into_iter().filter(|secret| !secret.is_empty()) {
@@ -126,18 +135,20 @@ impl Redactor {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Record {
     pub ordinal: usize,
     pub tool: String,
     pub observed_at: String,
     pub succeeded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
     pub excerpt: String,
     pub truncated: bool,
     pub links: Vec<String>,
 }
 
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug, serde::Serialize)]
 pub struct Snapshot {
     pub records: Vec<Record>,
     pub omitted: usize,
@@ -149,6 +160,10 @@ impl Snapshot {
             || self.records.iter().any(|record| {
                 record.tool.len() > 200
                     || record.observed_at.len() > 64
+                    || record.resource.as_ref().is_some_and(|resource| {
+                        record.tool != crate::workiq::connection::SDK_TOOL
+                            || crate::workiq::connection::read_resource(resource).is_err()
+                    })
                     || record.excerpt.len() > EXCERPT_LIMIT
                     || record.links.len() > LINK_LIMIT
                     || record.links.iter().any(|link| !safe_source_url(link))
@@ -159,6 +174,25 @@ impl Snapshot {
             );
         }
         Ok(())
+    }
+}
+
+pub fn source_label<'a>(tool: &'a str, resource: Option<&str>) -> &'a str {
+    match tool {
+        crate::workiq::connection::CONTEXT_TOOL => "Workplace search summary",
+        crate::workiq::connection::SDK_TOOL => {
+            match resource.map(|value| value.split('?').next().unwrap_or(value)) {
+                Some(path) if path.starts_with("/me/messages/") => "Message read",
+                Some(path) if path.starts_with("/me/events/") => "Meeting read",
+                Some("/me/messages") => "Mail search results",
+                Some("/me/events" | "/me/calendarView") => "Calendar results",
+                _ => "Mail and meetings",
+            }
+        }
+        crate::workiq::connection::cloud::SDK_TOOL => "Customer documents",
+        crate::context::SEARCH => "Local demos and repositories",
+        crate::context::READ => "Local document",
+        _ => tool,
     }
 }
 
@@ -193,6 +227,17 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    pub fn redact(&self, text: &str) -> String {
+        self.redactor.text(text)
+    }
+    pub(crate) fn resource_contains_credential(&self, resource: &str) -> bool {
+        self.redactor.contains(resource)
+            || resource.split_once('?').is_some_and(|(_, query)| {
+                url::form_urlencoded::parse(query.as_bytes()).any(|(name, value)| {
+                    self.redactor.contains(&name) || self.redactor.contains(&value)
+                })
+            })
+    }
     pub fn new(redactor: Arc<Redactor>) -> Self {
         Self {
             redactor,
@@ -207,12 +252,52 @@ impl Recorder {
     }
 
     pub fn record(&self, tool: &str, value: &Value, succeeded: bool) {
+        self.record_result(tool, value, succeeded, None);
+    }
+
+    pub fn record_workiq(&self, resource: &str, value: &Value) {
+        if crate::workiq::connection::read_resource(resource).is_err()
+            || self.resource_contains_credential(resource)
+        {
+            self.fail();
+            return;
+        }
+        self.record_result(
+            crate::workiq::connection::SDK_TOOL,
+            value,
+            true,
+            Some(resource.to_owned()),
+        );
+    }
+
+    fn record_result(&self, tool: &str, value: &Value, succeeded: bool, resource: Option<String>) {
         let ordinal = self.count.fetch_add(1, Ordering::AcqRel) + 1;
         if ordinal > RECORD_LIMIT {
             return;
         }
         let mut writer = BoundedWriter::default();
-        if serde_json::to_writer(&mut writer, value).is_err() && !writer.truncated {
+        let written = if succeeded && tool == crate::context::READ {
+            #[derive(serde::Serialize)]
+            struct LocalExcerpt<'a> {
+                _local_source: Value,
+                data: &'a Value,
+            }
+            serde_json::to_writer(
+                &mut writer,
+                &LocalExcerpt {
+                    _local_source: serde_json::json!({
+                        "root": value.get("root"),
+                        "folder": value.get("folder"),
+                        "path": value.get("path"),
+                        "offset": value.get("offset"),
+                    }),
+                    data: value,
+                },
+            )
+        } else {
+            serde_json::to_writer(&mut writer, value)
+        };
+        if written.is_err() && !writer.truncated {
             self.fail();
             return;
         }
@@ -241,6 +326,7 @@ impl Recorder {
             tool: tool.into(),
             observed_at: chrono::Utc::now().to_rfc3339(),
             succeeded,
+            resource,
             excerpt,
             truncated: writer.truncated || expanded,
             links: links.into_iter().collect(),
@@ -336,13 +422,54 @@ fn collect_links(
                 }
             }
         }
-        Value::String(text) if text.len() <= 8192 => {
-            if let Ok(structured) = serde_json::from_str::<Value>(text)
+        Value::String(text) => {
+            if text.len() <= 64_000 {
+                collect_markdown_links(text, visited, links, redactor);
+            }
+            if text.len() <= 8192
+                && let Ok(structured) = serde_json::from_str::<Value>(text)
                 && matches!(structured, Value::Object(_) | Value::Array(_))
             {
                 collect_links(&structured, depth + 1, visited, links, redactor);
             }
         }
+
         _ => {}
+    }
+}
+
+fn collect_markdown_links(
+    text: &str,
+    visited: &mut usize,
+    links: &mut BTreeSet<String>,
+    redactor: &Redactor,
+) {
+    for (index, _) in text.match_indices("](") {
+        if *visited >= 512 || links.len() >= LINK_LIMIT {
+            break;
+        }
+        *visited += 1;
+        let tail = &text[index + 2..];
+        if !tail.starts_with("https://") && !tail.starts_with("http://") {
+            continue;
+        }
+        let mut nesting = 0_usize;
+        for (end, character) in tail.char_indices() {
+            if end > URL_LIMIT || character.is_whitespace() || character == '\\' {
+                break;
+            }
+            match character {
+                '(' => nesting += 1,
+                ')' if nesting > 0 => nesting -= 1,
+                ')' => {
+                    let link = &tail[..end];
+                    if safe_source_url(link) && !redactor.contains(link) {
+                        links.insert(link.into());
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
     }
 }

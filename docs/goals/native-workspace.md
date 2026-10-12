@@ -8,6 +8,8 @@ Mode: repair loop | Decision owner: project owner
 Deliver a real Windows executable with Rust-rendered UI and Rust-owned local
 services. Preserve recognizable calendar/briefing workflows while adopting
 grayscale plus one configurable accent and full mouse/keyboard operation.
+The owner's later category decision permits Outlook-like category color
+families in small markers/labels, with theme-adjusted contrast.
 Non-goals: a WebView wrapper, web deployment, cosmetic prototype-only delivery,
 or reimplementing the proprietary Copilot runtime.
 
@@ -37,8 +39,9 @@ These Cargo commands are proposed bindings, not an existing test harness.
 Toolkit choice alone proves no speed. Preserve the calendar layout/workflow,
 not Tomas Commander's file panes. Use system/bundled fonts without runtime
 fetches, restrained borders, no ornamental gradients/mascots, short action
-labels and consistent secondary shortcut hints. Categories/status use labels
-and shapes with grayscale/selected-accent variants, not extra color families.
+labels and consistent secondary shortcut hints. Status uses labels/shapes.
+Categories retain the owner's Outlook-like color families in restrained
+markers/labels; do not recolor whole meeting backgrounds.
 Body text contrast >= 4.5:1; controls/focus indicators >= 3:1 (C04).
 A passing example: an unfinished event opens metadata immediately and leaves
 navigation usable. A failing example: disabled details until AI finishes.
