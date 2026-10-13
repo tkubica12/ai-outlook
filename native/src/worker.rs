@@ -50,7 +50,7 @@ pub enum Command {
         calendar: Arc<Calendar>,
         account: String,
     },
-    WorkiqConnected(String),
+    WorkiqConnected(crate::workiq::connection::Identity),
     CalendarSyncResult {
         id: u64,
         range: crate::workiq::connection::Range,
@@ -246,6 +246,8 @@ pub struct Activity {
     pub sync: crate::calendar_sync::Progress,
     pub recommendations:
         Arc<std::collections::BTreeMap<String, crate::recommendations::Recommendation>>,
+    pub recommendation_view: Arc<Vec<crate::recommendations::InboxEntry>>,
+    pub identity: Option<Arc<crate::workiq::connection::Identity>>,
 }
 
 pub struct Shutdown {
@@ -722,6 +724,7 @@ impl Worker {
                 let mut queue = store.queue()?;
                 let mut inbox = store.recommendations()?;
                 store.save_recommendations(&inbox)?;
+                let mut dismissals = store.recommendation_dismissals()?;
                 let (calendar_result_sender, mut calendar_results) = tokio::sync::mpsc::channel::<ai::CalendarResult>(2);
                 let legacy_revision = queue.analysis_revision.clone();
                 let (result_sender, mut results) = tokio::sync::mpsc::channel::<ai::Prepared>(2);
@@ -730,6 +733,11 @@ impl Worker {
                 let mut revision = 0;
                 let mut inbox_revision = 0_u64;
                 let mut published_inbox_revision = u64::MAX;
+                let mut published_calendar = calendar.clone();
+                let mut published_owner = None;
+                let mut published_minute = None;
+                let mut recommendation_view = Arc::new(Vec::new());
+                let mut identity = if options.demo.is_none() { store.workiq_identity()?.map(Arc::new) } else { None };
                 let mut failure = queue.failure.clone();
                 let mut exiting = false;
                 let mut dirty = true;
@@ -865,10 +873,24 @@ impl Worker {
                                                     let suggestions: Vec<crate::recommendations::Suggestion> =
                                                         serde_json::from_value(payload.get("recommendations").cloned().unwrap_or_else(|| serde_json::json!([])))
                                                             .map_err(|_| "Invalid saved recommendation schema")?;
+                                                    let suggestions = crate::recommendations::complete_suggestions(&calendar, event, suggestions)?;
+                                                    payload["recommendations"] = serde_json::to_value(&suggestions)
+                                                        .map_err(|_| "Encode completed recommendations failed")?;
                                                     let before = inbox.len();
                                                     crate::recommendations::compact(&mut inbox, &calendar, Some(&account), now);
                                                     if before != inbox.len() { inbox_revision += 1; }
                                                     let categories = known_categories(&calendar);
+                                                    for previous in inbox.values_mut().filter(|previous|
+                                                        previous.account == account && previous.event_id == event.id
+                                                        && previous.suggestion.kind != crate::recommendations::Kind::Manual
+                                                        && matches!(previous.state, crate::recommendations::State::Pending | crate::recommendations::State::NotSent)) {
+                                                        if !suggestions.iter().any(|suggestion| suggestion.kind == previous.suggestion.kind
+                                                            && suggestion.category == previous.suggestion.category
+                                                            && suggestion.minutes == previous.suggestion.minutes) {
+                                                            previous.state = crate::recommendations::State::Expired;
+                                                            inbox_revision += 1;
+                                                        }
+                                                    }
                                                     for suggestion in suggestions {
                                                         if event.unconfirmed() { continue; }
                                                         if event.start > now + chrono::Duration::days(14) { continue; }
@@ -876,10 +898,22 @@ impl Worker {
                                                             !categories.iter().any(|category| suggestion.category.as_ref() == Some(category)) { continue; }
                                                         if suggestion.kind == crate::recommendations::Kind::Category
                                                             && crate::recommendations::real_categories(event) == suggestion.category.iter().cloned().collect::<Vec<_>>() { continue; }
-                                                        if suggestion.kind == crate::recommendations::Kind::Travel
-                                                            && crate::recommendations::calendar_context(&calendar, event)["existing_travel_buffer"] == true { continue; }
                                                         let recommendation = crate::recommendations::Recommendation::from_insights(event, &account, suggestion, now)?;
-                                                        if inbox.contains_key(&recommendation.id) { continue; }
+                                                        if recommendation.dismissal_key().is_some_and(|key| dismissals.contains(&key)) { continue; }
+                                                        if let Some(previous) = inbox.get_mut(&recommendation.id) {
+                                                            if matches!(previous.state, crate::recommendations::State::Pending | crate::recommendations::State::NotSent)
+                                                                && previous.suggestion != recommendation.suggestion {
+                                                                previous.suggestion = recommendation.suggestion;
+                                                                inbox_revision += 1;
+                                                            }
+                                                            continue;
+                                                        }
+                                                        if inbox.values().any(|previous| previous.account == account
+                                                            && previous.event_id == event.id && previous.fingerprint == recommendation.fingerprint
+                                                            && matches!(previous.state, crate::recommendations::State::Applied | crate::recommendations::State::Dismissed)
+                                                            && previous.suggestion.kind == recommendation.suggestion.kind
+                                                            && previous.suggestion.category == recommendation.suggestion.category
+                                                            && previous.suggestion.minutes == recommendation.suggestion.minutes) { continue; }
                                                         if inbox.len() >= 512 {
                                                             notify(Notice::Error("Recommendation inbox reached its safety limit".into()));
                                                             break;
@@ -984,8 +1018,11 @@ impl Worker {
                                             if commands.try_send(ai::Command::Prepare(Box::new(ai::Preparation {
                                                 id, event: {
                                                     let mut event = event.clone();
-                                                    event.extra.insert("tomlook_known_categories".into(), serde_json::json!(known_categories(&calendar)));
+                                                    let categories = known_categories(&calendar);
+                                                    event.extra.insert("tomlook_category_meanings".into(), crate::recommendations::category_meanings(&categories));
+                                                    event.extra.insert("tomlook_known_categories".into(), serde_json::json!(categories));
                                                     event.extra.insert("tomlook_calendar_context".into(), crate::recommendations::calendar_context(&calendar, &event));
+                                                    event.extra.insert("tomlook_material_contacts".into(), serde_json::json!(crate::recommendations::material_contacts(&event, owner.as_deref().unwrap_or(&preferences.work_email), identity.as_deref())));
                                                     event
                                                 }, foreground: flight.foreground, account: store.calendar_owner()?, connector_revision: Some(connector_revision.clone()), previous, reply: result_sender.clone(), wake: wake.clone(),
                                             }))).is_err() { queue.defer(id, "SDK admission channel is unavailable; request was not sent".into()); failure = Some("SDK admission channel is unavailable".into()); }
@@ -1007,7 +1044,16 @@ impl Worker {
                     sync.error = sync_error.clone();
                     let previous = state.lock().map_err(|_| "Preparation state is unavailable")?.clone();
                     let queue_changed = previous.queue != queue;
-                    if queue_changed || previous.enabled != preferences.prepare_enabled || previous.paused != preferences.paused || previous.error != failure || previous.sync != sync || inbox_revision != published_inbox_revision {
+                    let view_changed = inbox_revision != published_inbox_revision
+                        || !Arc::ptr_eq(&published_calendar, &calendar)
+                        || published_owner != owner || published_minute != Some(now.timestamp() / 60);
+                    if view_changed {
+                        recommendation_view = Arc::new(crate::recommendations::inbox_view(&calendar, &inbox, owner.as_deref(), now, &dismissals));
+                        published_calendar = calendar.clone();
+                        published_owner = owner;
+                        published_minute = Some(now.timestamp() / 60);
+                    }
+                    if view_changed || queue_changed || previous.identity != identity || previous.enabled != preferences.prepare_enabled || previous.paused != preferences.paused || previous.error != failure || previous.sync != sync || inbox_revision != published_inbox_revision {
                         if inbox_revision != published_inbox_revision { store.save_recommendations(&inbox)?; }
                         let index = if queue_changed {
                             Arc::new(ActivityIndex::new(&queue))
@@ -1015,7 +1061,7 @@ impl Worker {
                             previous.index.clone()
                         };
                         revision += 1;
-                        let next = Activity { revision, queue: queue.clone(), index, enabled: preferences.prepare_enabled, paused: preferences.paused, error: failure.clone(), sync, recommendations: Arc::new(inbox.clone()),
+                        let next = Activity { revision, queue: queue.clone(), index, enabled: preferences.prepare_enabled, paused: preferences.paused, error: failure.clone(), sync, recommendations: Arc::new(inbox.clone()), recommendation_view: recommendation_view.clone(), identity: identity.clone(),
                             queued: queue.jobs.values().filter(|job| job.state == crate::scheduler::State::Queued).count(),
                             deferred: queue.jobs.values().filter(|job| job.state == crate::scheduler::State::Deferred).count() };
                         *state.lock().map_err(|_| "Preparation state is unavailable")? = Arc::new(next);
@@ -1110,14 +1156,35 @@ impl Worker {
                             dispatch_calendar_change(&mut store, &mut inbox, &mut inbox_revision, sdk,
                                 operation, &calendar_result_sender, &wake)
                         })(),
-                        Command::DismissRecommendation(id) => {
-                            if let Some(recommendation) = inbox.get_mut(&id)
-                                && matches!(recommendation.state, crate::recommendations::State::Pending | crate::recommendations::State::NotSent | crate::recommendations::State::Review) {
-                                recommendation.state = crate::recommendations::State::Dismissed;
-                                inbox_revision += 1;
+                        Command::DismissRecommendation(id) => (|| {
+                            let mut keys = std::collections::BTreeSet::new();
+                            if let Some(record) = inbox.get(&id).filter(|record| record.suggestion.kind == crate::recommendations::Kind::PriorityConflict) {
+                                let view = crate::recommendations::inbox_view(&calendar, &inbox, store.calendar_owner()?.as_deref(), chrono::Local::now().fixed_offset(), &dismissals);
+                                if let Some(entry) = view.iter().find(|entry| entry.id == id) {
+                                    keys.extend(entry.conflicts.iter().map(|other| crate::recommendations::conflict_dismissal_key(&record.account, &record.event_id, other)));
+                                }
                             }
-                            store.save_recommendations(&inbox)
-                        }
+                            let mut next = inbox.clone();
+                            let recommendation = next.get_mut(&id).ok_or("Recommendation no longer exists")?;
+                            if !matches!(recommendation.state, crate::recommendations::State::Pending | crate::recommendations::State::NotSent | crate::recommendations::State::Review) {
+                                return Err("Calendar approval was already consumed; inspect the previous outcome".into());
+                            }
+                            recommendation.state = crate::recommendations::State::Dismissed;
+                            let key = recommendation.dismissal_key();
+                            if let Some(key) = &key {
+                                for previous in next.values_mut().filter(|previous| matches!(previous.state,
+                                    crate::recommendations::State::Pending | crate::recommendations::State::NotSent)
+                                    && previous.dismissal_key().as_ref() == Some(key)) {
+                                    previous.state = crate::recommendations::State::Dismissed;
+                                }
+                            }
+                            store.save_recommendations_with_dismissals(&next, &keys)?;
+                            dismissals.extend(keys);
+                            if let Some(key) = key { dismissals.insert(key); }
+                            inbox = next;
+                            inbox_revision += 1;
+                            Ok(())
+                        })(),
                         Command::ConfirmRecommendation { id, change } => (|| {
                             if exiting { return Err("Tomlook is stopping; no calendar write was submitted".into()); }
                             if options.demo.is_some() { return Err("Preview never changes a live calendar".into()); }
@@ -1184,7 +1251,13 @@ impl Worker {
                                 }
                             }
                         },
-                        Command::WorkiqConnected(account) => {
+                        Command::WorkiqConnected(next_identity) => (|| {
+                            if options.demo.is_some() {
+                                return Err("Synthetic preview cannot save live WorkIQ identity".into());
+                            }
+                            store.save_workiq_identity(&next_identity)?;
+                            let account = next_identity.account.clone();
+                            identity = Some(Arc::new(next_identity));
                             sync_days = if store.calendar_owner()?.as_deref() == Some(account.as_str()) {
                                 store.calendar_sync_days()?
                             } else { crate::calendar_sync::Freshness::new() };
@@ -1194,7 +1267,7 @@ impl Worker {
                             sync_error = None;
                             dirty = true;
                             Ok(())
-                        },
+                        })(),
                         Command::CalendarSyncResult { id, range, result } => {
                             if sync_flight.is_some_and(|(active, requested, _)| active == id && requested == range) {
                                 sync_flight = None;

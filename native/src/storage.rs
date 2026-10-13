@@ -64,6 +64,35 @@ pub struct Store {
 }
 
 impl Store {
+    fn read_recommendation_dismissals(connection: &Connection) -> Result<BTreeSet<String>> {
+        let payload: Option<String> = connection
+            .query_row(
+                "SELECT payload FROM settings WHERE key='recommendation-dismissals-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "Read dismissed recommendations failed")?;
+        let keys: BTreeSet<String> = match payload {
+            Some(payload) if payload.len() <= 1024 * 1024 => serde_json::from_str(&payload)
+                .map_err(|_| "Saved dismissed recommendations are invalid")?,
+            Some(_) => return Err("Dismissed recommendations reached their safety limit".into()),
+            None => BTreeSet::new(),
+        };
+        if keys.len() > 10_000
+            || keys
+                .iter()
+                .any(|key| key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err("Saved dismissed recommendations are invalid".into());
+        }
+        Ok(keys)
+    }
+
+    pub fn recommendation_dismissals(&self) -> Result<BTreeSet<String>> {
+        Self::read_recommendation_dismissals(&self.connection)
+    }
+
     pub fn recommendations(
         &self,
     ) -> Result<std::collections::BTreeMap<String, crate::recommendations::Recommendation>> {
@@ -87,6 +116,13 @@ impl Store {
         if inbox.len() > 512 {
             return Err("Saved recommendation inbox exceeds its entry limit".into());
         }
+        let mut dismissals = self.recommendation_dismissals()?;
+        dismissals.extend(
+            inbox
+                .values()
+                .filter(|record| record.state == crate::recommendations::State::Dismissed)
+                .filter_map(crate::recommendations::Recommendation::dismissal_key),
+        );
         for (id, recommendation) in &mut inbox {
             if recommendation.suggestion.kind != crate::recommendations::Kind::Manual {
                 recommendation.suggestion.validate()?;
@@ -103,6 +139,14 @@ impl Store {
                 recommendation.state = crate::recommendations::State::Review;
                 recommendation.message =
                     crate::workiq::connection::calendar_write::UNCERTAIN.into();
+            } else if matches!(
+                recommendation.state,
+                crate::recommendations::State::Pending | crate::recommendations::State::NotSent
+            ) && recommendation
+                .dismissal_key()
+                .is_some_and(|key| dismissals.contains(&key))
+            {
+                recommendation.state = crate::recommendations::State::Dismissed;
             }
         }
         Ok(inbox)
@@ -112,6 +156,20 @@ impl Store {
         &self,
         inbox: &std::collections::BTreeMap<String, crate::recommendations::Recommendation>,
     ) -> Result<()> {
+        self.save_recommendations_with_dismissals(inbox, &BTreeSet::new())
+    }
+
+    pub fn save_recommendations_with_dismissals(
+        &self,
+        inbox: &std::collections::BTreeMap<String, crate::recommendations::Recommendation>,
+        keys: &BTreeSet<String>,
+    ) -> Result<()> {
+        if keys
+            .iter()
+            .any(|key| key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err("Dismissed recommendations contain an invalid identity".into());
+        }
         let mut next = inbox.clone();
         let transaction = self
             .connection
@@ -151,6 +209,28 @@ impl Store {
                     next.insert(id, previous);
                 }
             }
+        }
+        let mut dismissals = Self::read_recommendation_dismissals(&transaction)?;
+        let previous_dismissals = dismissals.len();
+        dismissals.extend(keys.iter().cloned());
+        dismissals.extend(
+            next.values()
+                .filter(|record| record.state == crate::recommendations::State::Dismissed)
+                .filter_map(crate::recommendations::Recommendation::dismissal_key),
+        );
+        if dismissals.len() > 10_000 {
+            return Err("Dismissed recommendations reached their safety limit".into());
+        }
+        if dismissals.len() != previous_dismissals {
+            let dismissal_payload = serde_json::to_string(&dismissals)
+                .map_err(|_| "Encode dismissed recommendations failed")?;
+            transaction
+                .execute(
+                    "INSERT INTO settings VALUES('recommendation-dismissals-v1',?1)
+                 ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                    [dismissal_payload],
+                )
+                .map_err(|_| "Persist dismissed recommendations failed")?;
         }
         let payload =
             serde_json::to_string(&next).map_err(|_| "Encode recommendation inbox failed")?;
@@ -335,6 +415,43 @@ impl Store {
                 [json],
             )
             .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn workiq_identity(&self) -> Result<Option<crate::workiq::connection::Identity>> {
+        use rusqlite::OptionalExtension;
+        let payload: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT payload FROM settings WHERE key='workiq_identity'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        payload
+            .map(|json| {
+                let identity: crate::workiq::connection::Identity = serde_json::from_str(&json)
+                    .map_err(|_| "Saved WorkIQ identity is invalid".to_string())?;
+                identity.validate()?;
+                Ok(identity)
+            })
+            .transpose()
+    }
+
+    pub fn save_workiq_identity(
+        &self,
+        identity: &crate::workiq::connection::Identity,
+    ) -> Result<()> {
+        identity.validate()?;
+        let json = serde_json::to_string(identity).map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "INSERT INTO settings VALUES('workiq_identity',?1)
+             ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                [json],
+            )
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 

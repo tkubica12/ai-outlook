@@ -5,6 +5,23 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const ALL_DAY_CONTEXT_POLICY: &str = "For all-day events, all_day_dates gives the actual inclusive calendar dates. The raw end is exclusive; do not shift these dates into another time zone or include the end date.";
 
+pub fn person_email(person: &str) -> Option<String> {
+    let email = person
+        .rsplit_once('<')
+        .map(|(_, email)| email.trim_end_matches('>'))
+        .unwrap_or(person)
+        .trim();
+    let (name, domain) = email.split_once('@')?;
+    (!name.is_empty()
+        && domain.contains('.')
+        && !domain.contains('@')
+        && email.len() <= 254
+        && email.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'.' | b'-' | b'_' | b'+')
+        }))
+    .then(|| email.to_ascii_lowercase())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Event {
     pub id: String,

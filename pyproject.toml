@@ -1,6 +1,6 @@
 [project]
 name = "tomlook"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-first intelligent calendar and meeting preparation assistant"
 requires-python = ">=3.12"
 dependencies = [

@@ -37,8 +37,9 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The first native Windows release is **[v0.1.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.1.0)**.
-Download **[Tomlook-v0.1.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.1.0/Tomlook-v0.1.0-win-x64.zip)**
+The latest native Windows release is **[v0.2.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.2.0)**.
+Read the [release notes](docs/releases/v0.2.0.md) for changes since v0.1.0.
+Download **[Tomlook-v0.2.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.2.0/Tomlook-v0.2.0-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable, unsigned,
 and does not install anything.
@@ -95,8 +96,8 @@ Exit a running release before publishing. `release\`, `.build\` and Cargo
 `target\` outputs are ignored; `.build\` is for temporary checks/staging.
 Published binaries are versioned through GitHub Releases; the local `release\`
 directory still contains only the current executable. The native Cargo package
-version also sets the executable's Windows file/product version. Release
-automation is not required for the first manually verified delivery.
+version also sets the executable's Windows file/product version. Versioned
+release notes are kept in `docs\releases\`.
 Run native checks from `native\` with `cargo test --locked --offline` and
 `cargo clippy --locked --offline --all-targets -- -D warnings`.
 
@@ -117,6 +118,22 @@ used, never a title prefix or merely a free availability slot. When the provider
 does not expose Follow, Tomlook cannot reliably distinguish it from no response.
 Expanded Insights use section cards, action headings and source counts rather
 than one continuous text block.
+The neutral status-bar bell opens a larger recommendation list with one selected
+detail, clear action, meeting and rationale. Skip is remembered across research,
+metadata changes and restarts. `office` means the home/employer office; customer or partner
+premises use `mimo office`. Offsite visits can suggest separately approved travel
+reserves immediately before and after the meeting. Confirmed travel is
+uncategorized; only an uncertain parent passes on its uncertainty category.
+Longer deck/demo preparation can use an earlier workday block, while short final
+reviews remain near the meeting. Conflicts name the overlapping events in local
+time, including each meeting's full duration. Reciprocal conflicts appear once;
+meeting titles open their calendar detail. Conflict cards offer the same compact,
+confirmed tentative/decline/cancel/delete actions as the meeting menu, according
+to organizer permissions. Skips are remembered per conflict pair. Missing-material
+tips suggest what to request and show invitation contacts, prioritizing the
+organizer and the user's email domain without assuming agenda ownership.
+The verified sign-in and primary mail addresses are excluded from that list.
+Tomlook does not contact them automatically. Route/availability checks remain under Details.
 
 For browser GitHub login, follow the
 [Czech step-by-step registration guide](docs/github-sign-in.cs.md).

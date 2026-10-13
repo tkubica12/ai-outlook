@@ -2,15 +2,19 @@ use crate::calendar::{Calendar, Event};
 use chrono::{DateTime, Duration, FixedOffset};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
 const LIMIT: usize = 4;
+const POLICY_REVISION: u8 = 2;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Category,
     Preparation,
+    PreparationAdvance,
     Travel,
+    TravelAfter,
     MissingMaterials,
     PriorityConflict,
     FollowUp,
@@ -23,12 +27,44 @@ impl Kind {
         match self {
             Self::Category => "Category",
             Self::Preparation => "Preparation",
-            Self::Travel => "Travel buffer",
+            Self::PreparationAdvance => "Advance preparation",
+            Self::Travel => "Travel before meeting",
+            Self::TravelAfter => "Travel after meeting",
             Self::MissingMaterials => "Missing materials",
             Self::PriorityConflict => "Priority conflict",
             Self::FollowUp => "Follow-up",
             Self::Transition => "Meeting transition",
             Self::Manual => "Meeting action",
+        }
+    }
+
+    pub fn is_travel(self) -> bool {
+        matches!(self, Self::Travel | Self::TravelAfter)
+    }
+
+    pub fn is_preparation(self) -> bool {
+        matches!(self, Self::Preparation | Self::PreparationAdvance)
+    }
+
+    fn intent(self) -> Self {
+        if self.is_preparation() {
+            Self::Preparation
+        } else {
+            self
+        }
+    }
+
+    fn intent_key(self) -> &'static str {
+        match self {
+            Self::Category => "category",
+            Self::Preparation | Self::PreparationAdvance => "preparation",
+            Self::Travel => "travel",
+            Self::TravelAfter => "travel_after",
+            Self::MissingMaterials => "missing_materials",
+            Self::PriorityConflict => "priority_conflict",
+            Self::FollowUp => "follow_up",
+            Self::Transition => "transition",
+            Self::Manual => "manual",
         }
     }
 }
@@ -71,8 +107,11 @@ impl Suggestion {
             return Err("Recommendation category or duration exceeds its bounds".into());
         }
         if (self.kind == Kind::Category) != self.category.is_some()
-            || (self.kind != Kind::Preparation && self.kind != Kind::Travel)
-                && self.minutes.is_some()
+            || (!self.kind.is_preparation() && !self.kind.is_travel()) && self.minutes.is_some()
+            || self.kind == Kind::PreparationAdvance
+                && !self
+                    .minutes
+                    .is_some_and(|minutes| (60..=180).contains(&minutes))
         {
             return Err("Recommendation action does not match its type".into());
         }
@@ -90,7 +129,7 @@ pub fn validate_suggestions(suggestions: &[Suggestion]) -> Result<(), String> {
     if suggestions.iter().enumerate().any(|(index, suggestion)| {
         suggestions[..index]
             .iter()
-            .any(|previous| previous.kind == suggestion.kind)
+            .any(|previous| previous.kind.intent() == suggestion.kind.intent())
     }) {
         return Err("A meeting can have only one recommendation of each type".into());
     }
@@ -123,11 +162,31 @@ pub struct Recommendation {
     pub state: State,
     pub message: String,
     pub created_at: DateTime<FixedOffset>,
+    #[serde(default)]
+    pub policy_revision: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_change: Option<Change>,
 }
 
 impl Recommendation {
+    pub fn dismissal_key(&self) -> Option<String> {
+        if matches!(self.suggestion.kind, Kind::Manual | Kind::PriorityConflict) {
+            return None;
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"tomlook-dismissal-v1");
+        for part in [
+            self.account.as_str(),
+            self.event_id.as_str(),
+            self.suggestion.kind.intent_key(),
+            self.suggestion.category.as_deref().unwrap_or(""),
+        ] {
+            hash.update((part.len() as u64).to_le_bytes());
+            hash.update(part.as_bytes());
+        }
+        Some(format!("{:x}", hash.finalize()))
+    }
+
     pub fn from_insights(
         event: &Event,
         account: &str,
@@ -139,7 +198,7 @@ impl Recommendation {
             return Err("Recommendations require a confirmed, noncancelled meeting".into());
         }
         let fingerprint = crate::scheduler::fingerprint(event);
-        let action = serde_json::to_vec(&(
+        let mut action = serde_json::to_vec(&(
             account,
             &event.id,
             &fingerprint,
@@ -148,6 +207,9 @@ impl Recommendation {
             suggestion.minutes,
         ))
         .map_err(|_| "Encode recommendation identity failed")?;
+        if suggestion.kind == Kind::Category || suggestion.kind.is_travel() {
+            action.push(POLICY_REVISION);
+        }
         Ok(Self {
             id: format!("{:x}", Sha256::digest(action)),
             account: account.into(),
@@ -159,6 +221,7 @@ impl Recommendation {
             state: State::Pending,
             message: String::new(),
             created_at: now,
+            policy_revision: POLICY_REVISION,
             manual_change: None,
         })
     }
@@ -193,6 +256,7 @@ impl Recommendation {
             state: State::Pending,
             message: String::new(),
             created_at: now,
+            policy_revision: POLICY_REVISION,
             manual_change: Some(change),
         })
     }
@@ -203,7 +267,10 @@ impl Recommendation {
         owner: Option<&str>,
         now: DateTime<FixedOffset>,
     ) -> Option<&'a Event> {
-        if owner != Some(self.account.as_str()) {
+        if owner != Some(self.account.as_str())
+            || ((self.suggestion.kind == Kind::Category || self.suggestion.kind.is_travel())
+                && self.policy_revision != POLICY_REVISION)
+        {
             return None;
         }
         calendar
@@ -215,7 +282,11 @@ impl Recommendation {
                     && !cancelled(event)
                     && (!matches!(
                         self.suggestion.kind,
-                        Kind::Preparation | Kind::Travel | Kind::FollowUp
+                        Kind::Preparation
+                            | Kind::PreparationAdvance
+                            | Kind::Travel
+                            | Kind::TravelAfter
+                            | Kind::FollowUp
                     ) || !logistics_buffer(event))
                     && match self.suggestion.kind {
                         Kind::Manual => self
@@ -475,7 +546,10 @@ impl Operation {
             }
             (Change::Category(category), Kind::Category)
                 if self.recommendation.suggestion.category.as_ref() == Some(category) => {}
-            (Change::Buffer { .. }, Kind::Travel | Kind::Preparation) => {}
+            (
+                Change::Buffer { .. },
+                Kind::Travel | Kind::TravelAfter | Kind::Preparation | Kind::PreparationAdvance,
+            ) => {}
             _ => return Err("Calendar approval does not match the proposed action".into()),
         }
         if let Change::Buffer {
@@ -491,18 +565,22 @@ impl Operation {
                 || title.chars().any(char::is_control)
                 || *end <= *start
                 || *end - *start > Duration::hours(3)
+                || category != &buffer_category(&self.event)
                 || (*end - *start).num_seconds()
                     != i64::from(self.recommendation.suggestion.minutes.unwrap_or(30)) * 60
                 || *start < chrono::Local::now().fixed_offset()
-                || *end > self.event.start
-                || (self.recommendation.suggestion.kind == Kind::Travel
-                    && *end != self.event.start)
+                || match self.recommendation.suggestion.kind {
+                    Kind::Travel => *end != self.event.start,
+                    Kind::TravelAfter => *start != self.event.end,
+                    _ => *end > self.event.start,
+                }
                 || category
                     .as_ref()
                     .is_some_and(|value| value.len() > 256 || value.chars().any(char::is_control)))
         {
             return Err(
-                "The confirmed buffer must be a bounded future interval before its meeting".into(),
+                "The confirmed buffer must match its proposed duration and side of the meeting"
+                    .into(),
             );
         }
         Ok(())
@@ -550,29 +628,32 @@ pub fn proposed_change(
             category_replacement(&category, &known_categories(calendar))?;
             Ok(Change::Category(category))
         }
-        Kind::Travel | Kind::Preparation => {
+        Kind::Travel | Kind::TravelAfter | Kind::Preparation | Kind::PreparationAdvance => {
             let minutes = recommendation.suggestion.minutes.unwrap_or(30);
-            let (start, end) = free_interval(
-                calendar,
-                event,
-                minutes,
-                now,
-                recommendation.suggestion.kind == Kind::Travel,
-            )
+            let (start, end) = if recommendation.suggestion.kind.is_travel() {
+                travel_interval(
+                    calendar,
+                    event,
+                    minutes,
+                    now,
+                    recommendation.suggestion.kind,
+                )
+            } else if recommendation.suggestion.kind == Kind::PreparationAdvance {
+                advance_preparation_interval(calendar, event, minutes, now)
+            } else {
+                free_interval(calendar, event, minutes, now, false)
+            }
             .ok_or("No free interval fits the proposed buffer; adjust the calendar first")?;
             let title = match (language, recommendation.suggestion.kind) {
                 (crate::i18n::Language::Cs, Kind::Travel) => "Přejezd",
+                (crate::i18n::Language::Cs, Kind::TravelAfter) => "Přejezd po schůzce",
                 (crate::i18n::Language::Cs, _) => "Příprava",
                 (_, Kind::Travel) => "Travel buffer",
+                (_, Kind::TravelAfter) => "Travel after meeting",
                 _ => "Preparation",
             }
             .to_owned();
-            let category = known_categories(calendar).into_iter().find(|category| {
-                matches!(
-                    category.to_lowercase().as_str(),
-                    "nejisté" | "blocker" | "rezerva"
-                )
-            });
+            let category = buffer_category(event);
             Ok(Change::Buffer {
                 title,
                 start,
@@ -582,6 +663,15 @@ pub fn proposed_change(
         }
         _ => Err("This recommendation is informational; open its Insights".into()),
     }
+}
+
+fn buffer_category(event: &Event) -> Option<String> {
+    real_categories(event).into_iter().find(|category| {
+        matches!(
+            category.trim().to_lowercase().as_str(),
+            "nejisté" | "nejiste" | "blocker"
+        )
+    })
 }
 
 pub fn known_categories(calendar: &Calendar) -> Vec<String> {
@@ -596,20 +686,298 @@ pub fn known_categories(calendar: &Calendar) -> Vec<String> {
         .collect()
 }
 
-pub fn calendar_context(calendar: &Calendar, event: &Event) -> serde_json::Value {
-    let confirmed = calendar
+pub fn category_meanings(categories: &[String]) -> serde_json::Value {
+    let meanings = categories.iter().filter_map(|category| {
+        let meaning = match category.trim().to_lowercase().as_str() {
+            "office" => "In person at the user's home office or employer's premises. A customer's or partner's office is not this category. Require affirmative evidence of the home/employer office.",
+            "mimo office" => "In person away from the user's home/employer office, including a customer's or partner's premises within the home city.",
+            "mimo prahu" => "A trip or in-person meeting outside Prague; do not infer a route or duration from the category alone.",
+            "call" => "Remote participation by video or phone. A conference link alone does not make an explicitly in-person or hybrid visit remote.",
+            "nejisté" | "nejiste" => "A genuinely uncertain or tentative event. Not a generic logistics, travel or preparation category. A buffer inherits uncertainty only from an uncertain parent meeting; confirmed meetings have uncategorized buffers.",
+            _ => return None,
+        };
+        Some((category.clone(), serde_json::Value::String(meaning.into())))
+    });
+    serde_json::Value::Object(meanings.collect())
+}
+
+pub fn complete_suggestions(
+    calendar: &Calendar,
+    event: &Event,
+    mut suggestions: Vec<Suggestion>,
+) -> Result<Vec<Suggestion>, String> {
+    validate_suggestions(&suggestions)?;
+    if event.unconfirmed() || cancelled(event) {
+        return Ok(Vec::new());
+    }
+    let categories = known_categories(calendar);
+    suggestions.retain(|suggestion| {
+        suggestion.kind != Kind::Category
+            || (suggestion
+                .category
+                .as_ref()
+                .is_some_and(|category| categories.contains(category))
+                && real_categories(event)
+                    != suggestion.category.iter().cloned().collect::<Vec<_>>())
+    });
+    let offsite_category = |category: &String| {
+        matches!(
+            category.trim().to_lowercase().as_str(),
+            "mimo office" | "mimo prahu"
+        )
+    };
+    let effective_categories = suggestions
+        .iter()
+        .find_map(|suggestion| suggestion.category.as_ref())
+        .map(|category| vec![category.clone()])
+        .unwrap_or_else(|| real_categories(event));
+    let offsite = effective_categories.iter().any(offsite_category);
+    let remote = !offsite
+        && effective_categories
+            .iter()
+            .any(|category| category.trim().eq_ignore_ascii_case("call"));
+    let placeholder = logistics_buffer(event);
+    let context = calendar_context(calendar, event);
+    suggestions.retain(|suggestion| {
+        if suggestion.kind.is_travel() && (remote || event.is_all_day || placeholder)
+            || suggestion.kind.is_preparation() && (event.is_all_day || placeholder)
+            || suggestion.kind == Kind::FollowUp && placeholder
+        {
+            return false;
+        }
+        match suggestion.kind {
+            Kind::Travel => context["existing_travel_buffer"] != true,
+            Kind::TravelAfter => context["existing_travel_buffer_after"] != true,
+            _ => true,
+        }
+    });
+    if offsite && !event.is_all_day && !placeholder {
+        for (kind, existing) in [
+            (Kind::Travel, context["existing_travel_buffer"] == true),
+            (
+                Kind::TravelAfter,
+                context["existing_travel_buffer_after"] == true,
+            ),
+        ] {
+            if existing || suggestions.iter().any(|suggestion| suggestion.kind == kind) {
+                continue;
+            }
+            if suggestions.len() == LIMIT {
+                let Some(index) = suggestions.iter().rposition(|suggestion| {
+                    suggestion.kind != Kind::Category
+                        && !suggestion.kind.is_preparation()
+                        && !suggestion.kind.is_travel()
+                }) else {
+                    return Err("Offsite travel recommendations exceed their safety limit".into());
+                };
+                suggestions.remove(index);
+            }
+            let (reason, reason_cs) = if kind == Kind::Travel {
+                (
+                    "An in-person visit away from your home office needs time to get there. Allow an estimated 30 minutes before the meeting.",
+                    "Na osobní schůzku mimo domovskou kancelář je potřeba dojet. Vyhraď si před ní přibližně 30 minut na přesun.",
+                )
+            } else {
+                (
+                    "An in-person visit away from your home office needs time for the onward journey. Allow an estimated 30 minutes after the meeting.",
+                    "Po osobní schůzce mimo domovskou kancelář je potřeba čas na další cestu. Vyhraď si po ní přibližně 30 minut na přesun.",
+                )
+            };
+            suggestions.push(Suggestion {
+                kind,
+                reason: reason.into(),
+                reason_cs: reason_cs.into(),
+                category: None,
+                minutes: Some(30),
+            });
+        }
+    }
+    validate_suggestions(&suggestions)?;
+    Ok(suggestions)
+}
+
+fn travel_buffer(event: &Event) -> bool {
+    if !logistics_buffer(event) {
+        return false;
+    }
+    let title = event.title.to_lowercase();
+    let first = title.trim_start_matches("blocker").trim_start();
+    !["příprava", "priprava", "preparation"]
+        .iter()
+        .any(|prefix| first.starts_with(prefix))
+}
+
+fn blocks_time(event: &Event) -> bool {
+    !event.unconfirmed()
+        && !cancelled(event)
+        && event
+            .extra
+            .get("showAs")
+            .and_then(serde_json::Value::as_str)
+            != Some("free")
+}
+
+pub fn conflicts<'a>(calendar: &'a Calendar, event: &Event) -> Vec<&'a Event> {
+    let mut conflicts = calendar
         .events
         .iter()
         .filter(|other| {
             other.id != event.id
-                && !other.unconfirmed()
-                && !cancelled(other)
-                && other
-                    .extra
-                    .get("showAs")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("free")
+                && blocks_time(other)
+                && other.start < event.end
+                && other.end > event.start
         })
+        .collect::<Vec<_>>();
+    conflicts.sort_by_key(|other| (other.start.max(event.start), &other.id));
+    conflicts
+}
+
+pub fn conflict_dismissal_key(account: &str, first: &str, second: &str) -> String {
+    let (first, second) = if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"tomlook-conflict-dismissal-v1");
+    for part in [account, first, second] {
+        hash.update((part.len() as u64).to_le_bytes());
+        hash.update(part.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InboxEntry {
+    pub id: String,
+    pub conflicts: Vec<String>,
+}
+
+pub fn inbox_view(
+    calendar: &Calendar,
+    inbox: &BTreeMap<String, Recommendation>,
+    owner: Option<&str>,
+    now: DateTime<FixedOffset>,
+    dismissals: &BTreeSet<String>,
+) -> Vec<InboxEntry> {
+    let mut covered = dismissals.clone();
+    // Preserve skips from versions that did not yet record individual conflict pairs.
+    for record in inbox.values().filter(|record| {
+        record.suggestion.kind == Kind::PriorityConflict && record.state == State::Dismissed
+    }) {
+        if let Some(event) = record.current(calendar, owner, now) {
+            let keys = conflicts(calendar, event)
+                .into_iter()
+                .map(|other| conflict_dismissal_key(&record.account, &event.id, &other.id))
+                .collect::<Vec<_>>();
+            if !keys.iter().any(|key| dismissals.contains(key)) {
+                covered.extend(keys);
+            }
+        }
+    }
+    let mut records = inbox
+        .values()
+        .filter(|record| record.visible(calendar, owner, now))
+        .collect::<Vec<_>>();
+    records.sort_by_key(|record| {
+        (
+            calendar
+                .event_index(&record.event_id)
+                .map(|index| calendar.events[index].start),
+            record.suggestion.kind,
+            &record.event_id,
+            &record.id,
+        )
+    });
+    records
+        .into_iter()
+        .filter_map(|record| {
+            let mut entry = InboxEntry {
+                id: record.id.clone(),
+                conflicts: Vec::new(),
+            };
+            if record.suggestion.kind == Kind::PriorityConflict {
+                if let Some(event) = record.current(calendar, owner, now) {
+                    entry.conflicts = conflicts(calendar, event)
+                        .into_iter()
+                        .filter(|other| {
+                            covered.insert(conflict_dismissal_key(
+                                &record.account,
+                                &event.id,
+                                &other.id,
+                            ))
+                        })
+                        .map(|other| other.id.clone())
+                        .collect();
+                }
+                if entry.conflicts.is_empty()
+                    && !matches!(record.state, State::Review | State::Dispatching)
+                {
+                    return None;
+                }
+            }
+            Some(entry)
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct MaterialContact {
+    pub person: String,
+    pub email: String,
+    pub organizer: bool,
+    pub same_domain: bool,
+}
+
+pub fn material_contacts(
+    event: &Event,
+    work_email: &str,
+    identity: Option<&crate::workiq::connection::Identity>,
+) -> Vec<MaterialContact> {
+    let own_email = crate::calendar::person_email(work_email);
+    let primary_email = identity
+        .filter(|identity| {
+            own_email
+                .as_deref()
+                .is_some_and(|email| identity.account.eq_ignore_ascii_case(email))
+        })
+        .and_then(|identity| identity.mail.as_deref())
+        .and_then(crate::calendar::person_email);
+    let own_domain = primary_email
+        .as_ref()
+        .or(own_email.as_ref())
+        .and_then(|email| email.split_once('@'))
+        .map(|(_, domain)| domain);
+    let mut seen = BTreeSet::new();
+    let mut contacts = std::iter::once((&event.organizer, true))
+        .chain(event.attendees.iter().map(|person| (person, false)))
+        .filter_map(|(person, organizer)| {
+            let email = crate::calendar::person_email(person)?;
+            if own_email.as_ref() == Some(&email)
+                || primary_email.as_ref() == Some(&email)
+                || !seen.insert(email.clone())
+            {
+                return None;
+            }
+            let domain = email.split_once('@')?.1;
+            Some(MaterialContact {
+                person: person.clone(),
+                organizer,
+                same_domain: own_domain == Some(domain),
+                email,
+            })
+        })
+        .collect::<Vec<_>>();
+    contacts.sort_by_key(|contact| (!contact.organizer, !contact.same_domain));
+    contacts.truncate(6);
+    contacts
+}
+
+pub fn calendar_context(calendar: &Calendar, event: &Event) -> serde_json::Value {
+    let confirmed = calendar
+        .events
+        .iter()
+        .filter(|other| other.id != event.id && blocks_time(other))
         .collect::<Vec<_>>();
     let nearby = |other: &&Event| {
         other.end >= event.start - Duration::days(2) && other.start <= event.end + Duration::days(2)
@@ -633,23 +1001,29 @@ pub fn calendar_context(calendar: &Calendar, event: &Event) -> serde_json::Value
         .collect::<Vec<_>>();
     let describe = |other: &Event| {
         serde_json::json!({
-            "title":other.title.chars().take(256).collect::<String>(), "start":other.start, "end":other.end,
+            "title":other.title.chars().take(256).collect::<String>(),
+            "start":if other.is_all_day { other.start } else { other.start.with_timezone(&chrono::Local).fixed_offset() },
+            "end":if other.is_all_day { other.end } else { other.end.with_timezone(&chrono::Local).fixed_offset() },
+            "calendar_dates":other.calendar_dates(),
             "location":other.location.chars().take(256).collect::<String>(), "all_day":other.is_all_day,
         })
     };
-    let previous_title = previous
-        .map(|other| other.title.to_lowercase())
-        .unwrap_or_default();
-    let existing_travel = previous.is_some_and(|other| other.end == event.start)
-        && [
-            "přejezd", "přesun", "presun", "rezerva", "travel", "transfer",
-        ]
+    let existing_travel = confirmed
         .iter()
-        .any(|word| previous_title.contains(word));
+        .any(|other| other.end == event.start && travel_buffer(other));
+    let existing_travel_after = confirmed
+        .iter()
+        .any(|other| other.start == event.end && travel_buffer(other));
     serde_json::json!({
+        "current_start_local":(!event.is_all_day).then(|| event.start.with_timezone(&chrono::Local).fixed_offset()),
+        "current_end_local":(!event.is_all_day).then(|| event.end.with_timezone(&chrono::Local).fixed_offset()),
+        "current_calendar_dates":event.calendar_dates(),
+        "planning_now_local":chrono::Local::now().fixed_offset(),
+        "display_time_zone":"local",
         "previous_confirmed":previous.map(describe), "next_confirmed":next.map(describe),
         "overlaps_confirmed":overlaps.iter().take(6).map(|other| describe(other)).collect::<Vec<_>>(),
         "overlaps_complete":overlaps.len() <= 6, "existing_travel_buffer":existing_travel,
+        "existing_travel_buffer_after":existing_travel_after,
         "current_title_is_buffer":logistics_buffer(event),
         "day_covered":calendar.coverage.contains(&event.start.with_timezone(&chrono::Local).date_naive()),
         "position_and_traffic_verified":false,
@@ -690,32 +1064,21 @@ pub fn free_interval(
     now: DateTime<FixedOffset>,
     travel: bool,
 ) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+    if travel {
+        return travel_interval(calendar, event, minutes, now, Kind::Travel);
+    }
     if event.is_all_day || !(5..=180).contains(&minutes) {
         return None;
     }
     let duration = Duration::minutes(i64::from(minutes));
     let end = event.start;
     let earliest = now + Duration::minutes(5);
-    let first = if travel {
-        end - duration
-    } else {
-        end - Duration::days(2)
-    }
-    .max(earliest);
+    let first = (end - Duration::days(2)).max(earliest);
     let mut intervals = calendar
         .events
         .iter()
         .filter(|other| {
-            !other.unconfirmed()
-                && !cancelled(other)
-                && other.id != event.id
-                && other
-                    .extra
-                    .get("showAs")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("free")
-                && other.end > first
-                && other.start < end
+            blocks_time(other) && other.id != event.id && other.end > first && other.start < end
         })
         .map(|other| (other.start, other.end))
         .collect::<Vec<_>>();
@@ -728,6 +1091,104 @@ pub fn free_interval(
         latest = latest.min(start);
     }
     working_interval(first, latest, duration)
+}
+
+pub fn advance_preparation_interval(
+    calendar: &Calendar,
+    event: &Event,
+    minutes: u16,
+    now: DateTime<FixedOffset>,
+) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+    if event.is_all_day || !(60..=180).contains(&minutes) {
+        return None;
+    }
+    let duration = Duration::minutes(i64::from(minutes));
+    let last = event.start;
+    let first = (last - Duration::days(14)).max(now + Duration::minutes(5));
+    let mut intervals = calendar
+        .events
+        .iter()
+        .filter(|other| {
+            other.id != event.id && blocks_time(other) && other.end > first && other.start < last
+        })
+        .map(|other| (other.start, other.end))
+        .collect::<Vec<_>>();
+    intervals.sort_by_key(|interval| interval.0);
+    let mut earliest = first;
+    for (start, end) in intervals {
+        if let Some(interval) = first_working_interval(earliest, start.min(last), duration) {
+            return Some(interval);
+        }
+        earliest = earliest.max(end);
+    }
+    first_working_interval(earliest, last, duration)
+}
+
+fn first_working_interval(
+    first: DateTime<FixedOffset>,
+    last: DateTime<FixedOffset>,
+    duration: Duration,
+) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+    use chrono::{Datelike, Local, TimeZone};
+    let mut day = first.with_timezone(&Local).date_naive();
+    let last_day = last.with_timezone(&Local).date_naive();
+    while day <= last_day {
+        if day.weekday().num_days_from_monday() < 5 {
+            let start = Local
+                .from_local_datetime(&day.and_hms_opt(8, 0, 0)?)
+                .single()?
+                .fixed_offset()
+                .max(first);
+            let mut seconds = start.timestamp().div_euclid(300) * 300;
+            if seconds < start.timestamp() || start.timestamp_subsec_nanos() > 0 {
+                seconds += 300;
+            }
+            let start = DateTime::from_timestamp(seconds, 0)?.with_timezone(start.offset());
+            let end = Local
+                .from_local_datetime(&day.and_hms_opt(18, 0, 0)?)
+                .single()?
+                .fixed_offset()
+                .min(last);
+            if end - start >= duration {
+                return Some((start, start + duration));
+            }
+        }
+        day = day.succ_opt()?;
+    }
+    None
+}
+
+pub fn travel_interval(
+    calendar: &Calendar,
+    event: &Event,
+    minutes: u16,
+    now: DateTime<FixedOffset>,
+    kind: Kind,
+) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+    use chrono::{Datelike, Local, Timelike};
+    if event.is_all_day || !(5..=180).contains(&minutes) || !kind.is_travel() {
+        return None;
+    }
+    let duration = Duration::minutes(i64::from(minutes));
+    let (start, end) = if kind == Kind::TravelAfter {
+        (event.end, event.end + duration)
+    } else {
+        (event.start - duration, event.start)
+    };
+    let local_start = start.with_timezone(&Local);
+    let local_end = end.with_timezone(&Local);
+    if start < now + Duration::minutes(5)
+        || local_start.date_naive() != local_end.date_naive()
+        || local_start.weekday().num_days_from_monday() >= 5
+        || local_start.hour() < 8
+        || local_end.time() > chrono::NaiveTime::from_hms_opt(18, 0, 0)?
+        || calendar.events.iter().any(|other| {
+            other.id != event.id && blocks_time(other) && other.start < end && other.end > start
+        })
+    {
+        return None;
+    }
+    Some((start, end))
 }
 
 fn working_interval(

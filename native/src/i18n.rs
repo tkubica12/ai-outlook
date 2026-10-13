@@ -297,7 +297,62 @@ pub const TEXTS: &[(&str, &str)] = &[
     ),
     ("Recommendations", "Doporučení"),
     ("Diagnostics", "Diagnostika"),
+    ("Meeting", "Schůzka"),
+    ("Make time to prepare", "Vyhradit čas na přípravu"),
+    (
+        "Reserve travel before meeting",
+        "Přidat přesun před schůzkou",
+    ),
+    ("Reserve travel after meeting", "Přidat přesun po schůzce"),
+    ("Travel before meeting", "Přesun před schůzkou"),
+    ("Travel after meeting", "Přesun po schůzce"),
+    ("Use category", "Použít kategorii"),
+    ("Add to calendar", "Přidat do kalendáře"),
+    ("Skip recommendation", "Přeskočit"),
+    ("Details and checks", "Podrobnosti"),
+    ("Needs review", "Ke kontrole"),
     ("Preparation", "Příprava"),
+    ("Advance preparation", "Příprava v předstihu"),
+    ("Prepare in advance", "Připravit v předstihu"),
+    ("To category", "Na kategorii"),
+    ("Conflicts with", "Překrývá se s"),
+    ("Who to ask", "Koho oslovit"),
+    ("Same email domain", "Stejná e-mailová doména"),
+    ("Participant", "Účastník"),
+    (
+        "Ask for the agenda, materials and your expected role.",
+        "Požádej o agendu, podklady a svou očekávanou roli.",
+    ),
+    ("Overlap", "Překryv"),
+    (
+        "Confirmed calendar request is invalid; no write was submitted",
+        "Potvrzený požadavek není platný. Zápis nebyl odeslán.",
+    ),
+    (
+        "No overlap in the current confirmed calendar.",
+        "V aktuálním kalendáři není překryv s potvrzenou událostí.",
+    ),
+    ("Alt+Up / Alt+Down", "Alt+nahoru / Alt+dolů"),
+    (
+        "Read dismissed recommendations failed",
+        "Nepodařilo se načíst přeskočená doporučení.",
+    ),
+    (
+        "Saved dismissed recommendations are invalid",
+        "Uložená přeskočená doporučení jsou neplatná.",
+    ),
+    (
+        "Dismissed recommendations reached their safety limit",
+        "Přeskočená doporučení dosáhla bezpečnostního limitu; historie nebyla odstraněna.",
+    ),
+    (
+        "Encode dismissed recommendations failed",
+        "Nepodařilo se připravit přeskočená doporučení k uložení.",
+    ),
+    (
+        "Persist dismissed recommendations failed",
+        "Nepodařilo se uložit přeskočená doporučení.",
+    ),
     ("Travel buffer", "Rezerva na přejezd"),
     ("Missing materials", "Chybějící podklady"),
     ("Priority conflict", "Souběh důležitých schůzek"),
@@ -345,6 +400,14 @@ pub const TEXTS: &[(&str, &str)] = &[
     (
         "No free interval fits the proposed buffer; adjust the calendar first",
         "Pro navrženou rezervu není volný úsek. Nejdřív upravte kalendář.",
+    ),
+    (
+        "The confirmed buffer must match its proposed duration and side of the meeting",
+        "Potvrzený blok musí mít navrženou délku a být na správné straně schůzky.",
+    ),
+    (
+        "Offsite travel recommendations exceed their safety limit",
+        "Počet doporučení na přesun překročil bezpečnostní limit.",
     ),
     (
         "Recommendation expired after a calendar change",
@@ -1221,6 +1284,7 @@ pub const TEXTS: &[(&str, &str)] = &[
 ];
 
 const PATTERNS: &[(&str, &str)] = &[
+    ("And {} more overlaps", "A další překryvy: {0}"),
     (
         "Calendar provider rejected the write with HTTP {}; nothing was changed by this request",
         "Poskytovatel odmítl zápis (HTTP {0}). Tento požadavek nic nezměnil.",

@@ -329,6 +329,7 @@ impl Queue {
     }
 
     fn admit(&mut self) {
+        let now = Local::now().fixed_offset();
         let mut candidates = self
             .jobs
             .values()
@@ -336,9 +337,7 @@ impl Queue {
                 job.verified
                     && (!job.on_demand || job.manual || job.foreground)
                     && matches!(job.state, State::Deferred | State::Queued)
-                    && job
-                        .retry_at
-                        .is_none_or(|retry| retry <= Local::now().fixed_offset())
+                    && job.retry_at.is_none_or(|retry| retry <= now)
             })
             .map(|job| {
                 (

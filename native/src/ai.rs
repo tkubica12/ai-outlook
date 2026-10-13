@@ -738,6 +738,10 @@ impl Engine {
                                             crate::workiq::connection::calendar_write::Outcome::NotSent(_) => "write_not_submitted_or_rejected",
                                             crate::workiq::connection::calendar_write::Outcome::Review(_) => "write_outcome_requires_review",
                                         }, None, 0);
+                                        if let crate::workiq::connection::calendar_write::Outcome::NotSent(message) = &outcome
+                                            && message.starts_with("Calendar provider rejected the write with HTTP ") {
+                                            telemetry.failure("calendar", message, None);
+                                        }
                                         let result = tokio::time::timeout(Duration::from_secs(10), reply.send(CalendarResult { id, outcome })).await
                                             .map_err(|_| "Confirmed calendar outcome delivery timed out".to_owned())
                                             .and_then(|result| result.map_err(|_| "Confirmed calendar outcome could not reach storage".to_owned()));
@@ -1206,7 +1210,7 @@ impl Engine {
                                             notify(Notice::HostedWorkiq { busy: false, ready: true, message: format!("Connected as {}", connection.account) });
                                             workiq = Some(connection);
                                             if let Some(wake) = &wake
-                                                && wake.try_send(crate::worker::Command::WorkiqConnected(workiq.as_ref().expect("connection just assigned").account.clone())).is_err()
+                                                && wake.try_send(crate::worker::Command::WorkiqConnected(workiq.as_ref().expect("connection just assigned").identity.clone())).is_err()
                                             {
                                                 notify(Notice::HostedWorkiq { busy: false, ready: true, message: "WorkIQ connected, but background synchronization could not reach storage".into() });
                                             }

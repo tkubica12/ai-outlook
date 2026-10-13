@@ -1,6 +1,6 @@
 use chrono::{DateTime, Duration, Local};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize},
@@ -1239,6 +1239,161 @@ fn malformed_ledgers_and_request_exhaustion_stop_visibly() {
     queue.sequence = (1 << 63) - 1;
     assert!(queue.dispatch().is_none());
     assert!(queue.failure.as_ref().unwrap().contains("identity limit"));
+}
+
+#[test]
+fn worker_completes_offsite_travel_drafts_without_dispatching_a_calendar_write() {
+    for skip_arrival in [false, true] {
+        use chrono::TimeZone;
+        use tomlook::recommendations::{Kind, State as RecommendationState};
+        let root = tempfile::tempdir().unwrap();
+        let now = Local::now().fixed_offset();
+        let monday = calendar::monday(now.date_naive()) + Duration::days(7);
+        let mut event = fixture(1).events.remove(0);
+        event.title = "Client architecture workshop".into();
+        event.location = "Client office".into();
+        event.start = Local
+            .from_local_datetime(&monday.and_hms_opt(14, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .fixed_offset();
+        event.end = event.start + Duration::hours(1);
+        event.category.clear();
+        event
+            .extra
+            .insert("categories".into(), serde_json::json!([]));
+        let mut categories = Vec::new();
+        for (index, category) in ["office", "mimo office"].into_iter().enumerate() {
+            let mut reference = event.clone();
+            reference.id = format!("category-reference-{index}");
+            reference.status = "cancelled".into();
+            reference.category = category.into();
+            reference
+                .extra
+                .insert("categories".into(), serde_json::json!([category]));
+            categories.push(reference);
+        }
+        categories.push(event.clone());
+        let calendar = Calendar::build(categories, [monday].into(), vec![]).unwrap();
+        {
+            let mut store = Store::open(root.path()).unwrap();
+            store
+                .save_workiq_calendar(&calendar, "fixture-owner")
+                .unwrap();
+            store
+                .save_preferences(&Preferences {
+                    prepare_enabled: true,
+                    ..Default::default()
+                })
+                .unwrap();
+            if skip_arrival {
+                let mut older_event = event.clone();
+                older_event.title = "Previous title of this same meeting".into();
+                let mut skipped = tomlook::recommendations::Recommendation::from_insights(
+                    &older_event,
+                    "fixture-owner",
+                    tomlook::recommendations::Suggestion {
+                        kind: Kind::Travel,
+                        reason: "Earlier arrival estimate.".into(),
+                        reason_cs: "Drivejsi odhad prijezdu.".into(),
+                        category: None,
+                        minutes: Some(60),
+                    },
+                    now - Duration::days(40),
+                )
+                .unwrap();
+                skipped.state = RecommendationState::Dismissed;
+                store
+                    .save_recommendations(&BTreeMap::from([(skipped.id.clone(), skipped)]))
+                    .unwrap();
+                store.save_recommendations(&BTreeMap::new()).unwrap();
+            }
+        }
+        let mut worker = Worker::start(
+            Options {
+                state: root.path().into(),
+                legacy_root: root.path().into(),
+                demo: None,
+            },
+            eframe::egui::Context::default(),
+        )
+        .unwrap();
+        let (sender, mut commands) = tokio::sync::mpsc::channel(64);
+        worker
+            .commands
+            .send(Command::AttachAi {
+                commands: sender,
+                ready: Arc::new(AtomicBool::new(true)),
+                occupied: Arc::new(AtomicUsize::new(0)),
+                terminated: Arc::new(AtomicBool::new(false)),
+                analysis_revision: Arc::new(std::sync::OnceLock::from("a".repeat(64))),
+                workiq_ready: Arc::new(AtomicBool::new(true)),
+            })
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let request = loop {
+            match commands.try_recv() {
+                Ok(ai::Command::Prepare(request)) => break request,
+                Ok(ai::Command::CalendarChange { .. }) => {
+                    panic!("Research dispatched a calendar write")
+                }
+                Ok(_) | Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Err(error) => panic!("Executor disconnected: {error}"),
+            }
+            assert!(Instant::now() < deadline, "No preparation dispatch");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(
+            request.event.extra["tomlook_category_meanings"]["office"]
+                .as_str()
+                .unwrap()
+                .contains("employer's premises")
+        );
+        assert_eq!(request.event.id, event.id);
+        request.reply.blocking_send(ai::Prepared {
+        id: request.id,
+        result: ai::PreparationResult::Finished(Ok(Arc::new(serde_json::json!({
+            "summary":"Client visit.", "sources":[], "gaps":[],
+            "recommendations":[{"kind":"category","reason":"The invitation names client premises.",
+                "reason_cs":"Pozvanka uvadi kancelar zakaznika.", "category":"mimo office","minutes":null}]
+        }).to_string()))),
+    }).unwrap();
+        request.wake.send(Command::Wake).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if Store::open(root.path()).unwrap().queue().unwrap().jobs[&event.id].state
+                == State::Completed
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Preparation was not persisted");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        worker.commands.send(Command::Exit).unwrap();
+        worker
+            .done
+            .take()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        while let Ok(command) = commands.try_recv() {
+            assert!(!matches!(command, ai::Command::CalendarChange { .. }));
+        }
+        let store = Store::open(root.path()).unwrap();
+        let inbox = store.recommendations().unwrap();
+        assert_eq!(inbox.len(), if skip_arrival { 2 } else { 3 });
+        for kind in [Kind::Category, Kind::Travel, Kind::TravelAfter] {
+            assert_eq!(
+                inbox.values().any(|record| record.suggestion.kind == kind
+                    && record.state == RecommendationState::Pending),
+                !skip_arrival || kind != Kind::Travel
+            );
+        }
+        let briefing: serde_json::Value =
+            serde_json::from_str(&store.briefing(&event.id).unwrap().unwrap()).unwrap();
+        assert_eq!(briefing["recommendations"].as_array().unwrap().len(), 3);
+    }
 }
 
 #[test]

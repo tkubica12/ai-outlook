@@ -169,6 +169,29 @@ occurrence can legitimately become a Graph exception; verification allows only
 that metadata transition while requiring the exact identity, categories, times
 and other fields. These reads use the reserved calendar lane, so background
 research cannot starve manual calendar verification.
+Definitive provider rejections retain HTTP status and an allowlisted Graph error
+identifier when returned, without saving arbitrary response bodies or private
+provider messages. HTTP status is also logged. Local request validation is never
+reported as a provider HTTP 400. A rejected response is not retried automatically;
+the user must explicitly confirm a new attempt.
+
+Recommendation titles navigate to the meeting and saved Insights, clearing
+search/category filters that could hide it. Priority-conflict cards show full
+local meeting times plus the intersection and offer role-appropriate tentative,
+decline, cancel or delete controls, each using the existing single confirmation.
+Reciprocal pairs appear only once; distinct additional conflicts remain visible.
+Conflict skips store symmetric account/occurrence-pair keys atomically with the
+inbox, surviving metadata/research changes and restarts without hiding other pairs
+or unknown write outcomes. The storage worker derives and caches the inbox view;
+the UI never scans the whole calendar to deduplicate advice. Large conflict lists
+are paged six meetings at a time.
+Missing-material cards show at most six actual invitation contacts, with the
+organizer and same-email-domain attendees first. Same-domain presence is a clue,
+not proof of employer or agenda ownership. The verified `/me` sign-in and primary
+mail addresses are cached locally, bound to the calendar account, and excluded
+from suggestions and AI contact context, including after restart. Fresh Insights investigate ownership
+in retrieved mail/Teams evidence and suggest a concrete question to ask; uncertain
+ownership is labeled as such. No outreach is submitted.
 
 `src\i18n.rs` owns English keys, natural Czech labels and argument-preserving
 message templates. New UI literals must enter that catalog; coverage, uniqueness,
@@ -228,22 +251,44 @@ for the external-runtime adapter.
 ### Quiet recommendations and confirmed calendar changes
 
 Fresh bilingual Insights can include up to four distinct, evidence-led drafts:
-category, preparation, travel, missing materials, priority conflict, follow-up,
+category, short preparation, advance preparation, arrival travel, departure travel, missing materials, priority conflict, follow-up,
 and meeting transition. Suggestions reuse that research; there is no separate
-recommendation model loop. The status-bar inbox stays quiet, uses a neutral count,
-and shows an amber triangle for warnings or uncertain writes. Opening it never
-submits research. Cards have EN/CZ reasons, saved Insights, dismissal, and an exact
-action preview. Rendering is bounded to six cards per page. Upcoming suggestions
+recommendation model loop. The status-bar inbox uses a neutral, keyboard-accessible
+bell and a small count; diagnostics do not turn it into an alarm triangle.
+Opening it never submits research. A larger master-detail window keeps a virtualized
+list on the left and one selected action on the right. Previous/Next and
+Alt+Up/Alt+Down navigate without submitting anything. Selection survives refreshed
+wording, and list navigation reveals offscreen selections. Cards separate the proposed action and time,
+associated meeting, and rationale, with technical checks under Details.
+Category chips and buffer time ranges are prominent; reasons and controls are
+localized in EN/CZ. The category arrow is drawn natively, not a font-dependent glyph.
+Conflict cards use current confirmed counterparts and local overlap times rather
+than model-written UTC prose. Upcoming suggestions
 cover fourteen days; follow-up cards activate after the source meeting ends.
 **Draft follow-up** opens the existing assistant with a localized draft request
 and **Suggest drafts** enabled. It preserves an existing unsent question, does
 not submit research automatically, and never sends mail. Unknown decisions,
 owners and dates must remain placeholders until evidence establishes them.
-Dismissed actions are deduplicated across restarts. Closed, obsolete records older
-than thirty days can be compacted; unresolved writes are retained.
+Skip atomically saves a separate account/meeting/action/category intent key, independent
+of rationale, event fingerprint, policy revision and duration. Arrival and departure
+remain separate, as do different category targets. Preparation variants share a skip
+intent. These decisions survive restarts and inbox compaction; unknown writes remain
+reviewable and approval fingerprints are never weakened. The bounded dismissal
+ledger reports errors instead of silently forgetting decisions. Closed, obsolete
+records older than thirty days can be compacted; unresolved writes are retained.
 The model receives bounded confirmed-calendar neighbours and overlaps; these
 are calendar facts, not proof of the user's physical position. Existing contiguous
-travel/reserve blocks suppress duplicate travel tips.
+travel/reserve blocks suppress duplicate tips independently before and after a meeting.
+`office` explicitly means the user's home/employer office, not a customer's or
+partner's premises; `mimo office` covers those offsite visits. The model receives
+these meanings alongside the exact existing category names. Legacy category and
+travel drafts from the previous rules expire; manual actions and unresolved
+writes remain available for inspection. New Insights replace superseded pending
+actions, while dismissed/applied equivalent actions are not reintroduced.
+For a confirmed timed offsite visit, missing arrival/departure drafts are completed
+on the storage worker from the existing or suggested offsite classification.
+Absent a supported estimate, each is an estimated 30-minute reserve, explained
+concisely; unverified route and traffic details stay under Details.
 Recognizable travel/reserve/preparation placeholder titles do not receive another
 buffer or post-meeting follow-up. A neighbouring workshop does not establish an
 active role in that placeholder; recommendations must concern their own meeting.
@@ -256,9 +301,16 @@ category**, or create one busy preparation/travel buffer with **no attendees**.
 Allowed category names currently come from the cached calendar, not the Outlook
 master-category catalog; unused categories cannot yet be proposed. Buffer slots
 use weekdays 08:00-18:00 local time, confirmed-calendar collision checks, and a
-five-minute lead. Travel must end immediately before the meeting. Traffic and
-real-world availability are not verified. Existing Blocker/Rezerva/Nejiste category
-names are reused when available, otherwise the buffer is uncategorized.
+five-minute lead. Arrival travel must end immediately before the meeting;
+departure travel must start immediately after it. Neither is moved to a detached
+gap when the adjacent time is busy. Traffic and real-world availability are not
+verified. Confirmed parents have uncategorized buffers, even when an uncertainty
+category exists elsewhere in the calendar. Only an explicitly uncertain parent
+category (Nejiste/Blocker) is inherited; invitation-response safeguards are unchanged.
+Short preparation keeps the latest fitting gap within two days. Evidence-led
+advance preparation requires a 60-180-minute estimate and chooses the earliest
+fitting workday gap within fourteen days before the meeting, respecting busy
+intervals, weekends and the five-minute lead. No free slot means no write.
 
 Confirmation is consumed transactionally before dispatch, with the exact approved
 operation saved locally. The writer discovers compatible schemas, refetches the
@@ -275,6 +327,15 @@ states that tenant policy blocks mutation operations by default. Read access and
 compatible metadata do not establish permission to write. Tenant authorization
 must be enabled separately by its administrator; Tomlook neither grants access nor
 bypasses policy. Automated safety tests use fakes, not real calendar mutations.
+Meeting response actions use a direct JSON object when the discovered `do_action`
+schema accepts objects or leaves the body unconstrained, as the live provider's
+parameter description documents. String-only schemas retain JSON-encoded bodies;
+accept/tentative/decline omit the optional comment when none was entered, while
+preserving the exact notification choice. Working create/update requests are
+unchanged. Error-code extraction also handles
+bounded JSON-encoded provider error envelopes, persisting only allowlisted codes,
+never arbitrary provider messages or bodies. HTTP 400 alone does not establish
+an OAuth or tenant-policy denial.
 
 ### AI accounting, diagnostics and connection maintenance
 
@@ -792,7 +853,7 @@ granting any new collection scope.
 
 The bottom status bar uses frameless clickable text for AI, WorkIQ, WebIQ,
 GitHub and activity. Hover underlines and keyboard-focus outlines preserve
-discoverability without permanent gray button boxes. The warning triangle
+discoverability without permanent gray button boxes. The neutral inbox bell
 also remains clickable without a filled box.
 The connector text opens app-owned WebIQ and GitHub connection dialogs.
 Enter the WebIQ key in its password field and choose **Connect and save key**.
@@ -1091,7 +1152,7 @@ stop dispatch visibly. The exact legacy pre-send shutdown banner is repaired on
 load without deleting results or replaying interrupted manual work. Dismissing a
 global error keeps it dismissed until the underlying error changes. Diagnostics
 no longer take a full-width row away from the calendar: a keyboard-accessible
-warning triangle next to the queue counts opens Messages in EN/CZ. Active
+neutral bell next to the queue counts opens Messages in EN/CZ. Active
 blocking errors remain available after dismissal; Messages also links to the
 interrupted-job view and explicit resumption of unrelated queued work.
 Outcome delivery waits asynchronously for bounded storage capacity rather than

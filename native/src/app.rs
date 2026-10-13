@@ -6,7 +6,7 @@ use std::{
 };
 use tomlook::{
     ai::{self, Engine, Question},
-    calendar::{Calendar, Event, View, safe_url},
+    calendar::{Calendar, Event, View, person_email, safe_url},
     proposals::{self, Draft, Kind, Proposal},
     storage::Preferences,
     worker::{ActivityFilter, Command, Notice, Options, Worker},
@@ -231,23 +231,6 @@ struct PersonPhoto {
     error: Option<String>,
 }
 
-fn person_email(person: &str) -> Option<String> {
-    let email = person
-        .rsplit_once('<')
-        .map(|(_, email)| email.trim_end_matches('>'))
-        .unwrap_or(person)
-        .trim();
-    let (name, domain) = email.split_once('@')?;
-    (!name.is_empty()
-        && domain.contains('.')
-        && !domain.contains('@')
-        && email.len() <= 254
-        && email.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'.' | b'-' | b'_' | b'+')
-        }))
-    .then(|| email.to_ascii_lowercase())
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConnectionPanel {
     Ai,
@@ -386,7 +369,9 @@ pub struct Tomlook {
     settings: bool,
     messages_open: bool,
     recommendations_tab: bool,
-    recommendation_page: usize,
+    recommendation_cursor: usize,
+    recommendation_selected: Option<String>,
+    recommendation_conflict_page: (String, usize),
     meeting_menu: Option<String>,
     meeting_action: Option<MeetingActionDraft>,
     activity_filter: ActivityFilter,
@@ -622,7 +607,9 @@ impl Tomlook {
             settings: false,
             messages_open: false,
             recommendations_tab: true,
-            recommendation_page: 0,
+            recommendation_cursor: 0,
+            recommendation_selected: None,
+            recommendation_conflict_page: Default::default(),
             meeting_menu: None,
             meeting_action: None,
             activity_filter: ActivityFilter::All,
@@ -3703,6 +3690,309 @@ impl Tomlook {
         }
     }
 
+    fn open_recommended_meeting(&mut self, event: &Event) {
+        if let Some(index) = self.calendar.event_index(&event.id) {
+            self.anchor = event.calendar_dates().0;
+            if !self
+                .preferences
+                .view
+                .days(self.anchor)
+                .contains(&self.anchor)
+            {
+                self.preferences.view = View::Week;
+                self.save_preferences();
+            }
+            self.date_selection = None;
+            self.date_drag = None;
+            self.query.clear();
+            self.category.clear();
+            self.select(index);
+            self.scroll_meeting = true;
+            self.insights_expanded = true;
+            self.messages_open = false;
+        } else {
+            self.error = Some("Meeting is no longer in the current calendar.".into());
+        }
+    }
+
+    fn recommendation_meeting(&mut self, ui: &mut egui::Ui, event: &Event, actions: bool) {
+        use tomlook::recommendations::{Change, MeetingResponse, validate_manual_change};
+        let language = self.preferences.language;
+        if ui
+            .add(
+                egui::Button::new(RichText::new(&event.title).strong().color(self.accent()))
+                    .frame(false)
+                    .wrap_mode(egui::TextWrapMode::Wrap),
+            )
+            .clicked()
+        {
+            self.open_recommended_meeting(event);
+        }
+        ui.weak(meeting_date_label(event, language));
+        if !event.location.is_empty() {
+            ui.weak(event.location.chars().take(256).collect::<String>());
+        }
+        if actions {
+            let ready = self.workiq_ready && self.ai.is_some() && self.calendar_owner.is_some();
+            ui.push_id((&event.id, "conflict-actions"), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for change in [
+                        Change::Respond {
+                            response: MeetingResponse::Tentative,
+                            comment: String::new(),
+                            send_response: true,
+                        },
+                        Change::Respond {
+                            response: MeetingResponse::Decline,
+                            comment: String::new(),
+                            send_response: true,
+                        },
+                        Change::Respond {
+                            response: MeetingResponse::Cancel,
+                            comment: String::new(),
+                            send_response: true,
+                        },
+                        Change::Delete,
+                    ] {
+                        if validate_manual_change(event, &change).is_err() {
+                            continue;
+                        }
+                        let label = match &change {
+                            Change::Respond { response, .. } => response.label(),
+                            _ => "Delete own appointment",
+                        };
+                        if ui
+                            .add_enabled(ready, egui::Button::new(language.text(label)))
+                            .clicked()
+                        {
+                            self.choose_meeting_action(event.clone(), change);
+                            self.messages_open = false;
+                        }
+                    }
+                });
+            });
+        }
+    }
+
+    fn recommendation_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        recommendation: &tomlook::recommendations::Recommendation,
+        calendar: &Calendar,
+        now: chrono::DateTime<chrono::FixedOffset>,
+    ) {
+        use tomlook::recommendations::{Change, Kind as RecommendationKind, State};
+        let language = self.preferences.language;
+        let index = calendar.event_index(&recommendation.event_id);
+        let event = index.map(|index| &calendar.events[index]);
+        let change = tomlook::recommendations::proposed_change(
+            recommendation,
+            calendar,
+            self.calendar_owner.as_deref(),
+            now,
+            language,
+        );
+        let heading = match recommendation.suggestion.kind {
+            RecommendationKind::Category => "Change category",
+            RecommendationKind::Preparation => "Make time to prepare",
+            RecommendationKind::PreparationAdvance => "Prepare in advance",
+            RecommendationKind::Travel => "Reserve travel before meeting",
+            RecommendationKind::TravelAfter => "Reserve travel after meeting",
+            kind => kind.label(),
+        };
+        let accent = self.accent();
+        egui::Frame::new()
+            .fill(ui.visuals().faint_bg_color)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .corner_radius(10)
+            .inner_margin(16)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let (marker, _) = ui.allocate_exact_size(Vec2::new(3.0, 20.0), egui::Sense::hover());
+                    ui.painter().rect_filled(marker, 1, accent);
+                    ui.label(RichText::new(language.text(heading)).strong().size(17.0));
+                    if recommendation.state == State::Review {
+                        ui.weak(language.text("Needs review"));
+                    } else if recommendation.state == State::Dispatching {
+                        ui.spinner();
+                    }
+                });
+                ui.add_space(8.0);
+                if let Ok(change) = &change {
+                    match change {
+                        Change::Category(category) => {
+                            let previous = event.map(tomlook::recommendations::real_categories).unwrap_or_default();
+                            ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 32.0),
+                                egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(if previous.is_empty() { language.text("None").into_owned() } else { previous.join(", ") }).size(16.0).weak());
+                                let (arrow, response) = ui.allocate_exact_size(Vec2::new(28.0, 24.0), egui::Sense::hover());
+                                let from = egui::pos2(arrow.left() + 3.0, arrow.center().y);
+                                let to = egui::pos2(arrow.right() - 3.0, arrow.center().y);
+                                let stroke = Stroke::new(1.6, ui.visuals().weak_text_color());
+                                for segment in [
+                                    [from, to],
+                                    [to - Vec2::new(6.0, 5.0), to],
+                                    [to - Vec2::new(6.0, -5.0), to],
+                                ] { ui.painter().line_segment(segment, stroke); }
+                                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, language.text("To category")));
+                                let color = category_color(category, self.preferences.dark);
+                                egui::Frame::new().fill(color.gamma_multiply(0.12)).corner_radius(5).inner_margin(6)
+                                    .show(ui, |ui| { ui.label(RichText::new(category).strong().size(16.0).color(color)); });
+                            });
+                        }
+                        Change::Buffer { start, end, .. } => {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(format!("{} – {}",
+                                    start.with_timezone(&Local).format("%H:%M"), end.with_timezone(&Local).format("%H:%M")))
+                                    .strong().size(20.0));
+                                ui.weak(format!("{} min", (*end - *start).num_minutes()));
+                                ui.weak(language.date(start.with_timezone(&Local).date_naive(), false));
+                            });
+                        }
+                        Change::ClearCategory => { ui.strong(language.text("Remove category")); }
+                        Change::Respond { response, .. } => { ui.strong(language.text(response.label())); }
+                        Change::Delete => { ui.strong(language.text("Delete own appointment")); }
+                    }
+                } else if recommendation.suggestion.kind.is_travel()
+                    || recommendation.suggestion.kind.is_preparation() {
+                    ui.weak(language.text("No free interval fits the proposed buffer; adjust the calendar first"));
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(RichText::new(language.text("Meeting")).small().weak());
+                if let Some(event) = event {
+                    self.recommendation_meeting(ui, event, recommendation.suggestion.kind == RecommendationKind::PriorityConflict);
+                } else if !recommendation.event_title.is_empty() {
+                    ui.strong(&recommendation.event_title);
+                } else {
+                    ui.weak(language.text("Meeting is no longer in the current calendar."));
+                }
+                ui.add_space(10.0);
+                let reason = match language {
+                    tomlook::i18n::Language::En => &recommendation.suggestion.reason,
+                    tomlook::i18n::Language::Cs => &recommendation.suggestion.reason_cs,
+                };
+                if recommendation.suggestion.kind == RecommendationKind::PriorityConflict {
+                    ui.label(RichText::new(language.text("Conflicts with")).small().weak());
+                    let conflicts = if let Some(entry) = self.activity.recommendation_view.iter().find(|entry| entry.id == recommendation.id) {
+                        entry.conflicts.iter().filter_map(|id| calendar.event_index(id).map(|index| &calendar.events[index])).collect()
+                    } else {
+                        event.map(|event| tomlook::recommendations::conflicts(calendar, event)).unwrap_or_default()
+                    };
+                    if let Some(event) = event {
+                        if self.recommendation_conflict_page.0 != recommendation.id {
+                            self.recommendation_conflict_page = (recommendation.id.clone(), 0);
+                        }
+                        let page = self.recommendation_conflict_page.1.min(conflicts.len().saturating_sub(1) / 6);
+                        self.recommendation_conflict_page.1 = page;
+                        for other in conflicts.iter().skip(page * 6).take(6) {
+                            ui.add_space(8.0);
+                            self.recommendation_meeting(ui, other, true);
+                            if !other.is_all_day {
+                                ui.weak(format!("{}: {} – {}",
+                                    language.text("Overlap"),
+                                    other.start.max(event.start).with_timezone(&Local).format("%H:%M"),
+                                    other.end.min(event.end).with_timezone(&Local).format("%H:%M")));
+                            }
+                        }
+                        if conflicts.len() > 6 {
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(page > 0, egui::Button::new(language.text("Previous"))).clicked() {
+                                    self.recommendation_conflict_page.1 -= 1;
+                                }
+                                ui.weak(format!("{}–{} / {}", page * 6 + 1, ((page + 1) * 6).min(conflicts.len()), conflicts.len()));
+                                if ui.add_enabled((page + 1) * 6 < conflicts.len(), egui::Button::new(language.text("Next"))).clicked() {
+                                    self.recommendation_conflict_page.1 += 1;
+                                }
+                            });
+                        }
+                    }
+                    if conflicts.is_empty() {
+                        ui.weak(language.text("No overlap in the current confirmed calendar."));
+                    }
+                } else {
+                    ui.label(RichText::new(language.text("Why?")).small().weak());
+                    let short = reason.chars().take(320).collect::<String>();
+                    ui.label(if reason.chars().count() > 320 { format!("{short}…") } else { short });
+                }
+                if recommendation.suggestion.kind == RecommendationKind::MissingMaterials
+                    && let Some(event) = event {
+                    let contacts = tomlook::recommendations::material_contacts(event, self.calendar_owner.as_deref().unwrap_or(&self.preferences.work_email), self.activity.identity.as_deref());
+                    if !contacts.is_empty() {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new(language.text("Who to ask")).strong());
+                        ui.weak(language.text("Ask for the agenda, materials and your expected role."));
+                        for contact in contacts {
+                            ui.label(&contact.person);
+                            let role = if contact.organizer { "Organizer" } else if contact.same_domain { "Same email domain" } else { "Participant" };
+                            ui.weak(language.text(role));
+                        }
+                    }
+                }
+                if !recommendation.message.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(language.text(&recommendation.message));
+                }
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    if recommendation.state == State::Review
+                        && matches!(recommendation.suggestion.kind, RecommendationKind::Manual | RecommendationKind::Category)
+                        && ui.add_enabled(self.workiq_ready && self.ai.is_some(),
+                            egui::Button::new(language.text("Check calendar result"))).clicked() {
+                        self.command(Command::RecheckCalendarResult(recommendation.id.clone()));
+                    }
+                    if recommendation.suggestion.kind != RecommendationKind::Manual
+                        && matches!(recommendation.state, State::Pending | State::NotSent)
+                        && let Ok(change) = &change {
+                        let label = if recommendation.suggestion.kind == RecommendationKind::Category {
+                            "Use category"
+                        } else { "Add to calendar" };
+                        if ui.add_enabled(self.workiq_ready && self.ai.is_some(),
+                            egui::Button::new(language.text(label))).clicked() {
+                            self.command(Command::ConfirmRecommendation { id: recommendation.id.clone(), change: change.clone() });
+                        }
+                    }
+                    if recommendation.suggestion.kind == RecommendationKind::FollowUp
+                        && ui.button(language.text("Draft follow-up")).clicked() {
+                        self.prepare_follow_up(recommendation);
+                    }
+                    if let Some(event) = event
+                        && ui.add(egui::Button::new(language.text("Open Insights")).frame(false)).clicked() {
+                        self.open_recommended_meeting(event);
+                    }
+                    if recommendation.state != State::Dispatching
+                        && ui.add(egui::Button::new(language.text("Skip recommendation")).frame(false)).clicked() {
+                        self.command(Command::DismissRecommendation(recommendation.id.clone()));
+                    }
+                });
+                if reason.chars().count() > 320 || change.is_ok() || recommendation.source_url.is_some()
+                    || recommendation.suggestion.kind == RecommendationKind::PriorityConflict {
+                    ui.collapsing(language.text("Details and checks"), |ui| {
+                        if reason.chars().count() > 320 || recommendation.suggestion.kind == RecommendationKind::PriorityConflict { ui.label(reason); }
+                        match &change {
+                            Ok(Change::Category(_)) => { ui.weak(language.text("Replaces all previous categories with this single category.")); }
+                            Ok(Change::Buffer { category, .. }) => {
+                                ui.weak(language.text("Suggested slots use weekdays, 08:00-18:00 local time."));
+                                if let Some(category) = category { ui.weak(format!("{}: {category}", language.text("Category"))); }
+                                ui.weak(language.text("Free in the confirmed calendar; actual availability is not verified."));
+                                if recommendation.suggestion.kind.is_travel() {
+                                    ui.weak(language.text("Travel duration is an estimate; live traffic has not been verified."));
+                                }
+                            }
+                            _ => {}
+                        }
+                        if let Some(url) = recommendation.source_url.as_deref()
+                            && tomlook::calendar::safe_url(url)
+                            && ui.add(egui::Button::new(language.text("Open original meeting")).frame(false)).clicked()
+                            && let Err(error) = tomlook::browser::open(url) {
+                            self.error = Some(error);
+                        }
+                    });
+                }
+            });
+    }
+
     fn overlays(&mut self, context: &egui::Context) {
         let language = self.preferences.language;
         self.meeting_action_dialog(context);
@@ -3712,183 +4002,245 @@ impl Tomlook {
             let mut open = true;
             let mut review = false;
             egui::Window::new(language.text("Messages"))
-                .id(Id::new("status-messages-window"))
+                .id(Id::new("status-messages-window-v3"))
                 .open(&mut open)
-                .default_width(480.0)
+                .default_width(940.0)
+                .min_width(740.0)
+                .default_height(660.0)
+                .min_height(520.0)
                 .resizable(true)
                 .show(context, |ui| {
                     let inbox = self.activity.recommendations.clone();
                     let now = chrono::Local::now().fixed_offset();
-                    let mut recommendations = inbox.values().filter(|recommendation|
-                        recommendation.visible(&calendar, self.calendar_owner.as_deref(), now))
+                    let recommendations = self
+                        .activity
+                        .recommendation_view
+                        .iter()
+                        .filter_map(|entry| inbox.get(&entry.id))
+                        .filter(|record| {
+                            record.visible(&calendar, self.calendar_owner.as_deref(), now)
+                        })
                         .collect::<Vec<_>>();
-                    recommendations.sort_by_key(|recommendation|
-                        self.calendar.event_index(&recommendation.event_id).map(|index| self.calendar.events[index].start));
                     if !recommendations.is_empty() {
                         ui.horizontal(|ui| {
-                            ui.selectable_value(&mut self.recommendations_tab, true,
-                                format!("{} ({})", language.text("Recommendations"), recommendations.len()));
-                            ui.selectable_value(&mut self.recommendations_tab, false, language.text("Diagnostics"));
+                            ui.selectable_value(
+                                &mut self.recommendations_tab,
+                                true,
+                                format!(
+                                    "{} ({})",
+                                    language.text("Recommendations"),
+                                    recommendations.len()
+                                ),
+                            );
+                            ui.selectable_value(
+                                &mut self.recommendations_tab,
+                                false,
+                                language.text("Diagnostics"),
+                            );
                         });
                     }
                     if self.recommendations_tab && !recommendations.is_empty() {
-                        let pages = recommendations.len().div_ceil(6);
-                        self.recommendation_page = self.recommendation_page.min(pages - 1);
-                        if pages > 1 { ui.horizontal(|ui| {
-                            if ui.add_enabled(self.recommendation_page > 0, egui::Button::new(language.text("Previous"))).clicked() {
-                                self.recommendation_page -= 1;
+                        self.recommendation_cursor = self
+                            .recommendation_selected
+                            .as_ref()
+                            .and_then(|id| {
+                                recommendations.iter().position(|record| &record.id == id)
+                            })
+                            .unwrap_or(self.recommendation_cursor)
+                            .min(recommendations.len() - 1);
+                        let previous_cursor = self.recommendation_cursor;
+                        let up =
+                            ui.input_mut(|input| input.consume_key(Modifiers::ALT, Key::ArrowUp));
+                        let down =
+                            ui.input_mut(|input| input.consume_key(Modifiers::ALT, Key::ArrowDown));
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    self.recommendation_cursor > 0,
+                                    egui::Button::new(language.text("Previous")),
+                                )
+                                .clicked()
+                                || up
+                            {
+                                self.recommendation_cursor =
+                                    self.recommendation_cursor.saturating_sub(1);
                             }
-                            ui.label(format!("{} / {pages}", self.recommendation_page + 1));
-                            if ui.add_enabled(self.recommendation_page + 1 < pages, egui::Button::new(language.text("Next"))).clicked() {
-                                self.recommendation_page += 1;
+                            ui.label(format!(
+                                "{} / {}",
+                                self.recommendation_cursor + 1,
+                                recommendations.len()
+                            ));
+                            if ui
+                                .add_enabled(
+                                    self.recommendation_cursor + 1 < recommendations.len(),
+                                    egui::Button::new(language.text("Next")),
+                                )
+                                .clicked()
+                                || down
+                            {
+                                self.recommendation_cursor =
+                                    (self.recommendation_cursor + 1).min(recommendations.len() - 1);
                             }
-                        }); }
-                        egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
-                            for recommendation in recommendations.into_iter().skip(self.recommendation_page * 6).take(6) {
-                                ui.push_id(&recommendation.id, |ui| {
-                                    let index = calendar.event_index(&recommendation.event_id);
-                                    let event = index.map(|index| &calendar.events[index]);
-                                    egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
-                                        ui.strong(language.text(recommendation.suggestion.kind.label()));
-                                        if !recommendation.event_title.is_empty() { ui.label(recommendation.event_title.chars().take(160).collect::<String>()); }
-                                        else if let Some(event) = event { ui.label(event.title.chars().take(160).collect::<String>()); }
-                                        else { ui.weak(language.text("Meeting is no longer in the current calendar.")); }
-                                        if let Some(event) = event { ui.weak(meeting_date_label(event, language)); }
-                                        let reason = match language {
-                                            tomlook::i18n::Language::En => &recommendation.suggestion.reason,
-                                            tomlook::i18n::Language::Cs => &recommendation.suggestion.reason_cs,
-                                        };
-                                        ui.label(reason.chars().take(400).collect::<String>());
-                                        if reason.chars().count() > 400 {
-                                            ui.collapsing(language.text("Why?"), |ui| { ui.label(reason); });
-                                        }
-                                        let change = tomlook::recommendations::proposed_change(recommendation, &self.calendar,
-                                            self.calendar_owner.as_deref(), now, language);
-                                        if let Ok(change) = &change {
-                                            match change {
-                                                tomlook::recommendations::Change::Category(category) => {
-                                                    let previous = event.map(tomlook::recommendations::real_categories).unwrap_or_default();
-                                                    ui.label(format!("{}: {}  ->  {}", language.text("Category"),
-                                                        if previous.is_empty() { language.text("None").into_owned() } else { previous.join(", ") }, category));
-                                                    ui.weak(language.text("Replaces all previous categories with this single category."));
+                            ui.weak(language.text("Alt+Up / Alt+Down"));
+                        });
+                        self.recommendation_selected =
+                            Some(recommendations[self.recommendation_cursor].id.clone());
+                        ui.add_space(8.0);
+                        let height = ui.available_height().max(400.0);
+                        let list_width = 260.0;
+                        let detail_width = (ui.available_width() - list_width - 24.0).max(360.0);
+                        ui.horizontal_top(|ui| {
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(list_width, height),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    let mut scroll = egui::ScrollArea::vertical()
+                                        .id_salt("recommendation-list")
+                                        .max_height(height);
+                                    if previous_cursor != self.recommendation_cursor {
+                                        scroll = scroll.vertical_scroll_offset(
+                                            (self.recommendation_cursor as f32
+                                                * (72.0 + ui.spacing().item_spacing.y)
+                                                - height * 0.5)
+                                                .max(0.0),
+                                        );
+                                    }
+                                    scroll.show_rows(
+                                        ui,
+                                        72.0,
+                                        recommendations.len(),
+                                        |ui, rows| {
+                                            for index in rows {
+                                                let record = recommendations[index];
+                                                let event = calendar
+                                                    .event_index(&record.event_id)
+                                                    .map(|index| &calendar.events[index]);
+                                                let date = event
+                                                    .map(|event| {
+                                                        event
+                                                            .start
+                                                            .with_timezone(&Local)
+                                                            .format("%d.%m. %H:%M")
+                                                            .to_string()
+                                                    })
+                                                    .unwrap_or_default();
+                                                let title = event
+                                                    .map(|event| event.title.as_str())
+                                                    .unwrap_or(&record.event_title);
+                                                let label = format!(
+                                                    "{}\n{}\n{date}",
+                                                    language.text(record.suggestion.kind.label()),
+                                                    title.chars().take(50).collect::<String>()
+                                                );
+                                                let response = ui
+                                                    .push_id(&record.id, |ui| {
+                                                        ui.add_sized(
+                                                            Vec2::new(list_width - 12.0, 72.0),
+                                                            egui::Button::new(label)
+                                                                .selected(
+                                                                    index
+                                                                        == self
+                                                                            .recommendation_cursor,
+                                                                )
+                                                                .truncate(),
+                                                        )
+                                                    })
+                                                    .inner;
+                                                if (up || down)
+                                                    && index == self.recommendation_cursor
+                                                {
+                                                    response
+                                                        .scroll_to_me(Some(egui::Align::Center));
                                                 }
-                                                tomlook::recommendations::Change::Buffer { start, end, category, .. } => {
-                                                    ui.label(format!("{} · {} - {} · {} min", language.date(start.with_timezone(&chrono::Local).date_naive(), true),
-                                                        start.with_timezone(&chrono::Local).format("%H:%M"),
-                                                        end.with_timezone(&chrono::Local).format("%H:%M"), (*end - *start).num_minutes()));
-                                                    if let Some(category) = category { ui.label(format!("{}: {category}", language.text("Category"))); }
-                                                    ui.weak(language.text("Suggested slots use weekdays, 08:00-18:00 local time."));
-                                                    ui.weak(language.text("Free in the confirmed calendar; actual availability is not verified."));
-                                                    if recommendation.suggestion.kind == tomlook::recommendations::Kind::Travel {
-                                                        ui.weak(language.text("Travel duration is an estimate; live traffic has not been verified."));
-                                                    }
+                                                if response.clicked() {
+                                                    self.recommendation_cursor = index;
+                                                    self.recommendation_selected =
+                                                        Some(record.id.clone());
                                                 }
-                                                tomlook::recommendations::Change::ClearCategory => { ui.label(language.text("Remove category")); }
-                                                tomlook::recommendations::Change::Respond { response, .. } => { ui.label(language.text(response.label())); }
-                                                tomlook::recommendations::Change::Delete => { ui.label(language.text("Delete own appointment")); }
                                             }
-                                        } else if matches!(recommendation.suggestion.kind,
-                                            tomlook::recommendations::Kind::Travel | tomlook::recommendations::Kind::Preparation) {
-                                            ui.weak(language.text("No free interval fits the proposed buffer; adjust the calendar first"));
-                                        }
-                                        if !recommendation.message.is_empty() { ui.label(language.text(&recommendation.message)); }
-                                        ui.horizontal_wrapped(|ui| {
-                                            if recommendation.state == tomlook::recommendations::State::Review
-                                                && matches!(recommendation.suggestion.kind, tomlook::recommendations::Kind::Manual | tomlook::recommendations::Kind::Category)
-                                                && ui.add_enabled(self.workiq_ready && self.ai.is_some(),
-                                                    egui::Button::new(language.text("Check calendar result"))).clicked() {
-                                                self.command(Command::RecheckCalendarResult(recommendation.id.clone()));
-                                            }
-                                            if recommendation.suggestion.kind != tomlook::recommendations::Kind::Manual
-                                                && matches!(recommendation.state, tomlook::recommendations::State::Pending | tomlook::recommendations::State::NotSent)
-                                                && let Ok(change) = change
-                                                && ui.add_enabled(self.workiq_ready && self.ai.is_some(),
-                                                    egui::Button::new(language.text("Confirm calendar change"))).clicked() {
-                                                    self.command(Command::ConfirmRecommendation { id: recommendation.id.clone(), change });
-                                            }
-                                            if recommendation.suggestion.kind == tomlook::recommendations::Kind::FollowUp
-                                                && ui.button(language.text("Draft follow-up")).clicked() {
-                                                self.prepare_follow_up(recommendation);
-                                            }
-                                            if let Some(index) = index && ui.button(language.text("Open Insights")).clicked() {
-                                                self.select(index);
-                                                self.insights_expanded = true;
-                                                self.messages_open = false;
-                                            }
-                                            if let Some(url) = recommendation.source_url.as_deref()
-                                                && tomlook::calendar::safe_url(url)
-                                                && ui.button(language.text("Open original meeting")).clicked()
-                                                && let Err(error) = tomlook::browser::open(url) {
-                                                self.error = Some(error);
-                                            }
-                                            if recommendation.state != tomlook::recommendations::State::Dispatching
-                                                && ui.button(language.text("Dismiss")).clicked() {
-                                                self.command(Command::DismissRecommendation(recommendation.id.clone()));
-                                            }
+                                        },
+                                    );
+                                },
+                            );
+                            ui.separator();
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(detail_width, height),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .id_salt((
+                                            "recommendation-detail",
+                                            &self.recommendation_selected,
+                                        ))
+                                        .max_height(height)
+                                        .show(ui, |ui| {
+                                            let record =
+                                                recommendations[self.recommendation_cursor];
+                                            ui.push_id(&record.id, |ui| {
+                                                self.recommendation_card(ui, record, &calendar, now)
+                                            });
                                         });
-                                    });
-                                    ui.add_space(6.0);
-                                });
-                            }
+                                },
+                            );
                         });
                     } else {
-                    egui::ScrollArea::vertical()
-                        .max_height(320.0)
-                        .show(ui, |ui| {
-                            let mut messages = Vec::<&str>::new();
-                            for message in [
-                                self.error.as_deref(),
-                                self.activity.error.as_deref(),
-                                self.activity.sync.error.as_deref(),
-                            ]
-                            .into_iter()
-                            .flatten()
-                            {
-                                if !messages.contains(&message) {
-                                    messages.push(message);
-                                }
-                            }
-                            for status in self.external_status.values() {
-                                if !status.ready
-                                    && !status.busy
-                                    && !status.message.is_empty()
-                                    && status.message != "Not connected"
-                                    && !messages.contains(&status.message.as_str())
+                        egui::ScrollArea::vertical()
+                            .max_height(320.0)
+                            .show(ui, |ui| {
+                                let mut messages = Vec::<&str>::new();
+                                for message in [
+                                    self.error.as_deref(),
+                                    self.activity.error.as_deref(),
+                                    self.activity.sync.error.as_deref(),
+                                ]
+                                .into_iter()
+                                .flatten()
                                 {
-                                    messages.push(&status.message);
+                                    if !messages.contains(&message) {
+                                        messages.push(message);
+                                    }
                                 }
-                            }
-                            if messages.is_empty() {
-                                ui.weak(language.text("No messages."));
-                            }
-                            for message in messages {
-                                ui.label(language.text(message));
-                                ui.separator();
-                            }
-                        });
-                    if self.error.is_some() && ui.button(language.text("Dismiss")).clicked() {
-                        self.error = None;
-                    }
-                    if self.activity.index.len(ActivityFilter::Problems) > 0
-                        && ui
-                            .button(language.text("Review interrupted jobs"))
-                            .clicked()
-                    {
-                        review = true;
-                    }
-                    }
-                    if self.activity.error.is_some()
-                        && ui
-                            .add_enabled(
-                                self.activity.queue.flights.is_empty(),
-                                egui::Button::new(language.text("Resume other queued jobs")),
-                            )
-                            .clicked()
-                    {
-                        self.command(Command::ResumeQueued);
+                                for status in self.external_status.values() {
+                                    if !status.ready
+                                        && !status.busy
+                                        && !status.message.is_empty()
+                                        && status.message != "Not connected"
+                                        && !messages.contains(&status.message.as_str())
+                                    {
+                                        messages.push(&status.message);
+                                    }
+                                }
+                                if messages.is_empty() {
+                                    ui.weak(language.text("No messages."));
+                                }
+                                for message in messages {
+                                    ui.label(language.text(message));
+                                    ui.separator();
+                                }
+                            });
+                        if self.error.is_some() && ui.button(language.text("Dismiss")).clicked() {
+                            self.error = None;
+                        }
+                        if self.activity.index.len(ActivityFilter::Problems) > 0
+                            && ui
+                                .button(language.text("Review interrupted jobs"))
+                                .clicked()
+                        {
+                            review = true;
+                        }
+                        if self.activity.error.is_some()
+                            && ui
+                                .add_enabled(
+                                    self.activity.queue.flights.is_empty(),
+                                    egui::Button::new(language.text("Resume other queued jobs")),
+                                )
+                                .clicked()
+                        {
+                            self.command(Command::ResumeQueued);
+                        }
                     }
                 });
-            self.messages_open = open && !review;
+            self.messages_open &= open && !review;
             if review {
                 self.settings = true;
                 self.activity_filter = ActivityFilter::Problems;
@@ -4342,10 +4694,10 @@ impl eframe::App for Tomlook {
                         let has_messages = self.error.is_some() || self.activity.error.is_some() || self.activity.sync.error.is_some() || problems > 0
                             || self.activity.recommendations.values().any(|recommendation|
                                 recommendation.state == tomlook::recommendations::State::Review
-                                    && self.calendar_owner.as_deref() == Some(recommendation.account.as_str())) || problems > 0
+                                    && self.calendar_owner.as_deref() == Some(recommendation.account.as_str()))
                             || self.external_status.values().any(|status| !status.ready && !status.busy && !status.message.is_empty() && status.message != "Not connected");
                         let now = chrono::Local::now().fixed_offset();
-                        let recommendations = self.activity.recommendations.values().filter(|recommendation|
+                        let recommendations = self.activity.recommendation_view.iter().filter_map(|entry| self.activity.recommendations.get(&entry.id)).filter(|recommendation|
                             recommendation.visible(&self.calendar, self.calendar_owner.as_deref(), now)).count();
                         if (has_messages || recommendations > 0) && inbox_button(ui, language, has_messages, recommendations).clicked() { self.messages_open = true; }
                     });
@@ -4462,15 +4814,10 @@ fn inbox_button(
 ) -> egui::Response {
     let response = ui
         .push_id("status-messages", |ui| {
-            ui.add(
-                egui::Button::new(if warning {
-                    "!".into()
-                } else {
-                    recommendations.min(99).to_string()
-                })
-                .frame(false)
-                .min_size(Vec2::splat(24.0)),
-            )
+            ui.add(egui::Button::new("").frame(false).min_size(Vec2::new(
+                if recommendations > 0 { 36.0 } else { 28.0 },
+                28.0,
+            )))
         })
         .inner;
     response.widget_info(|| {
@@ -4484,21 +4831,52 @@ fn inbox_button(
             },
         )
     });
-    let rect = response.rect.shrink(3.0);
-    let color = if ui.visuals().dark_mode {
-        Color32::from_rgb(242, 193, 78)
-    } else {
-        Color32::from_rgb(135, 82, 0)
-    };
-    if warning {
-        ui.painter().add(egui::epaint::Shape::closed_line(
-            vec![
-                egui::pos2(rect.center().x, rect.top()),
-                rect.right_bottom(),
-                rect.left_bottom(),
-            ],
-            egui::Stroke::new(1.25, color),
-        ));
+    let rect =
+        egui::Rect::from_min_size(response.rect.min + Vec2::new(3.0, 3.0), Vec2::splat(22.0));
+    let color = ui.visuals().weak_text_color();
+    let point = |x, y| rect.min + Vec2::new(x * rect.width(), y * rect.height());
+    let stroke = Stroke::new(1.4, color);
+    ui.painter().add(egui::epaint::Shape::closed_line(
+        vec![
+            point(0.5, 0.18),
+            point(0.35, 0.2),
+            point(0.25, 0.32),
+            point(0.25, 0.58),
+            point(0.2, 0.7),
+            point(0.14, 0.77),
+            point(0.86, 0.77),
+            point(0.8, 0.7),
+            point(0.75, 0.58),
+            point(0.75, 0.32),
+            point(0.65, 0.2),
+        ],
+        stroke,
+    ));
+    ui.painter()
+        .line_segment([point(0.5, 0.08), point(0.5, 0.18)], stroke);
+    ui.painter().circle_filled(point(0.5, 0.89), 1.6, color);
+    if recommendations > 0 {
+        let badge = response.rect.right_top() + Vec2::new(-7.0, 8.0);
+        ui.painter()
+            .circle_filled(badge, 7.0, ui.visuals().faint_bg_color);
+        ui.painter().text(
+            badge,
+            egui::Align2::CENTER_CENTER,
+            recommendations.min(99).to_string(),
+            egui::FontId::proportional(10.0),
+            ui.visuals().text_color(),
+        );
+    } else if warning {
+        ui.painter()
+            .circle_filled(response.rect.right_top() + Vec2::new(-3.0, 4.0), 2.5, color);
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect,
+            3,
+            ui.visuals().selection.stroke,
+            egui::StrokeKind::Inside,
+        );
     }
     response.on_hover_text(if recommendations > 0 {
         format!("{}: {recommendations}", language.text("Recommendations"))
@@ -4539,6 +4917,627 @@ impl Tomlook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recommendation_cards_separate_action_meeting_reason_and_adjacent_travel_sides() {
+        use tomlook::recommendations::{Kind as RecommendationKind, Recommendation, Suggestion};
+        let (mut app, _, mut commands) = assistant_fixture();
+        let now = Local::now().fixed_offset();
+        let monday = tomlook::calendar::monday(now.date_naive()) + chrono::Duration::days(7);
+        let mut event = tomlook::calendar::fixture(1).remove(0);
+        event.start = monday
+            .and_hms_opt(14, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .single()
+            .unwrap()
+            .fixed_offset();
+        event.end = event.start + chrono::Duration::hours(1);
+        event.is_all_day = false;
+        event.title = "Client workshop".into();
+        event.location = "Client office".into();
+        event.status = "accepted".into();
+        event.category = "mimo office".into();
+        event
+            .extra
+            .insert("categories".into(), serde_json::json!(["mimo office"]));
+        app.calendar =
+            Arc::new(Calendar::build(vec![event.clone()], Default::default(), vec![]).unwrap());
+        app.calendar_owner = Some("owner".into());
+        let context = egui::Context::default();
+        for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+            app.preferences.language = language;
+            for (kind, heading, time) in [
+                (
+                    RecommendationKind::Preparation,
+                    "Make time to prepare",
+                    "13:30",
+                ),
+                (
+                    RecommendationKind::Travel,
+                    "Reserve travel before meeting",
+                    "13:30",
+                ),
+                (
+                    RecommendationKind::TravelAfter,
+                    "Reserve travel after meeting",
+                    "15:00",
+                ),
+            ] {
+                let record = Recommendation::from_insights(
+                    &event,
+                    "owner",
+                    Suggestion {
+                        kind,
+                        reason: "Explain the architecture and demonstrate the prototype.".into(),
+                        reason_cs: "Vysvetli architekturu a ukaz prototyp.".into(),
+                        category: None,
+                        minutes: Some(30),
+                    },
+                    now,
+                )
+                .unwrap();
+                let mut text = String::new();
+                for _ in 0..3 {
+                    let mut output = context.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                Vec2::new(800.0, 900.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| app.recommendation_card(ui, &record, &app.calendar.clone(), now),
+                    );
+                    for shape in &output.shapes {
+                        append_shape_text(&shape.shape, &mut text);
+                    }
+                    output.textures_delta.clear();
+                }
+                for label in [
+                    heading,
+                    "Meeting",
+                    "Why?",
+                    "Add to calendar",
+                    "Details and checks",
+                ] {
+                    assert!(
+                        text.contains(language.text(label).as_ref()),
+                        "{language:?}, {kind:?}: {text}"
+                    );
+                }
+                assert!(text.contains("Client workshop"));
+                assert!(text.contains(time));
+                assert!(
+                    !text.contains(
+                        language
+                            .text("Suggested slots use weekdays, 08:00-18:00 local time.")
+                            .as_ref()
+                    )
+                );
+            }
+        }
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn neutral_bell_replaces_the_triangle_and_remains_keyboard_accessible() {
+        let context = egui::Context::default();
+        let mut identity = None;
+        for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+            for warning in [false, true] {
+                let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                    let response = inbox_button(ui, language, warning, 3);
+                    identity = Some(response.id);
+                });
+                assert!(!output.shapes.iter().any(|shape|
+                    matches!(&shape.shape, egui::epaint::Shape::Path(path) if path.points.len() == 3)));
+                let mut text = String::new();
+                for shape in &output.shapes {
+                    append_shape_text(&shape.shape, &mut text);
+                }
+                assert!(!text.contains('!'));
+                output.textures_delta.clear();
+            }
+        }
+        context.memory_mut(|memory| memory.request_focus(identity.unwrap()));
+        let mut clicked = false;
+        let mut output = context.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                clicked = inbox_button(ui, tomlook::i18n::Language::Cs, true, 3).clicked();
+            },
+        );
+        output.textures_delta.clear();
+        assert!(clicked);
+    }
+
+    #[test]
+    fn recommendation_navigation_renders_one_detail_and_keyboard_does_not_submit() {
+        use tomlook::recommendations::{Kind, Recommendation, Suggestion};
+        let (mut app, _, mut commands) = assistant_fixture();
+        let now = Local::now().fixed_offset();
+        let mut events = Vec::new();
+        let mut inbox = BTreeMap::new();
+        for index in 0..12 {
+            let mut event = tomlook::calendar::fixture(1).remove(0);
+            event.id = format!("meeting-{index}");
+            event.title = format!("Synthetic meeting {index}");
+            event.start = now + chrono::Duration::hours(2 + index);
+            event.end = event.start + chrono::Duration::minutes(30);
+            event.is_all_day = false;
+            event.status = "accepted".into();
+            let record = Recommendation::from_insights(
+                &event,
+                "owner",
+                Suggestion {
+                    kind: Kind::MissingMaterials,
+                    reason: format!("EXPLANATION_{index}_ONLY"),
+                    reason_cs: format!("VYSVETLENI_{index}_JEN"),
+                    category: None,
+                    minutes: None,
+                },
+                now,
+            )
+            .unwrap();
+            inbox.insert(record.id.clone(), record);
+            events.push(event);
+        }
+        app.calendar = Arc::new(Calendar::build(events, Default::default(), vec![]).unwrap());
+        app.calendar_owner = Some("owner".into());
+        let mut activity = (*app.activity).clone();
+        activity.error = Some("Saved diagnostic issue.".into());
+        activity.recommendations = Arc::new(inbox);
+        activity.recommendation_view = Arc::new(tomlook::recommendations::inbox_view(
+            &app.calendar,
+            &activity.recommendations,
+            app.calendar_owner.as_deref(),
+            now,
+            &BTreeSet::new(),
+        ));
+        app.activity = Arc::new(activity);
+        app.messages_open = true;
+        let context = egui::Context::default();
+        for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+            app.preferences.language = language;
+            app.recommendation_selected = None;
+            app.recommendation_cursor = 0;
+            let mut final_text = String::new();
+            for _ in 0..30 {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(1366.0, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| app.overlays(ui.ctx()),
+                );
+                final_text.clear();
+                for shape in &output.shapes {
+                    append_shape_text(&shape.shape, &mut final_text);
+                }
+                output.textures_delta.clear();
+            }
+            let explanation = if language == tomlook::i18n::Language::En {
+                "EXPLANATION"
+            } else {
+                "VYSVETLENI"
+            };
+            assert!(final_text.contains(&format!("{explanation}_0_")));
+            assert!(!final_text.contains(&format!("{explanation}_1_")));
+            assert!(!final_text.contains(language.text("Resume other queued jobs").as_ref()));
+            let rect = context.memory(|memory| {
+                memory
+                    .area_rect(Id::new("status-messages-window-v3"))
+                    .unwrap()
+            });
+            assert!(
+                rect.height() <= 710.0,
+                "Recommendation window grew: {rect:?}"
+            );
+            for cursor in 1..12 {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(1366.0, 900.0),
+                        )),
+                        events: vec![egui::Event::Key {
+                            key: Key::ArrowDown,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: Modifiers::ALT,
+                        }],
+                        ..Default::default()
+                    },
+                    |ui| app.overlays(ui.ctx()),
+                );
+                assert_eq!(app.recommendation_cursor, cursor);
+                let mut text = String::new();
+                for shape in &output.shapes {
+                    append_shape_text(&shape.shape, &mut text);
+                }
+                assert!(text.contains(&format!("{explanation}_{cursor}_")), "{text}");
+                output.textures_delta.clear();
+            }
+            assert_eq!(
+                app.recommendation_selected.as_deref(),
+                app.activity
+                    .recommendations
+                    .values()
+                    .find(|record| record.event_title == "Synthetic meeting 11")
+                    .map(|record| record.id.as_str())
+            );
+        }
+        app.recommendations_tab = false;
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.overlays(ui.ctx()));
+        output.textures_delta.clear();
+        let mut text = String::new();
+        for shape in &output.shapes {
+            append_shape_text(&shape.shape, &mut text);
+        }
+        assert!(
+            text.contains(
+                app.preferences
+                    .language
+                    .text("Resume other queued jobs")
+                    .as_ref()
+            )
+        );
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn conflict_cards_name_counterparts_and_render_the_local_overlap_not_raw_utc_reason() {
+        use tomlook::recommendations::{Kind, Recommendation, Suggestion};
+        let (mut app, _, mut commands) = assistant_fixture();
+        let now = Local::now().fixed_offset();
+        let day = tomlook::calendar::monday(now.date_naive()) + chrono::Duration::days(7);
+        let mut event = tomlook::calendar::fixture(1).remove(0);
+        event.start = day
+            .and_hms_opt(17, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .single()
+            .unwrap()
+            .fixed_offset();
+        event.end = event.start + chrono::Duration::hours(3);
+        event.is_all_day = false;
+        event.status = "accepted".into();
+        let mut overlap = event.clone();
+        overlap.id = "transfer".into();
+        overlap.title = "Synthetic transfer reserve".into();
+        overlap.start = (event.start + chrono::Duration::minutes(15))
+            .with_timezone(&chrono::FixedOffset::east_opt(0).unwrap());
+        overlap.end = event.start + chrono::Duration::hours(4);
+        app.calendar = Arc::new(
+            Calendar::build(vec![event.clone(), overlap], Default::default(), vec![]).unwrap(),
+        );
+        app.calendar_owner = Some("owner".into());
+        let record = Recommendation::from_insights(
+            &event,
+            "owner",
+            Suggestion {
+                kind: Kind::PriorityConflict,
+                reason: "Overlap from 15:15 UTC.".into(),
+                reason_cs: "Prekryv od 15:15 UTC.".into(),
+                category: None,
+                minutes: None,
+            },
+            now,
+        )
+        .unwrap();
+        let context = egui::Context::default();
+        let mut text = String::new();
+        for _ in 0..3 {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(800.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.recommendation_card(ui, &record, &app.calendar.clone(), now),
+            );
+            text.clear();
+            for shape in &output.shapes {
+                append_shape_text(&shape.shape, &mut text);
+            }
+            output.textures_delta.clear();
+        }
+        assert!(text.contains("Synthetic transfer reserve"));
+        assert!(text.contains("Overlap: 17:15"));
+        assert!(text.contains("17:15 - 21:00"));
+        assert!(
+            text.contains("20:00"),
+            "The intersection must remain secondary to the full counterpart time"
+        );
+        assert!(!text.contains("15:15 UTC"));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn recommendation_meeting_links_and_conflict_actions_are_navigable_and_require_confirmation() {
+        use tomlook::recommendations::{Change, MeetingResponse};
+        let (mut app, _, mut ai_commands) = assistant_fixture();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(16);
+        app.worker = Some(Worker {
+            commands: sender,
+            notices: Arc::new(Default::default()),
+            activity: Arc::new(std::sync::Mutex::new(Arc::new(Default::default()))),
+            stop: Arc::new(Default::default()),
+            done: None,
+        });
+        let now = Local::now().fixed_offset();
+        let mut event = tomlook::calendar::fixture(1).remove(0);
+        event.title = "Synthetic meeting link".into();
+        event.start = now + chrono::Duration::days(7);
+        event.end = event.start + chrono::Duration::hours(1);
+        event.is_all_day = false;
+        event.status = "accepted".into();
+        event.organizer = "organizer@example.test".into();
+        event
+            .extra
+            .insert("isOrganizer".into(), serde_json::json!(false));
+        event
+            .extra
+            .insert("type".into(), serde_json::json!("occurrence"));
+        app.calendar =
+            Arc::new(Calendar::build(vec![event.clone()], Default::default(), vec![]).unwrap());
+        app.calendar_owner = Some("owner".into());
+        app.workiq_ready = true;
+        app.preferences.view = View::Week;
+        for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+            app.preferences.language = language;
+            let context = egui::Context::default();
+            let draw = |app: &mut Tomlook, events| {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(800.0, 800.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.recommendation_meeting(ui, &event, true),
+                );
+                output.textures_delta.clear();
+                output
+            };
+            let click = |app: &mut Tomlook, label: &str| {
+                draw(app, vec![]);
+                let output = draw(app, vec![]);
+                let position = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
+                            Some(text.pos + text.galley.size() * 0.5)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("Missing button: {label}"));
+                draw(
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: Modifiers::NONE,
+                        },
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: Modifiers::NONE,
+                        },
+                    ],
+                );
+            };
+            let output = draw(&mut app, vec![]);
+            let mut text = String::new();
+            for shape in &output.shapes {
+                append_shape_text(&shape.shape, &mut text);
+            }
+            assert!(text.contains(&meeting_date_label(&event, language)));
+            for response in [MeetingResponse::Tentative, MeetingResponse::Decline] {
+                app.messages_open = true;
+                click(&mut app, language.text(response.label()).as_ref());
+                let draft = app.meeting_action.take().unwrap();
+                assert_eq!(draft.event.id, event.id);
+                assert!(
+                    matches!(draft.change, Change::Respond { response: selected, send_response: true, .. } if selected == response)
+                );
+                assert!(!app.messages_open);
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "Opening confirmation must not submit a write"
+                );
+            }
+            app.messages_open = true;
+            app.query = "hidden".into();
+            app.category = "other".into();
+            click(&mut app, &event.title);
+            assert_eq!(app.selected, app.calendar.event_index(&event.id));
+            assert_eq!(app.anchor, event.calendar_dates().0);
+            assert!(app.query.is_empty() && app.category.is_empty());
+            assert!(app.insights_expanded && !app.messages_open && app.scroll_meeting);
+            assert!(
+                matches!(receiver.try_recv().unwrap(), Command::Detail { id, .. } if id == event.id)
+            );
+            assert!(receiver.try_recv().is_err());
+            assert!(ai_commands.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn missing_material_cards_show_actual_contacts_in_both_languages_without_outreach() {
+        use tomlook::recommendations::{Kind, Recommendation, Suggestion};
+        let (mut app, _, mut commands) = assistant_fixture();
+        let now = Local::now().fixed_offset();
+        let mut event = tomlook::calendar::fixture(1).remove(0);
+        event.start = now + chrono::Duration::hours(2);
+        event.end = event.start + chrono::Duration::hours(1);
+        event.is_all_day = false;
+        event.organizer = "Synthetic organizer <agenda@partner.example>".into();
+        event.attendees = vec![
+            "Synthetic colleague <colleague@home.example>".into(),
+            "Own alias <alias@home.example>".into(),
+        ];
+        app.preferences.work_email = "next-account@tenant.example".into();
+        app.calendar_owner = Some("me@home.example".into());
+        Arc::make_mut(&mut app.activity).identity =
+            Some(Arc::new(tomlook::workiq::connection::Identity {
+                account: "me@home.example".into(),
+                mail: Some("alias@home.example".into()),
+            }));
+        app.calendar =
+            Arc::new(Calendar::build(vec![event.clone()], Default::default(), vec![]).unwrap());
+        let record = Recommendation::from_insights(
+            &event,
+            "me@home.example",
+            Suggestion {
+                kind: Kind::MissingMaterials,
+                reason: "Ask for the workshop agenda.".into(),
+                reason_cs: "Pozadej o agendu workshopu.".into(),
+                category: None,
+                minutes: None,
+            },
+            now,
+        )
+        .unwrap();
+        for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+            app.preferences.language = language;
+            let context = egui::Context::default();
+            let mut text = String::new();
+            for _ in 0..3 {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(800.0, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| app.recommendation_card(ui, &record, &app.calendar.clone(), now),
+                );
+                text.clear();
+                for shape in &output.shapes {
+                    append_shape_text(&shape.shape, &mut text);
+                }
+                output.textures_delta.clear();
+            }
+            assert!(text.contains(language.text("Who to ask").as_ref()));
+            assert!(text.contains("agenda@partner.example"));
+            assert!(text.contains("colleague@home.example"));
+            assert!(!text.contains("alias@home.example"));
+            assert!(text.contains(language.text("Same email domain").as_ref()));
+            assert!(!text.contains("Send"));
+            assert!(commands.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn category_transition_has_a_shared_baseline_and_a_vector_arrow_without_a_glyph_box() {
+        use tomlook::recommendations::{Kind, Recommendation, Suggestion};
+        let (mut app, _, mut commands) = assistant_fixture();
+        let now = Local::now().fixed_offset();
+        let mut event = tomlook::calendar::fixture(1).remove(0);
+        event.start = now + chrono::Duration::hours(2);
+        event.end = event.start + chrono::Duration::hours(1);
+        event.is_all_day = false;
+        event.status = "accepted".into();
+        event.category.clear();
+        event
+            .extra
+            .insert("categories".into(), serde_json::json!([]));
+        let mut reference = event.clone();
+        reference.id = "category-reference".into();
+        reference.status = "cancelled".into();
+        reference.category = "nejist\u{e9}".into();
+        reference
+            .extra
+            .insert("categories".into(), serde_json::json!(["nejist\u{e9}"]));
+        app.calendar = Arc::new(
+            Calendar::build(vec![event.clone(), reference], Default::default(), vec![]).unwrap(),
+        );
+        app.calendar_owner = Some("owner".into());
+        let record = Recommendation::from_insights(
+            &event,
+            "owner",
+            Suggestion {
+                kind: Kind::Category,
+                reason: "Explicitly tentative.".into(),
+                reason_cs: "Nejista udalost.".into(),
+                category: Some("nejist\u{e9}".into()),
+                minutes: None,
+            },
+            now,
+        )
+        .unwrap();
+        let context = egui::Context::default();
+        for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+            app.preferences.language = language;
+            let mut centers = (None, None);
+            let mut arrow_segments = 0;
+            for _ in 0..3 {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(800.0, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| app.recommendation_card(ui, &record, &app.calendar.clone(), now),
+                );
+                centers = (None, None);
+                arrow_segments = 0;
+                for shape in &output.shapes {
+                    match &shape.shape {
+                        egui::epaint::Shape::Text(text) => {
+                            let value = &text.galley.job.text;
+                            assert!(!value.contains('\u{2192}'));
+                            let center = text.pos.y + text.galley.rect.center().y;
+                            if value == language.text("None").as_ref() {
+                                centers.0 = Some(center);
+                            }
+                            if value == "nejist\u{e9}" {
+                                centers.1 = Some(center);
+                            }
+                        }
+                        egui::epaint::Shape::LineSegment { stroke, .. } if stroke.width == 1.6 => {
+                            arrow_segments += 1
+                        }
+                        _ => {}
+                    }
+                }
+                output.textures_delta.clear();
+            }
+            assert_eq!(arrow_segments, 3);
+            assert!(
+                (centers.0.unwrap() - centers.1.unwrap()).abs() < 1.0,
+                "{centers:?}"
+            );
+        }
+        assert!(commands.try_recv().is_err());
+    }
 
     #[test]
     fn inbox_is_bilingual_quiet_and_unknown_outcomes_have_no_confirmation_action() {
@@ -4587,6 +5586,13 @@ mod tests {
                     recommendation.id.clone(),
                     recommendation.clone(),
                 )]));
+                activity.recommendation_view = Arc::new(tomlook::recommendations::inbox_view(
+                    &app.calendar,
+                    &activity.recommendations,
+                    app.calendar_owner.as_deref(),
+                    now,
+                    &BTreeSet::new(),
+                ));
                 app.activity = Arc::new(activity);
                 for open in [false, true] {
                     app.messages_open = open;
@@ -4613,7 +5619,7 @@ mod tests {
                         "Inbox visibility: {language:?}, {state:?}, open={open}: {text}"
                     );
                     assert_eq!(
-                        text.contains(language.text("Confirm calendar change").as_ref()),
+                        text.contains(language.text("Use category").as_ref()),
                         open && state == tomlook::recommendations::State::Pending,
                         "Confirmation visibility: {language:?}, {state:?}, open={open}: {text}"
                     );
@@ -5891,6 +6897,36 @@ mod tests {
                 .iter()
                 .any(|text| **text != title && text.contains(&title))
         );
+    }
+
+    #[test]
+    fn ordinary_calendar_cards_show_only_their_time_range_not_a_conflict_caption() {
+        let context = egui::Context::default();
+        let mut app = Tomlook::initial(None, None, None);
+        let mut events = tomlook::calendar::fixture(1);
+        events[0].is_all_day = false;
+        events[0].end = events[0].start + chrono::Duration::hours(1);
+        events[0].status = "accepted".into();
+        let expected = format!(
+            "{} - {}",
+            events[0].start.with_timezone(&Local).format("%H:%M"),
+            events[0].end.with_timezone(&Local).format("%H:%M")
+        );
+        app.calendar = Arc::new(Calendar::build(events, Default::default(), vec![]).unwrap());
+        for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+            app.preferences.language = language;
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                let rect = egui::Rect::from_min_size(ui.cursor().min, Vec2::new(320.0, 140.0));
+                app.event_card(ui, 0, rect);
+            });
+            output.textures_delta.clear();
+            let mut text = String::new();
+            for shape in &output.shapes {
+                append_shape_text(&shape.shape, &mut text);
+            }
+            assert!(text.contains(&expected), "{text}");
+            assert!(!text.contains(language.text("Overlap").as_ref()), "{text}");
+        }
     }
 
     #[test]

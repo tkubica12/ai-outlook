@@ -87,8 +87,29 @@ impl Range {
     }
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Identity {
+    pub account: String,
+    pub mail: Option<String>,
+}
+
+impl Identity {
+    pub fn validate(&self) -> Result<(), String> {
+        if crate::calendar::person_email(&self.account).as_ref() != Some(&self.account)
+            || self
+                .mail
+                .as_ref()
+                .is_some_and(|mail| crate::calendar::person_email(mail).as_ref() != Some(mail))
+        {
+            return Err("WorkIQ identity contains an invalid email address".into());
+        }
+        Ok(())
+    }
+}
+
 pub struct Connection {
     pub account: String,
+    pub identity: Identity,
     pub tools_discovered: usize,
     peer: Peer<RoleClient>,
     service: Mutex<Option<RunningService<RoleClient, ClientConfig>>>,
@@ -96,6 +117,7 @@ pub struct Connection {
     admission: ReadSlots,
     capabilities: BTreeSet<String>,
     calendar_write_tools: BTreeSet<String>,
+    calendar_action_body_is_string: bool,
     cloud_root_url: Mutex<Option<cloud::Root>>,
 }
 
@@ -144,6 +166,7 @@ impl Connection {
             let mut names = BTreeSet::new();
             let mut found = false;
             let mut calendar_write_tools = BTreeSet::new();
+            let mut calendar_action_body_is_string = false;
             for page in 0..8 {
                 let result = peer
                     .list_tools(cursor.clone())
@@ -151,6 +174,10 @@ impl Connection {
                     .map_err(|_| "WorkIQ tool discovery failed")?;
                 for tool in result.tools {
                     if calendar_write::validate_tool(&tool) {
+                        if tool.name == "do_action" {
+                            calendar_action_body_is_string =
+                                calendar_write::action_body_is_string(&tool);
+                        }
                         calendar_write_tools.insert(tool.name.to_string());
                     }
                     if !names.insert(tool.name.to_string()) {
@@ -182,27 +209,50 @@ impl Connection {
                 return Err("WorkIQ has no supported read-only fetch tool".into());
             }
             let identity = peer
-                .call_tool(fetch_request("/me?$select=userPrincipalName")?)
+                .call_tool(fetch_request("/me?$select=userPrincipalName,mail")?)
                 .await
                 .map_err(|_| "WorkIQ account verification failed; provider details withheld")?;
             hosted::verify_account(&identity, account)?;
-            Ok((names, calendar_write_tools))
+            let data = hosted::fetch_data(&identity)?;
+            let mail = match data.get("mail") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(mail)) => Some(
+                    crate::calendar::person_email(mail)
+                        .ok_or("WorkIQ identity contains an invalid email address")?,
+                ),
+                Some(_) => return Err("WorkIQ identity contains an invalid mail property".into()),
+            };
+            let identity = Identity {
+                account: account.to_ascii_lowercase(),
+                mail,
+            };
+            identity.validate()?;
+            Ok((
+                names,
+                calendar_write_tools,
+                calendar_action_body_is_string,
+                identity,
+            ))
         })
         .await
         .map_err(|_| "WorkIQ tool/account verification timed out".to_string())
         .and_then(|result| result);
         match verified {
-            Ok((capabilities, calendar_write_tools)) => Ok(Self {
-                account: account.to_ascii_lowercase(),
-                tools_discovered: capabilities.len(),
-                capabilities,
-                calendar_write_tools,
-                peer,
-                service: Mutex::new(Some(service)),
-                active: AtomicBool::new(true),
-                admission: ReadSlots::new(),
-                cloud_root_url: Mutex::new(None),
-            }),
+            Ok((capabilities, calendar_write_tools, calendar_action_body_is_string, identity)) => {
+                Ok(Self {
+                    account: account.to_ascii_lowercase(),
+                    identity,
+                    tools_discovered: capabilities.len(),
+                    capabilities,
+                    calendar_write_tools,
+                    calendar_action_body_is_string,
+                    peer,
+                    service: Mutex::new(Some(service)),
+                    active: AtomicBool::new(true),
+                    admission: ReadSlots::new(),
+                    cloud_root_url: Mutex::new(None),
+                })
+            }
             Err(error) => {
                 let cleanup = tokio::time::timeout(Timeout::from_secs(5), service.cancel()).await;
                 if !matches!(cleanup, Ok(Ok(_))) {

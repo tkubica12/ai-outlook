@@ -44,7 +44,12 @@ pub fn validate_tool(tool: &Tool) -> bool {
                         .is_some_and(|types| types.iter().any(|kind| kind == "string"))
                     || (*name == "jsonBody"
                         && property.is_object()
-                        && property.get("type").is_none())
+                        && (property.get("type").is_none()
+                            || (tool.name == "do_action"
+                                && (property["type"] == "object"
+                                    || property["type"].as_array().is_some_and(|types| {
+                                        types.iter().any(|kind| kind == "object")
+                                    })))))
             })
     }) && required.is_none_or(|required| {
         required
@@ -59,6 +64,14 @@ pub fn validate_tool(tool: &Tool) -> bool {
                     required.iter().any(|value| value.as_str() == Some(*name))
                 })
             }))
+}
+
+pub(super) fn action_body_is_string(tool: &Tool) -> bool {
+    let kind = &tool.input_schema["properties"]["jsonBody"]["type"];
+    kind == "string"
+        || kind.as_array().is_some_and(|types| {
+            types.iter().any(|kind| kind == "string") && !types.iter().any(|kind| kind == "object")
+        })
 }
 
 #[async_trait]
@@ -84,6 +97,8 @@ pub trait Api: Send + Sync {
 pub enum SubmissionError {
     Denied,
     Rejected(u16),
+    RejectedWithCode(u16, &'static str),
+    InvalidRequest,
     Unknown,
 }
 
@@ -151,6 +166,16 @@ pub async fn execute(api: &impl Api, operation: &Operation) -> Outcome {
             return Outcome::NotSent(format!(
                 "Calendar provider rejected the write with HTTP {status}; nothing was changed by this request"
             ));
+        }
+        Err(SubmissionError::RejectedWithCode(status, code)) => {
+            return Outcome::NotSent(format!(
+                "Calendar provider rejected the write with HTTP {status} ({code}); nothing was changed by this request"
+            ));
+        }
+        Err(SubmissionError::InvalidRequest) => {
+            return Outcome::NotSent(
+                "Confirmed calendar request is invalid; no write was submitted".into(),
+            );
         }
         Err(SubmissionError::Unknown) => return Outcome::Review(UNCERTAIN.into()),
     };
@@ -261,7 +286,10 @@ fn event_path(id: &str) -> Result<String, String> {
     Ok(format!("/me/events/{id}"))
 }
 
-fn request(operation: &Operation) -> Result<CallToolRequestParams, String> {
+fn request(
+    operation: &Operation,
+    action_body_is_string: bool,
+) -> Result<CallToolRequestParams, String> {
     let (name, arguments) = match &operation.change {
         Change::Category(category) => {
             if category.trim().is_empty()
@@ -292,12 +320,21 @@ fn request(operation: &Operation) -> Result<CallToolRequestParams, String> {
             let body = if *response == MeetingResponse::Cancel {
                 json!({"comment":comment})
             } else {
-                json!({"comment":comment, "sendResponse":send_response})
+                let mut body = json!({"sendResponse":send_response});
+                if !comment.is_empty() {
+                    body["comment"] = json!(comment);
+                }
+                body
+            };
+            let body = if action_body_is_string {
+                Value::String(body.to_string())
+            } else {
+                body
             };
             (
                 "do_action",
                 json!({"actionUrl":format!("{}/{}", event_path(&operation.event.id)?, response.action()),
-                "jsonBody":body.to_string()}),
+                "jsonBody":body}),
             )
         }
         Change::Buffer {
@@ -381,7 +418,8 @@ impl Api for Connection {
         Connection::calendar(self, range).await
     }
     async fn submit(&self, operation: &Operation) -> Result<String, SubmissionError> {
-        let request = request(operation).map_err(|_| SubmissionError::Rejected(400))?;
+        let request = request(operation, self.calendar_action_body_is_string)
+            .map_err(|_| SubmissionError::InvalidRequest)?;
         let result = tokio::time::timeout(Duration::from_secs(60), self.peer.call_tool(request))
             .await
             .map_err(|_| SubmissionError::Unknown)?
@@ -510,9 +548,10 @@ fn submission_result(
     let payload = hosted::read_json_payload(result).map_err(|_| SubmissionError::Unknown)?;
     match payload["statusCode"].as_u64() {
         Some(401 | 403) => Err(SubmissionError::Denied),
-        Some(status @ (400 | 404 | 409 | 412 | 422 | 429)) => {
-            Err(SubmissionError::Rejected(status as u16))
-        }
+        Some(status @ (400 | 404 | 409 | 412 | 422 | 429)) => Err(provider_error_code(&payload)
+            .map_or(SubmissionError::Rejected(status as u16), |code| {
+                SubmissionError::RejectedWithCode(status as u16, code)
+            })),
         Some(200 | 201) if result.is_error != Some(true) => payload["data"]["id"]
             .as_str()
             .filter(|id| !id.is_empty())
@@ -535,6 +574,50 @@ fn submission_result(
         }
         _ => Err(SubmissionError::Unknown),
     }
+}
+
+fn provider_error_code(payload: &Value) -> Option<&'static str> {
+    // Persist known error identifiers, never arbitrary provider text or calendar data.
+    const CODES: &[&str] = &[
+        "BadRequest",
+        "Request_BadRequest",
+        "RequestBodyRead",
+        "InvalidRequest",
+        "ErrorInvalidRequest",
+        "ErrorInvalidOperation",
+        "ErrorInvalidIdMalformed",
+        "ErrorItemNotFound",
+        "ErrorAccessDenied",
+        "Authorization_RequestDenied",
+        "ErrorInvalidParameter",
+        "ErrorInvalidProperty",
+        "ErrorInvalidRecipients",
+        "ErrorInvalidUser",
+        "ErrorCalendarOccurrenceIsDeletedFromRecurrence",
+        "ErrorCalendarCannotMoveOrCopyOccurrence",
+        "ErrorOccurrenceCrossingBoundary",
+        "ErrorIrresolvableConflict",
+        "ErrorCannotDeleteObject",
+        "TooManyRequests",
+    ];
+    fn read(node: &Value, depth: usize) -> Option<&'static str> {
+        if depth > 3 {
+            return None;
+        }
+        if let Some(code) = node.get("code").and_then(Value::as_str)
+            && let Some(known) = CODES.iter().copied().find(|known| *known == code)
+        {
+            return Some(known);
+        }
+        if let Some(text) = node.as_str().filter(|text| text.len() <= 16_384) {
+            let decoded: Value = serde_json::from_str(text).ok()?;
+            return read(&decoded, depth + 1);
+        }
+        ["error", "data", "body"]
+            .into_iter()
+            .find_map(|key| node.get(key).and_then(|node| read(node, depth + 1)))
+    }
+    read(payload, 0)
 }
 
 #[cfg(test)]
@@ -714,20 +797,60 @@ mod tests {
                         (name.to_owned(), json!({"type":property.get("type"), "anyOf":property.get("anyOf").and_then(Value::as_array)
                             .map(|types| types.iter().map(|kind| kind.get("type")).collect::<Vec<_>>())}))))
                     .collect::<serde_json::Map<String, Value>>();
-                json!({"tool":tool.name, "required":tool.input_schema.get("required"), "parameter_types":types})
+                json!({"tool":tool.name, "description":tool.description,
+                    "json_body_schema":properties.and_then(|properties| properties.get("jsonBody")),
+                    "required":tool.input_schema.get("required"), "parameter_types":types})
             }).collect::<Vec<_>>();
+        let mut response_schemas = Vec::new();
+        for action in [
+            "decline",
+            "tentativelyAccept",
+            "microsoft.graph.tentativelyAccept",
+        ] {
+            let path = format!("/me/events/{{event-id}}/{action}");
+            let request = CallToolRequestParams::new("get_schema").with_arguments(
+                json!({"path":path, "operationType":"create", "format":"jsonschema"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            let result =
+                tokio::time::timeout(Duration::from_secs(30), connection.peer.call_tool(request))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let payload = hosted::read_json_payload(&result).unwrap();
+            let schema = payload.get("data").unwrap_or(&payload);
+            let parameters = ["comment", "sendResponse", "proposedNewTime"]
+                .into_iter()
+                .filter_map(|name| {
+                    schema_property(schema, schema, name, 0)
+                        .map(|property| (name.to_owned(), shape(property, 0)))
+                })
+                .collect::<serde_json::Map<_, _>>();
+            response_schemas.push(json!({
+                "path":path, "operation":"get_schema", "operation_type":"create",
+                "http_status":payload.get("statusCode"),
+                "error_code":provider_error_code(&payload),
+                "title":schema.get("title"),
+                "parameters":parameters,
+                "tool_error":result.is_error
+            }));
+        }
         let report = json!({
             "registered_tools":connection.capabilities,
             "schema_title":title,
             "category_schema_shape":category_shape,
             "buffer_schema_shape":buffer_shape,
             "write_tool_metadata":schemas,
+            "response_action_schema_probes":response_schemas,
+            "response_action_body_is_string":connection.calendar_action_body_is_string,
             "category_metadata_compatible":category.is_ok(),
             "buffer_metadata_compatible":buffer.is_ok(),
             "category_error":category.as_ref().err(),
             "buffer_error":buffer.as_ref().err(),
             "response_tool_contracts":actions,
-            "response_body_contract":"Fixed native Graph action contracts; get_schema is not an action-schema endpoint",
+            "response_body_contract":"Native Graph action contracts with separately captured action-schema probe results",
             "delete_metadata_compatible":deletion.is_ok(),
             "delete_error":deletion.err(),
             "write_permission_verified":false,
@@ -782,7 +905,7 @@ mod tests {
                 title: "Travel buffer".into(),
                 start: event.start - chrono::Duration::minutes(30),
                 end: event.start,
-                category: Some("Blocker".into()),
+                category: None,
             }
         } else {
             Change::Category("Office".into())
@@ -944,15 +1067,47 @@ mod tests {
             ));
             assert_eq!(api.writes.load(Ordering::SeqCst), 1);
             if buffer {
-                let request = request(&operation).unwrap();
+                let request = request(&operation, false).unwrap();
                 let body: Value =
                     serde_json::from_str(request.arguments.unwrap()["jsonBody"].as_str().unwrap())
                         .unwrap();
                 assert_eq!(body["transactionId"], operation.recommendation.id);
                 assert!(body.get("attendees").is_none());
-                assert_eq!(body["categories"], json!(["Blocker"]));
+                assert_eq!(body["categories"], json!([]));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_travel_buffer_inherits_only_its_uncertain_parent_category() {
+        let mut operation = operation(true);
+        operation.event.category = "nejist\u{e9}".into();
+        operation
+            .event
+            .extra
+            .insert("categories".into(), json!(["nejist\u{e9}"]));
+        operation.recommendation = crate::recommendations::Recommendation::from_insights(
+            &operation.event,
+            "owner",
+            operation.recommendation.suggestion.clone(),
+            Local::now().fixed_offset(),
+        )
+        .unwrap();
+        operation.recommendation.state = crate::recommendations::State::Dispatching;
+        if let Change::Buffer { category, .. } = &mut operation.change {
+            *category = Some("nejist\u{e9}".into());
+        }
+        let api = Fake::new(&operation);
+        assert!(matches!(
+            execute(&api, &operation).await,
+            Outcome::Applied(_)
+        ));
+        assert_eq!(api.writes.load(Ordering::SeqCst), 1);
+        let request = request(&operation, false).unwrap();
+        let body: Value =
+            serde_json::from_str(request.arguments.unwrap()["jsonBody"].as_str().unwrap()).unwrap();
+        assert_eq!(body["categories"], json!(["nejist\u{e9}"]));
+        assert!(body.get("attendees").is_none());
     }
 
     #[tokio::test]
@@ -1044,6 +1199,31 @@ mod tests {
         readonly["properties"]["categories"] = json!({"type":"array","readOnly":true});
         assert!(!compatible_schema(&readonly, false));
     }
+
+    #[test]
+    fn response_body_encoding_follows_discovered_provider_schema() {
+        for (property, valid, encoded) in [
+            (json!({}), true, false),
+            (json!({"type":"object"}), true, false),
+            (json!({"type":["object","null"]}), true, false),
+            (json!({"type":"string"}), true, true),
+            (json!({"type":["string","null"]}), true, true),
+            (json!({"type":["object","string","null"]}), true, false),
+            (json!({"type":"integer"}), false, false),
+        ] {
+            let tool: Tool = serde_json::from_value(json!({
+                "name":"do_action", "inputSchema":{
+                    "type":"object",
+                    "properties":{"actionUrl":{"type":"string"},"jsonBody":property},
+                    "required":["actionUrl","jsonBody"]
+                }
+            }))
+            .unwrap();
+            assert_eq!(validate_tool(&tool), valid);
+            assert_eq!(action_body_is_string(&tool), encoded);
+        }
+    }
+
     #[test]
     fn category_wire_body_replaces_all_categories_and_never_updates_other_fields() {
         let mut event = crate::calendar::fixture(1).remove(0);
@@ -1069,7 +1249,7 @@ mod tests {
             event,
             change: Change::Category("Office".into()),
         };
-        let request = request(&operation).unwrap();
+        let request = request(&operation, false).unwrap();
         assert_eq!(request.name, "update_entity");
         let body: Value =
             serde_json::from_str(request.arguments.unwrap()["jsonBody"].as_str().unwrap()).unwrap();
@@ -1121,22 +1301,27 @@ mod tests {
                 },
                 response == MeetingResponse::Cancel,
             );
-            let request = request(&operation).unwrap();
-            assert_eq!(request.name, "do_action");
-            let arguments = request.arguments.unwrap();
+            let wire = request(&operation, false).unwrap();
+            assert_eq!(wire.name, "do_action");
+            let arguments = wire.arguments.unwrap();
             assert_eq!(
                 arguments["actionUrl"],
                 format!("/me/events/{}/{}", operation.event.id, response.action())
             );
-            let body: Value =
-                serde_json::from_str(arguments["jsonBody"].as_str().unwrap()).unwrap();
+            let body = &arguments["jsonBody"];
+            assert!(body.is_object());
             assert_eq!(
-                body,
+                *body,
                 if response == MeetingResponse::Cancel {
                     json!({"comment":"Confirmed comment."})
                 } else {
                     json!({"comment":"Confirmed comment.","sendResponse":true})
                 }
+            );
+            let encoded = request(&operation, true).unwrap().arguments.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(encoded["jsonBody"].as_str().unwrap()).unwrap(),
+                *body
             );
             assert_eq!(
                 submission_result(
@@ -1162,20 +1347,119 @@ mod tests {
             },
             false,
         );
-        let body: Value = serde_json::from_str(
-            request(&operation).unwrap().arguments.unwrap()["jsonBody"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(body, json!({"comment":"","sendResponse":false}));
+        let body = request(&operation, false).unwrap().arguments.unwrap()["jsonBody"].clone();
+        assert_eq!(body, json!({"sendResponse":false}));
+        assert!(body["sendResponse"].is_boolean());
+    }
+
+    #[test]
+    fn responses_without_comments_omit_the_optional_parameter_and_preserve_notification_choice() {
+        for response in [
+            MeetingResponse::Accept,
+            MeetingResponse::Tentative,
+            MeetingResponse::Decline,
+        ] {
+            for send_response in [false, true] {
+                let operation = manual_operation(
+                    Change::Respond {
+                        response,
+                        comment: String::new(),
+                        send_response,
+                    },
+                    false,
+                );
+                for encoded in [false, true] {
+                    let arguments = request(&operation, encoded).unwrap().arguments.unwrap();
+                    let body = if encoded {
+                        serde_json::from_str::<Value>(arguments["jsonBody"].as_str().unwrap())
+                            .unwrap()
+                    } else {
+                        arguments["jsonBody"].clone()
+                    };
+                    assert_eq!(body, json!({"sendResponse":send_response}));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejection_codes_are_safe_persistent_and_never_trigger_a_write_retry() {
+        let operation = manual_operation(
+            Change::Respond {
+                response: MeetingResponse::Decline,
+                comment: String::new(),
+                send_response: false,
+            },
+            false,
+        );
+        let error = submission_result(&rmcp::model::CallToolResult::structured(json!({
+            "statusCode":400,
+            "data":{"error":{"code":"ErrorInvalidOperation","message":"PRIVATE body and person@example.test"}}
+        })), &operation).unwrap_err();
+        assert!(matches!(
+            error,
+            SubmissionError::RejectedWithCode(400, "ErrorInvalidOperation")
+        ));
+        let mut fake = Fake::new(&operation);
+        fake.rejection = Some(error);
+        let Outcome::NotSent(message) = execute(&fake, &operation).await else {
+            panic!("Expected definitive rejection");
+        };
+        assert!(message.contains("HTTP 400 (ErrorInvalidOperation)"));
+        assert!(!message.contains("PRIVATE"));
+        assert!(!message.contains("person@"));
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 1);
+        for code in [
+            "person@example.test",
+            "private-token",
+            "UnknownPrivateIdentifier",
+        ] {
+            assert!(matches!(
+                submission_result(
+                    &rmcp::model::CallToolResult::structured(json!({
+                        "statusCode":400, "error":{"code":code,"message":"private"}
+                    })),
+                    &operation
+                ),
+                Err(SubmissionError::Rejected(400))
+            ));
+        }
+        fake.rejection = Some(SubmissionError::InvalidRequest);
+        let Outcome::NotSent(message) = execute(&fake, &operation).await else {
+            panic!("Expected local validation failure");
+        };
+        assert!(!message.contains("HTTP"));
+        assert!(message.contains("no write was submitted"));
+    }
+
+    #[test]
+    fn encoded_error_envelopes_retain_only_known_codes_with_bounded_decoding() {
+        let error = json!({
+            "error":{"code":"RequestBodyRead","message":"PRIVATE person@example.test"}
+        });
+        for payload in [
+            json!({"data":error.to_string()}),
+            json!({"body":error.to_string()}),
+            json!({"error":{"code":"RequestBodyRead","message":"PRIVATE"}}),
+            json!({"data":{"body":error}}),
+        ] {
+            assert_eq!(provider_error_code(&payload), Some("RequestBodyRead"));
+        }
+        for payload in [
+            json!({"data":"not JSON; PRIVATE person@example.test"}),
+            json!({"data":json!({"error":{"code":"person@example.test"}}).to_string()}),
+            json!({"body":"x".repeat(16_385)}),
+            json!({"data":{"body":{"data":{"error":{"code":"RequestBodyRead"}}}}}),
+        ] {
+            assert_eq!(provider_error_code(&payload), None);
+        }
     }
 
     #[tokio::test]
     async fn manual_clear_delete_and_role_staleness_follow_verified_outcome_rules() {
         let operation = manual_operation(Change::ClearCategory, false);
         let body: Value = serde_json::from_str(
-            request(&operation).unwrap().arguments.unwrap()["jsonBody"]
+            request(&operation, false).unwrap().arguments.unwrap()["jsonBody"]
                 .as_str()
                 .unwrap(),
         )
@@ -1186,7 +1470,7 @@ mod tests {
             Outcome::Applied(_)
         ));
         let operation = manual_operation(Change::Delete, true);
-        assert_eq!(request(&operation).unwrap().name, "delete_entity");
+        assert_eq!(request(&operation, false).unwrap().name, "delete_entity");
         let fake = Fake::new(&operation);
         assert!(
             matches!(execute(&fake, &operation).await, Outcome::Removed(id) if id == operation.event.id)
