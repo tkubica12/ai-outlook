@@ -16,7 +16,15 @@ autonomous email sends, calendar changes or CRM writes.
 Update the approved native assistant/palette, conversation state, typed tool
 policy and adapter modules plus related tests/docs. Module paths bind after
 NATIVE-01. Preserve meeting briefings; add calendar-independent questions and
-local action proposals, not a duplicate meeting-only chat implementation.
+read-only answers, not a duplicate meeting-only chat implementation. The
+owner-approved Ask UI is a right dock with an optional true native window and
+locally filtered slash shortcuts. Local-concept editors are removed; hiding or
+changing presentation must preserve a running question. Stop is explicit, and
+calendar navigation never silently changes a question's meeting context.
+The owner-requested `/travel` and `/categories` shortcuts check the next 14 days
+through the background Insights queue and publish scoped proposals to the bell.
+They do not change the calendar or bypass approval, dismissals, account binding,
+coverage or execution budgets.
 Deliver the real authorized provider workflow and shared run evidence.
 Do not retain raw mail or tokens in repository fixtures/status records.
 

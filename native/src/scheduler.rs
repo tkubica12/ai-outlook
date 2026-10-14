@@ -1,7 +1,25 @@
 use crate::calendar::{Calendar, Event};
 use chrono::{DateTime, Duration, FixedOffset, Local};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRequest {
+    pub kinds: BTreeSet<crate::recommendations::Review>,
+    pub until: DateTime<FixedOffset>,
+}
+
+impl ReviewRequest {
+    pub fn includes(&self, kind: crate::recommendations::Kind) -> bool {
+        self.kinds.iter().any(|review| review.includes(kind))
+    }
+
+    pub fn covers(&self, event: &Event, now: DateTime<FixedOffset>) -> bool {
+        event.end > now
+            && event.start < self.until
+            && self.kinds.iter().any(|review| review.eligible(event))
+    }
+}
 
 pub const PENDING_LIMIT: usize = 64;
 pub const PROFILE: &str = "native-preparation-v1";
@@ -39,6 +57,8 @@ pub struct Job {
     pub retry_at: Option<DateTime<FixedOffset>>,
     #[serde(default)]
     pub prepared_at: Option<DateTime<FixedOffset>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +66,8 @@ pub struct Flight {
     pub event_id: String,
     pub fingerprint: String,
     pub foreground: bool,
+    #[serde(default)]
+    pub translation_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +140,9 @@ impl Queue {
             return Ok(false);
         }
         self.analysis_revision = revision.into();
+        for job in self.jobs.values_mut() {
+            job.review = None;
+        }
         Ok(true)
     }
 
@@ -222,6 +247,7 @@ impl Queue {
             let event = events.get(job.event_id.as_str());
             if event.is_none_or(|event| !job.manual && !eligible(event, now)) {
                 job.state = State::Cancelled;
+                job.review = None;
                 job.message =
                     "Meeting removed, cancelled, elapsed or outside preparation horizon".into();
             }
@@ -261,6 +287,7 @@ impl Queue {
                 retries: 0,
                 retry_at: None,
                 prepared_at: None,
+                review: None,
             });
             if job.fingerprint != key {
                 let needs_retry = matches!(job.state, State::Failed | State::Interrupted);
@@ -282,7 +309,20 @@ impl Queue {
                     retries: 0,
                     retry_at: None,
                     prepared_at: None,
+                    review: job.review.clone(),
                 };
+            }
+            if job
+                .review
+                .as_ref()
+                .is_some_and(|review| !review.covers(event, now))
+            {
+                job.review = None;
+                if job.state == State::Running && !job.manual {
+                    job.state = State::Deferred;
+                    job.message =
+                        "Ad-hoc review window elapsed or the meeting is no longer eligible".into();
+                }
             }
             if job.state == State::Completed
                 && !job.manual
@@ -343,20 +383,22 @@ impl Queue {
                 (
                     job.event_id.clone(),
                     job.foreground,
+                    job.review.is_some(),
                     job.promotion,
                     job.start,
                 )
             })
             .collect::<Vec<_>>();
-        candidates.sort_by_key(|(id, foreground, promotion, start)| {
+        candidates.sort_by_key(|(id, foreground, review, promotion, start)| {
             (
                 !*foreground,
+                !*review,
                 std::cmp::Reverse(*promotion),
                 *start,
                 id.clone(),
             )
         });
-        for (index, (id, _, _, _)) in candidates.into_iter().enumerate() {
+        for (index, (id, _, _, _, _)) in candidates.into_iter().enumerate() {
             let job = self.jobs.get_mut(&id).expect("candidate exists");
             job.state = if index < PENDING_LIMIT {
                 State::Queued
@@ -436,6 +478,7 @@ impl Queue {
                 retries: 0,
                 retry_at: None,
                 prepared_at: None,
+                review: None,
             },
         );
         self.failure = None;
@@ -443,6 +486,73 @@ impl Queue {
             return Err("Preparation could not be queued.".into());
         }
         Ok(())
+    }
+
+    pub fn request_review(
+        &mut self,
+        calendar: &Calendar,
+        now: DateTime<FixedOffset>,
+        kind: crate::recommendations::Review,
+    ) -> Result<usize, String> {
+        if self.failure.is_some() {
+            return Err(
+                "Resolve the previous preparation failure before starting a calendar review."
+                    .into(),
+            );
+        }
+        let until = now + Duration::days(14);
+        let first = now.with_timezone(&Local).date_naive();
+        let last = (until - Duration::nanoseconds(1))
+            .with_timezone(&Local)
+            .date_naive();
+        if (0..=(last - first).num_days())
+            .any(|day| !calendar.coverage.contains(&(first + Duration::days(day))))
+        {
+            return Err(
+                "Refresh the next 14 days of the calendar before starting this review.".into(),
+            );
+        }
+        let mut next = self.clone();
+        next.reconcile(calendar, now);
+        let events = calendar
+            .events
+            .iter()
+            .filter(|event| event.end > now && event.start < until && kind.eligible(event))
+            .collect::<Vec<_>>();
+        if events.iter().any(|event| {
+            next.jobs
+                .get(&event.id)
+                .is_some_and(|job| matches!(job.state, State::Failed | State::Interrupted))
+        }) {
+            return Err("Some meetings have failed or interrupted research; inspect and retry them before this review.".into());
+        }
+        for event in &events {
+            let job = next
+                .jobs
+                .get_mut(&event.id)
+                .ok_or("Meeting could not enter the review queue.")?;
+            if job.state == State::Completed {
+                job.manual = false;
+                job.promotion = 0;
+            }
+            if job.state != State::Running && !job.manual {
+                job.foreground = false;
+            }
+            let review = job.review.get_or_insert_with(|| ReviewRequest {
+                kinds: BTreeSet::new(),
+                until,
+            });
+            review.kinds.insert(kind);
+            review.until = review.until.max(until);
+            if job.state != State::Running {
+                job.state = State::Deferred;
+                job.retry_at = None;
+                job.retries = 0;
+            }
+        }
+        next.admit();
+        *self = next;
+        Ok(events.len())
     }
 
     pub fn yield_for_manual(&mut self) -> Option<u64> {
@@ -473,7 +583,7 @@ impl Queue {
             .filter(|job| {
                 job.state == State::Queued
                     && (!job.on_demand || job.manual || job.foreground)
-                    && (automatic || job.manual)
+                    && (automatic || job.manual || job.review.is_some())
                     && (job.foreground || !background_busy)
                     && !self
                         .flights
@@ -483,6 +593,7 @@ impl Queue {
             .min_by_key(|job| {
                 (
                     !job.foreground,
+                    job.review.is_none(),
                     std::cmp::Reverse(job.promotion),
                     job.start,
                     &job.event_id,
@@ -508,6 +619,7 @@ impl Queue {
             event_id: job.event_id.clone(),
             fingerprint: job.fingerprint.clone(),
             foreground: job.foreground,
+            translation_only: false,
         };
         if self.sequence == (1 << 63) - 1 {
             self.failure = Some(
@@ -539,10 +651,18 @@ impl Queue {
         {
             match result {
                 Ok(()) => {
-                    job.state = State::Completed;
+                    let review_after_translation = flight.translation_only && job.review.is_some();
+                    job.state = if review_after_translation {
+                        State::Deferred
+                    } else {
+                        State::Completed
+                    };
                     job.prepared_at = Some(Local::now().fixed_offset());
                     job.message =
                         "Saved result validated; citations are not independently verified".into();
+                    if !review_after_translation {
+                        job.review = None;
+                    }
                 }
                 Err(error) => {
                     job.state = State::Failed;
@@ -586,12 +706,12 @@ impl Queue {
             .jobs
             .get_mut(&flight.event_id)
             .expect("Current job exists");
-        job.state = if job.manual {
+        job.state = if job.manual || job.review.is_some() {
             State::Interrupted
         } else {
             State::Deferred
         };
-        job.retry_at = if job.manual {
+        job.retry_at = if job.manual || job.review.is_some() {
             None
         } else {
             Some(Local::now().fixed_offset() + Duration::seconds(2))
@@ -635,6 +755,226 @@ fn valid_fingerprint(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn review_calendar(now: DateTime<FixedOffset>) -> Calendar {
+        let mut events = crate::calendar::fixture(7);
+        for (index, event) in events.iter_mut().enumerate() {
+            event.title = format!("Review meeting {index}");
+            event.status = "accepted".into();
+            event.extra.clear();
+            event.start = now + Duration::days(index as i64 + 1);
+            event.end = event.start + Duration::hours(1);
+            event.is_all_day = false;
+        }
+        events[1].start = now + Duration::days(14) - Duration::seconds(1);
+        events[1].end = events[1].start + Duration::hours(1);
+        events[2].start = now + Duration::days(14);
+        events[2].end = events[2].start + Duration::hours(1);
+        events[3].start = now - Duration::days(1);
+        events[3].end = now - Duration::hours(1);
+        events[4].status = "cancelled".into();
+        events[5].status = "tentative".into();
+        events[6].is_all_day = true;
+        Calendar::build(
+            events,
+            (0..=14)
+                .map(|day| now.with_timezone(&Local).date_naive() + Duration::days(day))
+                .collect(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ad_hoc_reviews_have_an_exact_horizon_and_one_background_slot_when_paused() {
+        use crate::recommendations::Review;
+        let now = Local::now().fixed_offset();
+        let calendar = review_calendar(now);
+        let mut queue = Queue::default();
+        assert_eq!(
+            queue
+                .request_review(&calendar, now, Review::Travel)
+                .unwrap(),
+            2
+        );
+        let selected = queue
+            .jobs
+            .values()
+            .filter(|job| job.review.is_some())
+            .count();
+        assert_eq!(selected, 2);
+        let (id, flight) = queue.dispatch_for(false).unwrap();
+        assert!(!flight.foreground);
+        assert!(!queue.jobs[&flight.event_id].manual);
+        assert!(queue.dispatch_for(false).is_none());
+        assert_eq!(
+            queue
+                .request_review(&calendar, now, Review::Categories)
+                .unwrap(),
+            3
+        );
+        let scope = queue.jobs[&flight.event_id].review.as_ref().unwrap();
+        assert_eq!(
+            scope.kinds,
+            BTreeSet::from([Review::Travel, Review::Categories])
+        );
+        assert_eq!(
+            queue.flights.len(),
+            1,
+            "The running research is reused, not restarted"
+        );
+        assert_eq!(
+            queue
+                .jobs
+                .values()
+                .filter(|job| job.review.is_some())
+                .count(),
+            3
+        );
+        let persisted: Queue =
+            serde_json::from_str(&serde_json::to_string(&queue).unwrap()).unwrap();
+        assert_eq!(persisted, queue);
+        queue.finish(id, Ok(()));
+        assert!(queue.jobs[&flight.event_id].review.is_none());
+        let (next, next_flight) = queue.dispatch_for(false).unwrap();
+        assert!(!next_flight.foreground);
+        queue.finish(next, Ok(()));
+        let (last, _) = queue.dispatch_for(false).unwrap();
+        queue.finish(last, Ok(()));
+        assert!(queue.dispatch_for(false).is_none());
+    }
+
+    #[test]
+    fn review_admission_is_atomic_for_missing_coverage_and_previous_failures() {
+        use crate::recommendations::Review;
+        let now = Local::now().fixed_offset();
+        let mut calendar = review_calendar(now);
+        calendar
+            .coverage
+            .remove(&(now.with_timezone(&Local).date_naive() + Duration::days(10)));
+        let mut queue = Queue::default();
+        let before = queue.clone();
+        assert!(
+            queue
+                .request_review(&calendar, now, Review::Travel)
+                .is_err()
+        );
+        assert_eq!(queue, before);
+        calendar
+            .coverage
+            .insert(now.with_timezone(&Local).date_naive() + Duration::days(10));
+        queue.reconcile(&calendar, now);
+        let (id, _) = queue.dispatch().unwrap();
+        queue.finish(id, Err("Unknown previous outcome".into()));
+        let before = queue.clone();
+        assert!(
+            queue
+                .request_review(&calendar, now, Review::Categories)
+                .is_err()
+        );
+        assert_eq!(queue, before);
+    }
+
+    #[test]
+    fn review_joining_a_translation_waits_for_fresh_research() {
+        use crate::recommendations::Review;
+        let now = Local::now().fixed_offset();
+        let calendar = review_calendar(now);
+        let mut queue = Queue::default();
+        queue.reconcile(&calendar, now);
+        let (translation, flight) = queue.dispatch().unwrap();
+        queue
+            .flights
+            .get_mut(&translation)
+            .unwrap()
+            .translation_only = true;
+        queue
+            .request_review(&calendar, now, Review::Travel)
+            .unwrap();
+        queue.finish(translation, Ok(()));
+        assert_ne!(queue.jobs[&flight.event_id].state, State::Completed);
+        assert!(queue.jobs[&flight.event_id].review.is_some());
+        let (research, fresh) = queue.dispatch_for(false).unwrap();
+        assert_eq!(fresh.event_id, flight.event_id);
+        assert!(!fresh.translation_only);
+        queue.finish(research, Ok(()));
+        assert!(queue.jobs[&flight.event_id].review.is_none());
+    }
+
+    #[test]
+    fn review_requests_do_not_cross_account_or_analysis_configuration_bindings() {
+        use crate::recommendations::Review;
+        let now = Local::now().fixed_offset();
+        let calendar = review_calendar(now);
+        let mut queue = Queue::default();
+        queue
+            .request_review(&calendar, now, Review::Categories)
+            .unwrap();
+        assert!(queue.can_dispatch_for(false));
+        queue.set_analysis_revision(&"b".repeat(64)).unwrap();
+        queue.reconcile(&calendar, now);
+        assert!(queue.jobs.values().all(|job| job.review.is_none()));
+        assert!(!queue.can_dispatch_for(false));
+    }
+
+    #[test]
+    fn stale_completed_promotions_cannot_take_the_interactive_slot_for_a_review() {
+        use crate::recommendations::Review;
+        let now = Local::now().fixed_offset();
+        let calendar = review_calendar(now);
+        let mut queue = Queue::default();
+        queue.reconcile(&calendar, now);
+        let event = calendar
+            .events
+            .iter()
+            .find(|event| event.start == now + Duration::days(1))
+            .unwrap();
+        queue.promote(&event.id);
+        let (id, flight) = queue.dispatch().unwrap();
+        assert!(flight.foreground);
+        queue.finish(id, Ok(()));
+        queue.jobs.get_mut(&event.id).unwrap().prepared_at = Some(now - Duration::hours(25));
+        queue
+            .request_review(&calendar, now, Review::Travel)
+            .unwrap();
+        let (_, flight) = queue.dispatch_for(false).unwrap();
+        assert!(!flight.foreground);
+        assert!(queue.dispatch_for(false).is_none());
+    }
+
+    #[test]
+    fn review_expiry_cancels_the_old_flight_and_completed_manual_jobs_review_in_background() {
+        use crate::recommendations::{Kind, Review};
+        let now = Local::now().fixed_offset();
+        let calendar = review_calendar(now);
+        let event = calendar
+            .events
+            .iter()
+            .find(|event| event.start == now + Duration::days(1))
+            .unwrap();
+        let mut queue = Queue::default();
+        queue.request_now(event, true).unwrap();
+        let (id, _) = queue.dispatch_for(false).unwrap();
+        queue.finish(id, Ok(()));
+        queue
+            .request_review(&calendar, now, Review::Travel)
+            .unwrap();
+        let job = &queue.jobs[&event.id];
+        assert!(!job.foreground);
+        assert!(!job.manual);
+        let scope = job.review.as_ref().unwrap();
+        assert!(scope.includes(Kind::Travel));
+        assert!(scope.includes(Kind::TravelAfter));
+        assert!(!scope.includes(Kind::Category));
+        let (id, flight) = queue.dispatch_for(false).unwrap();
+        assert!(
+            queue
+                .reconcile(&calendar, now + Duration::days(15))
+                .contains(&id)
+        );
+        assert!(queue.current(id).is_none());
+        assert!(queue.jobs[&flight.event_id].review.is_none());
+    }
 
     #[test]
     fn unchanged_inputs_refresh_matches_full_reconciliation_across_time_and_results() {

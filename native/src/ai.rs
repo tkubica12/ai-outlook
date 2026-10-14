@@ -1047,7 +1047,6 @@ impl Engine {
                                         let (cancel, cancelled) = watch::channel(false);
                                         cancellations.insert(question.id, (cancel, false));
                                         let progress = streaming.clone();
-                                        let context = context.clone();
                                         let workiq_connection = workiq.clone();
                                         let index = source_index.clone();
                                         let connectors = connectors.clone();
@@ -1055,7 +1054,7 @@ impl Engine {
                                         let telemetry = telemetry.clone();
                                         tasks.spawn(async move {
                                             let id = question.id;
-                                            let result = ask(harness, *question, cancelled, progress, context, true, Sources { translation: false, workiq: workiq_connection, index, connectors: Some(connectors), telemetry: Some(telemetry) }).await.map_err(RequestError::message);
+                                            let result = ask(harness, *question, cancelled, progress, true, Sources { translation: false, workiq: workiq_connection, index, connectors: Some(connectors), telemetry: Some(telemetry) }).await.map_err(RequestError::message);
                                             Completion::Answer { id, connector_revision, result }
                                         });
                                     } else {
@@ -1088,7 +1087,6 @@ impl Engine {
                                         let (cancel, cancelled) = watch::channel(false);
                                         cancellations.insert(id, (cancel, !request.foreground));
                                         let progress = streaming.clone();
-                                        let context = context.clone();
                                         let connection = workiq.clone();
                                         let index = source_index.clone();
                                         let connectors = connectors.clone();
@@ -1103,7 +1101,7 @@ impl Engine {
                                                 },
                                                 meeting: Some(request.event.clone()), account: request.account.clone(), public_topic: None, suggest_drafts: false, language: crate::i18n::Language::En,
                                             };
-                                            ask(harness, question, cancelled, progress, context, false, Sources { translation: request.previous.is_some(), workiq: connection, index, connectors: Some(connectors), telemetry: Some(telemetry) }).await
+                                            ask(harness, question, cancelled, progress, false, Sources { translation: request.previous.is_some(), workiq: connection, index, connectors: Some(connectors), telemetry: Some(telemetry) }).await
                                             }.await;
                                             let quota_day = match &result { Err(RequestError::Quota(day)) => Some(*day), _ => None };
                                             Completion::Prepared { request, connector_revision, result: result.map_err(RequestError::message), quota_day }
@@ -1644,7 +1642,6 @@ async fn ask(
     question: Question,
     mut cancel: watch::Receiver<bool>,
     progress: Arc<Mutex<Progress>>,
-    context: egui::Context,
     stream: bool,
     sources: Sources,
 ) -> Result<Answer, RequestError> {
@@ -1784,7 +1781,6 @@ async fn ask(
                                     if text.len() > 64_000 { return Err("Redacted AI progress exceeded the 64 KiB limit".into()); }
                                     *state = Progress { id: question.id, text: Arc::new(text) };
                                     drop(state);
-                                    context.request_repaint();
                                     last_update = Instant::now();
                                 }
                             }
@@ -1999,7 +1995,6 @@ mod live_source_tests {
                     },
                     cancelled,
                     Arc::new(Mutex::new(Progress::default())),
-                    egui::Context::default(),
                     false,
                     Sources {
                         translation: false,

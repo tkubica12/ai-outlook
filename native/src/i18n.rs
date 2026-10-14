@@ -217,6 +217,142 @@ pub const TEXTS: &[(&str, &str)] = &[
     ("Delete", "Smazat"),
     ("Back", "Zpět"),
     ("Ask AI", "Zeptat se AI"),
+    ("Hide Ask", "Skrýt"),
+    ("Stop", "Zastavit"),
+    ("Dock Ask", "Zadokovat"),
+    ("Detach Ask", "Samostatné okno"),
+    ("Answer ready", "Odpověď je připravená"),
+    ("Meeting context", "Ke schůzce"),
+    ("Clear context", "Odebrat kontext"),
+    ("General question", "Obecný dotaz"),
+    ("Ask is updating...", "Ask se aktualizuje…"),
+    (
+        "Ask is updating. Try changing context again.",
+        "Ask se aktualizuje. Zkus kontext změnit znovu.",
+    ),
+    ("Use selected meeting", "K vybrané schůzce"),
+    (
+        "Ask a question or type / for commands",
+        "Napiš dotaz nebo / pro příkazy",
+    ),
+    ("What is on my calendar today", "Co mám dnes v kalendáři"),
+    (
+        "Important meetings this week",
+        "Důležité schůzky tento týden",
+    ),
+    (
+        "Prepare for the contextual meeting",
+        "Příprava na schůzku v kontextu",
+    ),
+    ("Explain calendar conflicts", "Vysvětlit souběhy schůzek"),
+    (
+        "Find a meeting, message or material",
+        "Najít schůzku, zprávu nebo podklady",
+    ),
+    (
+        "Missing travel time: next 14 days, results in Messages",
+        "Doplnit přejezdy: příštích 14 dní, návrhy do zvonečku",
+    ),
+    (
+        "Review categories: next 14 days, results in Messages",
+        "Kontrola kategorií: příštích 14 dní, návrhy do zvonečku",
+    ),
+    (
+        "Use /travel or /categories without arguments; each checks the next 14 days.",
+        "Použij /travel nebo /categories bez dalších parametrů; oba kontrolují příštích 14 dní.",
+    ),
+    (
+        "Travel review queued for the next 14 days. Suggestions will appear in Messages; calendar changes still need approval.",
+        "Kontrola přejezdů na příštích 14 dní byla předána na pozadí. Návrhy najdeš ve zvonečku; změny kalendáře stále vyžadují schválení.",
+    ),
+    (
+        "Category review queued for the next 14 days. Suggestions will appear in Messages; calendar changes still need approval.",
+        "Kontrola kategorií na příštích 14 dní byla předána na pozadí. Návrhy najdeš ve zvonečku; změny kalendáře stále vyžadují schválení.",
+    ),
+    (
+        "Connect AI and WorkIQ before starting a calendar review.",
+        "Před kontrolou kalendáře připoj AI a WorkIQ.",
+    ),
+    (
+        "Resolve the previous preparation failure before starting a calendar review.",
+        "Před kontrolou kalendáře vyřeš předchozí chybu přípravy.",
+    ),
+    (
+        "Refresh the next 14 days of the calendar before starting this review.",
+        "Před kontrolou nejdřív načti kalendář na příštích 14 dní.",
+    ),
+    (
+        "Some meetings have failed or interrupted research; inspect and retry them before this review.",
+        "U některých schůzek zjišťování selhalo nebo bylo přerušeno. Před kontrolou je zkontroluj a zopakuj.",
+    ),
+    (
+        "Calendar account changed before the review; nothing was queued.",
+        "Před kontrolou se změnil účet kalendáře; nic nebylo zařazeno do fronty.",
+    ),
+    (
+        "Calendar review stopped after the account or AI configuration changed. Run the command again.",
+        "Kontrola kalendáře byla zastavena po změně účtu nebo nastavení AI. Spusť příkaz znovu.",
+    ),
+    (
+        "Calendar reviews need the live worker; previews never submit requests.",
+        "Kontroly kalendáře vyžadují připojené služby; ukázkový režim žádné požadavky neodesílá.",
+    ),
+    (
+        "Unknown Ask command. Choose a command below or ask without a leading slash.",
+        "Neznámý příkaz. Vyber příkaz z nabídky nebo napiš dotaz bez úvodního lomítka.",
+    ),
+    (
+        "Choose a meeting context before using /prepare.",
+        "Pro /prepare nejdřív vyber kontext schůzky.",
+    ),
+    (
+        "After /find, enter what you want to find.",
+        "Za /find napiš, co chceš najít.",
+    ),
+    (
+        "Stop the current question before changing its meeting context.",
+        "Před změnou kontextu schůzky nejdřív zastav aktuální dotaz.",
+    ),
+    (
+        "Meeting context changed. Review the question before submitting it.",
+        "Kontext schůzky se změnil. Před odesláním zkontroluj dotaz.",
+    ),
+    (
+        "The Ask window is unavailable. Restart Tomlook.",
+        "Okno Ask není dostupné. Restartuj Tomlook.",
+    ),
+    (
+        "The Ask window state is unavailable. Restart Tomlook.",
+        "Stav okna Ask není dostupný. Restartuj Tomlook.",
+    ),
+    (
+        "Separate Ask windows are not supported by this renderer. Ask remains docked.",
+        "Samostatná okna nejsou podporována. Ask zůstává v pravém panelu.",
+    ),
+    (
+        "The Ask action queue is full. Nothing was submitted; try again.",
+        "Fronta akcí Ask je plná. Nic nebylo odesláno; zkus to znovu.",
+    ),
+    (
+        "Summarize my calendar for this local date, with important meetings and preparation needs:",
+        "Shrň můj kalendář pro toto místní datum, včetně důležitých schůzek a potřebné přípravy:",
+    ),
+    (
+        "Summarize important meetings and preparation needs for this local calendar week:",
+        "Shrň důležité schůzky a potřebnou přípravu pro tento týden místního kalendáře:",
+    ),
+    (
+        "Explain how to prepare for the contextual meeting using saved Insights and retrieved evidence. Distinguish verified needs, reusable material and missing information.",
+        "Vysvětli přípravu na schůzku v kontextu pomocí uložených Insights a získaných podkladů. Rozliš ověřené potřeby, znovupoužitelné materiály a chybějící informace.",
+    ),
+    (
+        "Find conflicts in my calendar for these local dates. Name both meetings and their full local time ranges, and explain practical resolution options without changing the calendar:",
+        "Najdi souběhy v mém kalendáři pro tato místní data. Uveď obě schůzky a jejich celé místní časové rozsahy. Vysvětli možnosti řešení bez změny kalendáře:",
+    ),
+    (
+        "Find the requested meeting, message or preparation material in authorized workplace sources. Cite retrieved sources and distinguish no matches from unavailable access.",
+        "Najdi požadovanou schůzku, zprávu nebo podklady v oprávněných pracovních zdrojích. Uveď získané zdroje a rozliš nenalezené výsledky od nedostupného přístupu.",
+    ),
     ("More options", "Další možnosti"),
     ("Copy answer", "Kopírovat odpověď"),
     ("Thinking...", "Přemýšlím…"),
@@ -1007,7 +1143,6 @@ pub const TEXTS: &[(&str, &str)] = &[
         "Switch to global question",
         "Zeptat se bez vazby na schůzku",
     ),
-    ("Use selected meeting", "Použít vybranou schůzku"),
     ("Ask a question...", "Na co se chcete zeptat?"),
     ("Suggest drafts", "Navrhovat koncepty"),
     (
@@ -1390,23 +1525,23 @@ mod tests {
 
     #[test]
     fn native_static_controls_are_in_the_shared_catalog() {
-        let app = include_str!("app.rs")
-            .split("#[cfg(test)]\nmod tests")
-            .next()
-            .unwrap();
-        for rest in app.split("language.text(\"").skip(1) {
-            let key = rest.split('"').next().unwrap();
-            if !key.chars().any(|ch| ch.is_ascii_alphabetic())
-                || key.starts_with("Ctrl+")
-                || key == "Esc"
-                || key == "Tomlook"
-            {
-                continue;
+        let sources = [include_str!("app.rs"), include_str!("ask.rs")];
+        for source in sources {
+            let app = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            for rest in app.split("language.text(\"").skip(1) {
+                let key = rest.split('"').next().unwrap();
+                if !key.chars().any(|ch| ch.is_ascii_alphabetic())
+                    || key.starts_with("Ctrl+")
+                    || key == "Esc"
+                    || key == "Tomlook"
+                {
+                    continue;
+                }
+                assert!(
+                    TEXTS.iter().any(|(en, _)| *en == key),
+                    "Missing Czech UI label: {key}"
+                );
             }
-            assert!(
-                TEXTS.iter().any(|(en, _)| *en == key),
-                "Missing Czech UI label: {key}"
-            );
         }
         assert_eq!(Language::Cs.text("R2: Message read"), "R2: Původní zpráva");
         assert_eq!(

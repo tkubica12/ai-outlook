@@ -2,12 +2,13 @@ use chrono::{Datelike, Local, NaiveDate};
 use eframe::egui::{self, Color32, Id, Key, Modifiers, RichText, Stroke, Vec2};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, Mutex, mpsc},
 };
 use tomlook::{
     ai::{self, Engine, Question},
+    ask,
     calendar::{Calendar, Event, View, person_email, safe_url},
-    proposals::{self, Draft, Kind, Proposal},
+    proposals,
     storage::Preferences,
     worker::{ActivityFilter, Command, Notice, Options, Worker},
 };
@@ -311,19 +312,23 @@ fn command_matches_in(query: &str, language: tomlook::i18n::Language) -> Vec<Pal
     matches
 }
 
-fn draft_editor_id(draft: u64, field: &str) -> Id {
-    Id::new(("local-draft-editor", draft, field))
-}
-
 #[derive(Default)]
 struct AssistantState {
     question: String,
     answer: Option<ai::Answer>,
     error: Option<String>,
     fingerprint: Option<String>,
-    suggest_drafts: bool,
-    drafts: Vec<Draft>,
-    draft_error: Option<String>,
+}
+
+#[derive(Default)]
+struct DetachedAsk {
+    view: ask::View,
+    synced_question: String,
+    failure: Option<String>,
+}
+
+fn ask_viewport() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("tomlook-ask")
 }
 
 struct MeetingActionDraft {
@@ -419,6 +424,13 @@ pub struct Tomlook {
     github_client_id: String,
     forget_connector: Option<tomlook::connectors::Kind>,
     assistant: bool,
+    assistant_detached: bool,
+    ask_unread: bool,
+    ask_cursor: usize,
+    ask_menu_dismissed: bool,
+    detached_ask: Arc<Mutex<DetachedAsk>>,
+    ask_input: mpsc::Receiver<ask::Input>,
+    ask_output: mpsc::SyncSender<ask::Input>,
     assistant_context: Option<Event>,
     assistant_revision: Option<String>,
     assistant_states: BTreeMap<Option<String>, AssistantState>,
@@ -429,12 +441,7 @@ pub struct Tomlook {
     active_request: Option<u64>,
     answer: Option<ai::Answer>,
     ai_error: Option<String>,
-    suggest_drafts: bool,
-    drafts: Vec<Draft>,
-    draft_error: Option<String>,
     activity: Arc<tomlook::worker::Activity>,
-    draft_id: u64,
-    focus_draft: Option<u64>,
     tray: Option<crate::tray::Tray>,
     in_tray: bool,
     last_prepared: Option<(String, Option<chrono::DateTime<chrono::FixedOffset>>)>,
@@ -590,6 +597,7 @@ impl Tomlook {
     }
 
     fn initial(worker: Option<Worker>, ai: Option<Engine>, error: Option<String>) -> Self {
+        let (ask_output, ask_input) = mpsc::sync_channel(16);
         Self {
             worker,
             error,
@@ -656,6 +664,13 @@ impl Tomlook {
             github_client_id: String::new(),
             forget_connector: None,
             assistant: false,
+            assistant_detached: false,
+            ask_unread: false,
+            ask_cursor: 0,
+            ask_menu_dismissed: false,
+            detached_ask: Arc::new(Mutex::new(DetachedAsk::default())),
+            ask_input,
+            ask_output,
             assistant_context: None,
             assistant_revision: None,
             assistant_states: BTreeMap::new(),
@@ -666,11 +681,6 @@ impl Tomlook {
             active_request: None,
             answer: None,
             ai_error: None,
-            suggest_drafts: false,
-            drafts: Vec::new(),
-            draft_error: None,
-            draft_id: 0,
-            focus_draft: None,
             activity: Arc::new(tomlook::worker::Activity::default()),
             tray: None,
             in_tray: false,
@@ -757,6 +767,8 @@ impl Tomlook {
                         if updated.is_none_or(|event| event.fingerprint() != context.fingerprint())
                         {
                             let updated = updated.cloned();
+                            self.cancel_ai();
+                            self.answer = None;
                             self.switch_assistant_context(updated);
                             self.ai_error = Some("The meeting changed or disappeared. The old result was invalidated and cancellation requested; review the updated context before asking again.".into());
                         }
@@ -970,6 +982,7 @@ impl Tomlook {
                 }
                 ai::Notice::Answer { id, result } if self.active_request == Some(id) => {
                     self.active_request = None;
+                    self.ask_unread = !self.assistant;
                     match result {
                         Ok(answer) if answer.text.len() <= 64_000 => {
                             let validation = answer.evidence.validate().and_then(|()| {
@@ -1018,6 +1031,7 @@ impl Tomlook {
                     }
                     if self.active_request.take().is_some() {
                         self.answer = None;
+                        self.ask_unread = !self.assistant;
                         self.ai_error = Some("AI stopped without a completed answer; provider outcome may be unknown".into());
                     }
                 }
@@ -1026,9 +1040,6 @@ impl Tomlook {
     }
 
     fn select(&mut self, index: usize) {
-        if self.assistant_context.is_some() {
-            self.switch_assistant_context(Some(self.calendar.events[index].clone()));
-        }
         self.selected = Some(index);
         self.insights_expanded = false;
         self.detail_revision += 1;
@@ -1128,14 +1139,17 @@ impl Tomlook {
             self.focus_search = true;
         }
         if consume(Modifiers::CTRL, Key::Space) {
-            self.assistant = !self.assistant;
-            self.focus_assistant = self.assistant;
-            if !self.assistant {
-                self.cancel_ai();
-                self.focus_search = true;
-            }
+            self.toggle_assistant(context);
         }
-        if consume(Modifiers::NONE, Key::Escape) {
+        let slash_menu = self.assistant
+            && !self.assistant_detached
+            && !self.ask_menu_dismissed
+            && !ask::matches(&self.question, self.preferences.language).is_empty()
+            && context.memory(|memory| {
+                memory.focused() == Some(Id::new("assistant-question"))
+                    || memory.had_focus_last_frame(Id::new("assistant-question"))
+            });
+        if !slash_menu && consume(Modifiers::NONE, Key::Escape) {
             if self.meeting_action.take().is_some()
                 || self.meeting_menu.take().is_some()
                 || self.date_drag.take().is_some()
@@ -1153,9 +1167,7 @@ impl Tomlook {
                 self.connection_panel = None;
                 self.focus_search = true;
             } else if self.assistant {
-                self.assistant = false;
-                self.cancel_ai();
-                self.focus_search = true;
+                self.toggle_assistant(context);
             } else if self.selected.is_some() {
                 self.selected = None;
                 self.detail_revision += 1;
@@ -1174,11 +1186,6 @@ impl Tomlook {
                 ]
                 .into_iter()
                 .any(|name| id == Id::new(name))
-                    || self.drafts.iter().any(|draft| {
-                        ["title", "target", "body"]
-                            .into_iter()
-                            .any(|field| id == draft_editor_id(draft.id, field))
-                    })
             })
         });
         let search_focused =
@@ -1405,24 +1412,32 @@ impl Tomlook {
                     .clicked()
                 {
                     self.preferences.language = language.other();
-                    self.cancel_ai();
-                    self.answer = None;
-                    for state in self.assistant_states.values_mut() {
-                        state.answer = None;
-                    }
                     self.save_preferences();
                 }
                 if ui
-                    .button(language.text("Ask"))
+                    .button(if self.active_request.is_some() {
+                        format!(
+                            "{} · {}",
+                            language.text("Ask"),
+                            language.text("Thinking...")
+                        )
+                    } else if self.ask_unread {
+                        format!(
+                            "{} · {}",
+                            language.text("Ask"),
+                            language.text(if self.ai_error.is_some() {
+                                "Needs review"
+                            } else {
+                                "Answer ready"
+                            })
+                        )
+                    } else {
+                        language.text("Ask").into_owned()
+                    })
                     .on_hover_text(language.text("Ctrl+Space"))
                     .clicked()
                 {
-                    self.assistant = !self.assistant;
-                    self.focus_assistant = self.assistant;
-                    if !self.assistant {
-                        self.cancel_ai();
-                        self.focus_search = true;
-                    }
+                    self.toggle_assistant(ui.ctx());
                 }
             });
         });
@@ -2989,6 +3004,7 @@ impl Tomlook {
 
     fn cancel_ai(&mut self) {
         if let Some(id) = self.active_request.take() {
+            self.ask_unread = !self.assistant;
             self.ai_error = Some("Cancellation requested; partial output is not a completed answer. Provider outcome may be unknown.".into());
             if !self.ai_command(ai::Command::Cancel(id)) {
                 self.error = Some("AI cancellation could not be submitted. Its result will be discarded, but the provider request may continue until timeout or application exit.".into());
@@ -3007,6 +3023,30 @@ impl Tomlook {
     }
 
     fn switch_assistant_context(&mut self, next: Option<Event>) -> bool {
+        if self.assistant_detached {
+            let shared = match self.detached_ask.try_lock() {
+                Ok(shared) => shared,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    self.context_error =
+                        Some("Ask is updating. Try changing context again.".into());
+                    return false;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    self.context_error =
+                        Some("The Ask window state is unavailable. Restart Tomlook.".into());
+                    return false;
+                }
+            };
+            if shared.view.revision == self.assistant_revision
+                && shared.view.context.as_ref().map(|event| event.id.as_str())
+                    == self
+                        .assistant_context
+                        .as_ref()
+                        .map(|event| event.id.as_str())
+            {
+                self.question = shared.view.question.clone();
+            }
+        }
         let current_id = self
             .assistant_context
             .as_ref()
@@ -3024,8 +3064,11 @@ impl Tomlook {
             self.assistant_revision = fingerprint;
             return true;
         }
-        self.cancel_ai();
-        self.focus_draft = None;
+        if self.active_request.is_some() {
+            self.ai_error =
+                Some("Stop the current question before changing its meeting context.".into());
+            return false;
+        }
         if !self.assistant_states.contains_key(&next_id)
             && self.assistant_states.len() + 1 >= ASSISTANT_CONTEXT_LIMIT
         {
@@ -3040,9 +3083,6 @@ impl Tomlook {
                 answer: self.answer.take(),
                 error: self.ai_error.take(),
                 fingerprint: self.assistant_context.as_ref().map(Event::fingerprint),
-                suggest_drafts: self.suggest_drafts,
-                drafts: std::mem::take(&mut self.drafts),
-                draft_error: self.draft_error.take(),
             },
         );
         if restored.fingerprint != fingerprint && restored.answer.is_some() {
@@ -3052,13 +3092,12 @@ impl Tomlook {
         self.question = restored.question;
         self.answer = restored.answer;
         self.ai_error = restored.error;
-        self.suggest_drafts = restored.suggest_drafts;
-        self.drafts = restored.drafts;
-        self.draft_error = restored.draft_error;
         self.assistant_context = next;
         self.assistant_revision = fingerprint;
         self.context_error = None;
         self.focus_assistant = true;
+        self.ask_cursor = 0;
+        self.ask_menu_dismissed = false;
         true
     }
 
@@ -3074,23 +3113,81 @@ impl Tomlook {
             self.ai_error = Some("Use a nonempty question of at most 8,000 bytes.".into());
             return;
         }
+        let submission = match ask::expand(
+            &self.question,
+            self.assistant_context.as_ref(),
+            self.preferences.language,
+        ) {
+            Ok(submission) => submission,
+            Err(error) => {
+                self.ai_error = Some(error);
+                return;
+            }
+        };
         let Some(id) = self.request_id.checked_add(1).filter(|id| *id < 1 << 63) else {
             self.ai_error = Some("Assistant request identity limit reached. No question was submitted; restart Tomlook.".into());
             return;
         };
         self.request_id = id;
         self.ai_error = None;
+        let question = match submission {
+            ask::Submission::Question(question) => question,
+            ask::Submission::Review(kind) => {
+                self.request_recommendation_review(kind);
+                return;
+            }
+        };
         if self.ai_command(ai::Command::Ask(Box::new(Question {
             id,
-            question: self.question.clone(),
+            question,
             meeting: self.assistant_context.clone(),
             account: self.calendar_owner.clone(),
             public_topic: None,
-            suggest_drafts: self.suggest_drafts,
+            suggest_drafts: false,
             language: self.preferences.language,
         }))) {
             self.active_request = Some(id);
             self.answer = None;
+            self.ask_unread = false;
+        }
+    }
+
+    fn request_recommendation_review(&mut self, kind: tomlook::recommendations::Review) {
+        let Some(account) = self
+            .calendar_owner
+            .clone()
+            .filter(|account| !account.is_empty())
+        else {
+            self.ai_error = Some("Connect AI and WorkIQ before starting a calendar review.".into());
+            return;
+        };
+        let command = Command::ReviewRecommendations { kind, account };
+        let Some(worker) = &self.worker else {
+            self.ai_error = Some("The storage worker is unavailable. Restart Tomlook.".into());
+            return;
+        };
+        match worker.commands.try_send(command) {
+            Ok(()) => {
+                let message = match kind {
+                    tomlook::recommendations::Review::Travel => {
+                        "Travel review queued for the next 14 days. Suggestions will appear in Messages; calendar changes still need approval."
+                    }
+                    tomlook::recommendations::Review::Categories => {
+                        "Category review queued for the next 14 days. Suggestions will appear in Messages; calendar changes still need approval."
+                    }
+                };
+                self.answer = Some(ai::Answer::new(
+                    self.preferences.language.text(message).into_owned(),
+                    Arc::new(Default::default()),
+                    Arc::new(Vec::new()),
+                ));
+                self.ask_unread = false;
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.ai_error =
+                    Some("Local queue is full. Nothing was submitted; try again.".into());
+            }
+            _ => self.ai_error = Some("The storage worker is unavailable. Restart Tomlook.".into()),
         }
     }
 
@@ -3115,7 +3212,6 @@ impl Tomlook {
         }
         if self.question.trim().is_empty() {
             self.question = self.preferences.language.text("Prepare a local follow-up draft for this meeting using saved Insights and retrieved evidence. Separate verified outcomes from pre-meeting plans; use placeholders for unknown decisions, owners and dates. Do not send any message, invite attendees or modify the calendar.").into_owned();
-            self.suggest_drafts = true;
         } else {
             self.ai_error = Some("An unsent question is already saved for this meeting; it was preserved. Review it before asking for a follow-up draft.".into());
         }
@@ -3123,327 +3219,276 @@ impl Tomlook {
         self.messages_open = false;
     }
 
-    fn keep_local_proposal(&mut self, proposal: Proposal) {
-        if self.context_error.is_some() {
-            self.draft_error = Some(
-                "Resolve the assistant context warning before keeping a draft; nothing was kept"
-                    .into(),
-            );
-            return;
-        }
-        let result = proposal.validate().and_then(|()| {
-            if self.drafts.len() >= proposals::DRAFT_LIMIT {
-                Err("Eight local drafts already occupy this context; discard one before keeping another".into())
-            } else if self.drafts.iter().any(|draft| draft.proposal == proposal) {
-                Err("This proposal is already a local draft; nothing was duplicated".into())
-            } else {
-                Ok(())
-            }
-        });
-        if let Err(error) = result {
-            self.draft_error = Some(error);
-            return;
-        }
-        self.push_local_draft(proposal);
-    }
-
-    fn push_local_draft(&mut self, proposal: Proposal) {
-        let Some(id) = self.draft_id.checked_add(1) else {
-            self.draft_error = Some("Local draft identity limit reached; nothing was added. Restart Tomlook to clear memory.".into());
-            return;
-        };
-        self.draft_id = id;
-        self.drafts.push(Draft {
-            id,
-            proposal,
-            context_revision: self.assistant_revision.clone(),
-        });
-        self.focus_draft = Some(id);
-        self.draft_error = None;
-    }
-
-    fn new_local_draft(&mut self) {
-        if self.context_error.is_some() {
-            self.draft_error = Some(
-                "Resolve the assistant context warning before adding a draft; nothing was added"
-                    .into(),
-            );
-            return;
-        }
-        if self.drafts.len() >= proposals::DRAFT_LIMIT {
-            self.draft_error = Some(
-                "Eight local drafts already occupy this context; discard one before adding another"
-                    .into(),
-            );
-            return;
-        }
-        let target = self
-            .assistant_context
-            .as_ref()
-            .and_then(|event| (event.id.len() <= proposals::TARGET_LIMIT).then(|| event.id.clone()))
-            .unwrap_or_default();
-        self.push_local_draft(Proposal {
-            title: "Local draft".into(),
-            target,
+    fn ask_view(&self) -> ask::View {
+        ask::View {
+            question: self.question.clone(),
+            answer: self.answer.clone(),
+            error: self.context_error.clone().or_else(|| self.ai_error.clone()),
+            context: self.assistant_context.clone(),
+            revision: self.assistant_revision.clone(),
+            selected: self.selected.is_some(),
+            ready: self.ai_ready && self.context_error.is_none(),
+            busy: self.active_request.is_some(),
+            cursor: self.ask_cursor,
+            menu_dismissed: self.ask_menu_dismissed,
+            focus: self.focus_assistant,
+            language: self.preferences.language,
+            accent: self.accent(),
             ..Default::default()
-        });
+        }
     }
 
-    fn local_drafts(&mut self, ui: &mut egui::Ui) {
-        let language = self.preferences.language;
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.weak(language.text(
-                &(format!(
-                    "LOCAL DRAFTS ({}/{})",
-                    self.drafts.len(),
-                    proposals::DRAFT_LIMIT
-                )),
-            ));
-            if ui
-                .add_enabled(
-                    self.drafts.len() < proposals::DRAFT_LIMIT && self.context_error.is_none(),
-                    egui::Button::new(language.text("New local draft")),
-                )
-                .clicked()
-            {
-                self.new_local_draft();
+    fn toggle_assistant(&mut self, context: &egui::Context) {
+        if self.assistant {
+            self.apply_ask_input(self.ask_view().input(ask::Action::Hide), context);
+        } else {
+            self.assistant = true;
+            self.ask_unread = false;
+            self.focus_assistant = true;
+            if self.assistant_detached {
+                context.send_viewport_cmd_to(ask_viewport(), egui::ViewportCommand::Visible(true));
+                context.send_viewport_cmd_to(ask_viewport(), egui::ViewportCommand::Focus);
             }
-        });
-        ui.weak(language.text(
-            "Memory only. Targets are unverified. Nothing is sent, scheduled or created remotely.",
-        ));
-        if let Some(error) = &self.draft_error {
-            ui.label(RichText::new(language.text(error)).strong());
         }
-        let mut discard = None;
-        for (index, draft) in self.drafts.iter_mut().enumerate() {
-            ui.push_id(("local-draft", draft.id), |ui| {
-                egui::CollapsingHeader::new(language.text(&(format!("Local draft {}", index + 1)))).id_salt("editor").open((self.focus_draft == Some(draft.id)).then_some(true)).show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        for (kind, label) in Kind::ALL {
-                            ui.selectable_value(&mut draft.proposal.kind, kind, language.text(label));
-                        }
-                    });
-                    let title = ui.label(language.text("Title"));
-                    let editor = ui.add(egui::TextEdit::singleline(&mut draft.proposal.title).id(draft_editor_id(draft.id, "title")).char_limit(proposals::TITLE_LIMIT).desired_width(f32::INFINITY)).labelled_by(title.id);
-                    if self.focus_draft == Some(draft.id) {
-                        editor.request_focus();
-                        self.focus_draft = None;
-                    }
-                    let target = ui.label(language.text("Proposed target - verify manually"));
-                    ui.add(egui::TextEdit::singleline(&mut draft.proposal.target).id(draft_editor_id(draft.id, "target")).char_limit(proposals::TARGET_LIMIT).desired_width(f32::INFINITY)).labelled_by(target.id);
-                    let body = ui.label(language.text("Draft text / proposed change"));
-                    ui.add(egui::TextEdit::multiline(&mut draft.proposal.body).id(draft_editor_id(draft.id, "body")).char_limit(proposals::BODY_LIMIT).desired_rows(3).desired_width(f32::INFINITY)).labelled_by(body.id);
-                    let validation = draft.proposal.validate();
-                    if let Err(error) = &validation {
-                        ui.label(language.text(error));
-                    }
-                    if draft.needs_review(&self.assistant_revision) {
-                        ui.label(RichText::new(language.text("Meeting changed since this draft was kept; review the target and text.")).strong());
-                        if ui.add_enabled(validation.is_ok(), egui::Button::new(language.text("Mark reviewed locally"))).clicked() {
-                            draft.context_revision = self.assistant_revision.clone();
-                        }
-                    }
-                    ui.weak(language.text("Kept only in this context's memory; cleared on Exit."));
-                    if ui.button(language.text("Discard local draft")).clicked() {
-                        discard = Some(index);
-                    }
-                });
-            });
+    }
+
+    fn apply_ask_input(&mut self, input: ask::Input, context: &egui::Context) {
+        let same_context = input.context_id.as_deref()
+            == self
+                .assistant_context
+                .as_ref()
+                .map(|event| event.id.as_str())
+            && input.revision == self.assistant_revision;
+        if same_context {
+            self.question = input.question;
+            self.ask_cursor = input.cursor;
+            self.ask_menu_dismissed = input.menu_dismissed;
         }
-        if let Some(index) = discard {
-            self.drafts.remove(index);
-            self.draft_error = None;
+        match input.action {
+            ask::Action::Submit if !same_context => {
+                self.ai_error = Some(
+                    "Meeting context changed. Review the question before submitting it.".into(),
+                );
+            }
+            ask::Action::Submit => self.ask_question(),
+            ask::Action::Stop => self.cancel_ai(),
+            ask::Action::Hide => {
+                self.assistant = false;
+                self.focus_assistant = false;
+                self.focus_search = true;
+                context.memory_mut(|memory| memory.surrender_focus(Id::new("assistant-question")));
+                context.send_viewport_cmd_to(ask_viewport(), egui::ViewportCommand::Visible(false));
+            }
+            ask::Action::Detach => {
+                self.assistant_detached = true;
+                self.focus_assistant = true;
+                context.memory_mut(|memory| memory.surrender_focus(Id::new("assistant-question")));
+            }
+            ask::Action::Dock => {
+                self.assistant_detached = false;
+                self.focus_assistant = true;
+                context.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Visible(true),
+                );
+                context.send_viewport_cmd_to(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportCommand::Minimized(false),
+                );
+                context.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+                context.send_viewport_cmd_to(ask_viewport(), egui::ViewportCommand::Visible(false));
+            }
+            ask::Action::UseSelected => {
+                if let Some(event) = self
+                    .selected
+                    .map(|index| self.calendar.events[index].clone())
+                {
+                    self.switch_assistant_context(Some(event));
+                } else {
+                    self.ai_error = Some("Select a meeting first.".into());
+                }
+            }
+            ask::Action::ClearContext => {
+                self.switch_assistant_context(None);
+            }
+            ask::Action::Exit => self.exit(context),
+        }
+        context.request_repaint();
+    }
+
+    fn receive_ask_inputs(&mut self, context: &egui::Context) {
+        for _ in 0..16 {
+            match self.ask_input.try_recv() {
+                Ok(input) => self.apply_ask_input(input, context),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.ai_error = Some("The Ask window is unavailable. Restart Tomlook.".into());
+                    break;
+                }
+            }
+        }
+    }
+
+    fn sync_detached_ask(&mut self, context: &egui::Context) {
+        if !self.assistant_detached {
+            return;
+        }
+        let desired = self.ask_view();
+        let mut shared = match self.detached_ask.try_lock() {
+            Ok(shared) => shared,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                context.request_repaint_after(std::time::Duration::from_millis(16));
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                self.ai_error =
+                    Some("The Ask window state is unavailable. Restart Tomlook.".into());
+                return;
+            }
+        };
+        if let Some(error) = shared.failure.take() {
+            self.ai_error = Some(error.clone());
+            shared.view.error = Some(error);
+            context.request_repaint();
+            context.request_repaint_of(ask_viewport());
+            return;
+        }
+        let answer_changed = match (&shared.view.answer, &desired.answer) {
+            (Some(old), Some(new)) => !Arc::ptr_eq(&old.text, &new.text),
+            (None, None) => false,
+            _ => true,
+        };
+        let context_changed = shared.view.revision != desired.revision
+            || shared.view.context.as_ref().map(|event| event.id.as_str())
+                != desired.context.as_ref().map(|event| event.id.as_str());
+        let changed = shared.synced_question != desired.question
+            || answer_changed
+            || shared.view.error != desired.error
+            || context_changed
+            || shared.view.selected != desired.selected
+            || shared.view.ready != desired.ready
+            || shared.view.busy != desired.busy
+            || shared.view.language != desired.language
+            || shared.view.accent != desired.accent
+            || desired.focus;
+        if shared.synced_question != desired.question || context_changed {
+            shared.view.question = desired.question.clone();
+            shared.synced_question = desired.question;
+            shared.view.cursor = desired.cursor;
+            shared.view.menu_dismissed = desired.menu_dismissed;
+        }
+        shared.view.answer = desired.answer;
+        shared.view.error = desired.error;
+        shared.view.context = desired.context;
+        shared.view.revision = desired.revision;
+        shared.view.selected = desired.selected;
+        shared.view.ready = desired.ready;
+        shared.view.busy = desired.busy;
+        shared.view.language = desired.language;
+        shared.view.accent = desired.accent;
+        shared.view.focus |= desired.focus;
+        self.focus_assistant = false;
+        if changed {
+            context.request_repaint_of(ask_viewport());
         }
     }
 
     fn assistant_panel(&mut self, ui: &mut egui::Ui) {
-        let language = self.preferences.language;
-        if let Some(event) = &self.assistant_context {
-            ui.weak(&event.title);
-        }
-        let shortcut = ui.ctx().memory(|memory| memory.focused() == Some(Id::new("assistant-question")))
-            && ui.input_mut(|input| {
-                let mut submit = false;
-                input.events.retain(|event| {
-                    let take = matches!(event, egui::Event::Key { key: Key::Enter, pressed: true, repeat: false, modifiers, .. }
-                        if !modifiers.shift && !modifiers.alt && !modifiers.mac_cmd);
-                    submit |= take;
-                    !take
-                });
-                submit
-            });
-        let question = ui.add(
-            egui::TextEdit::multiline(&mut self.question)
-                .id(Id::new("assistant-question"))
-                .hint_text(language.text("Ask a question..."))
-                .char_limit(8000)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY),
-        );
-        if self.focus_assistant {
-            question.request_focus();
-            self.focus_assistant = false;
-        }
-        let can_ask = self.ai_ready
-            && !self.question.trim().is_empty()
-            && self.active_request.is_none()
-            && self.context_error.is_none()
-            && self.question.len() <= 8000;
-        if self.question.len() > 8000 {
-            ui.label(language.text("Shorten the question to 8,000 bytes."));
-        }
-        if let Some(error) = &self.context_error {
-            ui.label(RichText::new(language.text(error)).strong());
-        }
-        ui.horizontal(|ui| {
-            let clicked = ui
-                .add_enabled(
-                    can_ask,
-                    egui::Button::new(language.text("Ask")).min_size([72.0, 30.0].into()),
-                )
-                .on_hover_text(language.text("Enter to ask; Shift+Enter for a new line"))
-                .clicked();
-            if (clicked || shortcut) && can_ask {
-                self.ask_question();
-            }
-            if self.active_request.is_some() && ui.button(language.text("Cancel")).clicked() {
-                self.cancel_ai();
-            }
-            if self.active_request.is_some() {
-                ui.spinner();
-                ui.weak(language.text("Thinking..."));
-            }
-        });
-        if let Some(error) = &self.ai_error {
-            ui.label(RichText::new(language.text(error)).strong());
-        }
-        if self.answer.is_some() {
-            ui.add_space(10.0);
-            ui.separator();
-        }
-        let mut keep = None;
-        if let Some(answer) = &self.answer {
-            egui::ScrollArea::vertical()
-                .id_salt("assistant-answer")
-                .max_height(420.0)
-                .show(ui, |ui| answer.markdown.show(ui));
-            if ui.small_button(language.text("Copy answer")).clicked() {
-                ui.ctx().copy_text(answer.text.as_ref().clone());
-            }
-            if answer.evidence.records.is_empty() {
-                ui.weak(language.text("No sources retrieved."));
-            } else {
-                ui.collapsing(
-                    language.text(&(format!("Sources ({})", answer.evidence.records.len()))),
-                    |ui| {
-                        ui.weak(
-                            language.text("Check important claims against the original sources."),
-                        );
-                        if answer.evidence.omitted > 0 {
-                            ui.label(language.text(
-                                &(format!(
-                                    "{} additional results omitted by the memory limit.",
-                                    answer.evidence.omitted
-                                )),
-                            ));
-                        }
-                        for record in &answer.evidence.records {
-                            let label = tomlook::evidence::source_label(
-                                &record.tool,
-                                record.resource.as_deref(),
-                            );
-                            ui.collapsing(
-                                language.text(&(format!("R{}: {label}", record.ordinal))),
-                                |ui| {
-                                    ui.weak(
-                                        language
-                                            .text(&(format!("Observed {}", record.observed_at))),
-                                    );
-                                    ui.label(language.text(if record.succeeded {
-                                        "Retrieved"
-                                    } else {
-                                        "Retrieval failed"
-                                    }));
-                                    if let Some(resource) = &record.resource {
-                                        ui.label(resource);
-                                    }
-                                    if record.truncated {
-                                        ui.weak(language.text(
-                                            "Excerpt truncated; this is not the complete response.",
-                                        ));
-                                    }
-                                    if record.links.is_empty() {
-                                        ui.weak(
-                                            language.text("No structured source URL captured."),
-                                        );
-                                    }
-                                    for link in record
-                                        .links
-                                        .iter()
-                                        .filter(|link| tomlook::evidence::safe_source_url(link))
-                                    {
-                                        ui.hyperlink_to(link, link);
-                                    }
-                                    ui.label(&record.excerpt);
-                                },
-                            );
-                        }
-                    },
-                );
-            }
-        }
-        ui.add_space(6.0);
-        ui.collapsing(language.text("More options"), |ui| {
-            if self.assistant_context.is_some() {
-                if ui.button(language.text("Switch to global question")).clicked() {
-                    self.switch_assistant_context(None);
-                }
-            } else if let Some(index) = self.selected
-                && ui.button(language.text("Use selected meeting")).clicked() {
-                self.switch_assistant_context(Some(self.calendar.events[index].clone()));
-            }
-            ui.checkbox(&mut self.suggest_drafts, language.text("Suggest drafts"));
-            if let Some(answer) = &self.answer {
-                for (index, proposal) in answer.proposals.iter().enumerate() {
-                    ui.push_id(("proposal", index), |ui| {
-                        ui.collapsing(language.text(&(format!("Proposed {}: {}", proposal.kind.label(), proposal.title))), |ui| {
-                            ui.weak(language.text("Model suggestion, not verified or approved. Keeping it has no remote effect."));
-                            ui.label(language.text(&(format!("Proposed target: {}", proposal.target))));
-                            ui.label(&proposal.body);
-                            if ui.add_enabled(self.context_error.is_none(), egui::Button::new(language.text("Keep local draft"))).clicked() {
-                                keep = Some(proposal.clone());
-                            }
-                        });
-                    });
-                }
-            }
-            self.local_drafts(ui);
-        });
-        if let Some(proposal) = keep {
-            self.keep_local_proposal(proposal);
+        let mut view = self.ask_view();
+        let action = ask::draw(ui, &mut view, false);
+        self.question = view.question.clone();
+        self.ask_cursor = view.cursor;
+        self.ask_menu_dismissed = view.menu_dismissed;
+        self.focus_assistant = view.focus;
+        self.ask_unread = false;
+        if let Some(action) = action {
+            self.apply_ask_input(view.input(action), ui.ctx());
         }
     }
 
     fn assistant_dialog(&mut self, context: &egui::Context) {
-        if !self.assistant {
+        if !self.assistant || !self.assistant_detached {
             return;
         }
-        let mut open = true;
-        egui::Window::new(self.preferences.language.text("Ask AI"))
-            .id(Id::new("assistant-dialog"))
-            .open(&mut open)
-            .collapsible(false)
-            .default_width(640.0)
-            .min_width(340.0)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(context, |ui| self.assistant_panel(ui));
-        if !open {
-            self.assistant = false;
-            self.cancel_ai();
-            self.focus_search = true;
+        self.sync_detached_ask(context);
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(format!(
+                "Tomlook — {}",
+                self.preferences.language.text("Ask AI")
+            ))
+            .with_taskbar(true)
+            .with_inner_size([560.0, 740.0])
+            .with_min_inner_size([340.0, 420.0]);
+        if let Ok(shared) = self.detached_ask.try_lock() {
+            builder = builder.with_inner_size(shared.view.size);
+            if let Some(position) = shared.view.position {
+                builder = builder.with_position(position);
+            }
         }
+        let shared = self.detached_ask.clone();
+        let output = self.ask_output.clone();
+        let language = self.preferences.language;
+        context.show_viewport_deferred(ask_viewport(), builder, move |ui, class| {
+            let mut shared = match shared.try_lock() {
+                Ok(shared) => shared,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    ui.label(language.text("Ask is updating..."));
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(16));
+                    return;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    ui.label(
+                        language.text("The Ask window state is unavailable. Restart Tomlook."),
+                    );
+                    return;
+                }
+            };
+            let action = if class == egui::ViewportClass::EmbeddedWindow {
+                shared.failure = Some(
+                    "Separate Ask windows are not supported by this renderer. Ask remains docked."
+                        .into(),
+                );
+                Some(ask::Action::Dock)
+            } else {
+                let viewport = ui.ctx().input(|input| input.viewport().clone());
+                if let Some(rect) = viewport.outer_rect {
+                    shared.view.position = Some(rect.min);
+                }
+                if let Some(rect) = viewport.inner_rect {
+                    shared.view.size = rect.size();
+                }
+                if viewport.close_requested() {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    Some(ask::Action::Hide)
+                } else {
+                    egui::CentralPanel::default()
+                        .show(ui, |ui| ask::draw(ui, &mut shared.view, true))
+                        .inner
+                }
+            };
+            if let Some(action) = action {
+                match output.try_send(shared.view.input(action)) {
+                    Ok(()) => {
+                        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                    }
+                    Err(error) => {
+                        let message = match error {
+                            mpsc::TrySendError::Full(_) => {
+                                "The Ask action queue is full. Nothing was submitted; try again."
+                            }
+                            mpsc::TrySendError::Disconnected(_) => {
+                                "The Ask window is unavailable. Restart Tomlook."
+                            }
+                        };
+                        shared.failure = Some(message.into());
+                        shared.view.error = Some(message.into());
+                        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                    }
+                }
+            }
+        });
     }
 
     fn visible_workiq_range(&self) -> Result<tomlook::workiq::connection::Range, String> {
@@ -4470,6 +4515,9 @@ impl Tomlook {
 
 impl eframe::App for Tomlook {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.receive();
+        self.receive_ask_inputs(context);
+        self.sync_detached_ask(context);
         if let Some(trace) = &self.startup
             && trace.idle
         {
@@ -4568,11 +4616,9 @@ impl eframe::App for Tomlook {
             {
                 context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                self.cancel_ai();
             } else if viewport.minimized == Some(true) && !self.in_tray {
                 self.in_tray = true;
                 context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                self.cancel_ai();
             } else if viewport.minimized == Some(false) {
                 self.in_tray = false;
             }
@@ -4582,7 +4628,6 @@ impl eframe::App for Tomlook {
         {
             self.error = Some(error);
         }
-        self.receive();
         if self.preview && self.demo_screenshot.is_some() {
             if self.screenshot_requested {
                 let image = context.input(|input| {
@@ -4712,7 +4757,13 @@ impl eframe::App for Tomlook {
                     .auto_shrink([false, false])
                     .show(ui, |ui| self.sidebar(ui));
             });
-        if let Some(event) = self.selected.map(|i| self.calendar.events[i].clone()) {
+        if self.assistant && !self.assistant_detached {
+            egui::Panel::right("ask-panel")
+                .default_size(520.0)
+                .size_range(340.0..=680.0)
+                .resizable(true)
+                .show(ui, |ui| self.assistant_panel(ui));
+        } else if let Some(event) = self.selected.map(|i| self.calendar.events[i].clone()) {
             egui::Panel::right("meeting-details")
                 .default_size(345.0)
                 .size_range(285.0..=500.0)
@@ -4917,6 +4968,7 @@ impl Tomlook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tomlook::proposals::{Kind, Proposal};
 
     #[test]
     fn recommendation_cards_separate_action_meeting_reason_and_adjacent_travel_sides() {
@@ -5656,7 +5708,7 @@ mod tests {
             app.question.clear();
             app.messages_open = true;
             app.prepare_follow_up(&recommendation);
-            assert!(app.assistant && app.suggest_drafts && app.focus_assistant);
+            assert!(app.assistant && app.focus_assistant);
             assert!(!app.messages_open);
             assert_eq!(
                 app.assistant_context.as_ref().unwrap().id,
@@ -6351,6 +6403,7 @@ mod tests {
             start: Local::now().fixed_offset(),
             foreground: false,
             manual: false,
+            review: None,
             on_demand: false,
             promotion: 0,
             verified: true,
@@ -6944,92 +6997,6 @@ mod tests {
     }
 
     #[test]
-    fn draft_editors_keep_typing_and_cursor_keys_out_of_calendar_navigation() {
-        for field in ["title", "target", "body"] {
-            let (mut app, _, mut commands) = assistant_fixture();
-            app.keep_local_proposal(fixture_proposal("Fixture draft"));
-            app.assistant = true;
-            app.anchor = NaiveDate::from_ymd_opt(2026, 9, 7).unwrap();
-            let anchor = app.anchor;
-            let view = app.preferences.view;
-            let id = draft_editor_id(app.drafts[0].id, field);
-            let context = egui::Context::default();
-            for frame in 0..16 {
-                let mut output = context.run_ui(
-                    egui::RawInput {
-                        time: Some(f64::from(frame) * 0.1),
-                        ..Default::default()
-                    },
-                    |ui| app.local_drafts(ui),
-                );
-                output.textures_delta.clear();
-            }
-            assert!(app.focus_draft.is_none());
-            assert_eq!(
-                context.memory(|memory| memory.focused()),
-                Some(draft_editor_id(app.drafts[0].id, "title"))
-            );
-            context.memory_mut(|memory| memory.request_focus(id));
-            let input = egui::RawInput {
-                time: Some(2.0),
-                events: vec![
-                    egui::Event::Key {
-                        key: Key::Num1,
-                        physical_key: None,
-                        pressed: true,
-                        repeat: false,
-                        modifiers: Modifiers::NONE,
-                    },
-                    egui::Event::Key {
-                        key: Key::T,
-                        physical_key: None,
-                        pressed: true,
-                        repeat: false,
-                        modifiers: Modifiers::NONE,
-                    },
-                    egui::Event::Text("1t".into()),
-                    egui::Event::Key {
-                        key: Key::ArrowDown,
-                        physical_key: None,
-                        pressed: true,
-                        repeat: false,
-                        modifiers: Modifiers::NONE,
-                    },
-                    egui::Event::Key {
-                        key: Key::ArrowLeft,
-                        physical_key: None,
-                        pressed: true,
-                        repeat: false,
-                        modifiers: Modifiers::ALT,
-                    },
-                ],
-                ..Default::default()
-            };
-            let mut output = context.run_ui(input, |ui| {
-                app.shortcuts(ui.ctx());
-                app.local_drafts(ui);
-            });
-            output.textures_delta.clear();
-            assert_eq!(
-                app.preferences.view, view,
-                "{field} changed the calendar view"
-            );
-            assert_eq!(app.anchor, anchor, "{field} navigated away from the period");
-            assert!(app.selected.is_none());
-            let value = match field {
-                "title" => &app.drafts[0].proposal.title,
-                "target" => &app.drafts[0].proposal.target,
-                _ => &app.drafts[0].proposal.body,
-            };
-            assert!(
-                value.contains("1t"),
-                "{field} did not receive ordinary text input"
-            );
-            assert!(commands.try_recv().is_err());
-        }
-    }
-
-    #[test]
     fn calendar_keyboard_commands_still_work_when_a_non_editor_control_has_focus() {
         let (mut app, _, _) = assistant_fixture();
         let context = egui::Context::default();
@@ -7059,65 +7026,6 @@ mod tests {
     }
 
     #[test]
-    fn local_drafts_are_bounded_deduplicated_and_never_dispatch_ai_or_storage_commands() {
-        let (mut app, _, mut input) = assistant_fixture();
-        app.keep_local_proposal(fixture_proposal("Fixture draft"));
-        app.keep_local_proposal(fixture_proposal("Fixture draft"));
-        assert_eq!(app.drafts.len(), 1);
-        assert!(app.draft_error.as_ref().unwrap().contains("duplicated"));
-        for index in 1..proposals::DRAFT_LIMIT {
-            app.keep_local_proposal(fixture_proposal(&format!("Fixture {index}")));
-        }
-        app.new_local_draft();
-        app.keep_local_proposal(fixture_proposal("Overflow"));
-        assert_eq!(app.drafts.len(), proposals::DRAFT_LIMIT);
-        assert!(app.draft_error.as_ref().unwrap().contains("Eight"));
-        assert!(input.try_recv().is_err());
-        assert!(app.worker.is_none());
-        assert!(app.active_request.is_none());
-    }
-
-    #[test]
-    fn drafts_and_suggestion_preferences_stay_scoped_and_changed_meetings_require_review() {
-        let (mut app, _, mut input) = assistant_fixture();
-        app.suggest_drafts = true;
-        app.keep_local_proposal(fixture_proposal("Global draft"));
-        let mut meeting = tomlook::calendar::demo(Local::now(), 1).remove(0);
-        app.switch_assistant_context(Some(meeting.clone()));
-        assert!(app.drafts.is_empty());
-        assert!(!app.suggest_drafts);
-        app.keep_local_proposal(fixture_proposal("Meeting draft"));
-        assert!(!app.drafts[0].needs_review(&app.assistant_revision));
-        meeting.title = "Changed fixture meeting".into();
-        app.switch_assistant_context(Some(meeting.clone()));
-        assert_eq!(app.drafts.len(), 1);
-        assert!(app.drafts[0].needs_review(&app.assistant_revision));
-        app.switch_assistant_context(None);
-        assert!(app.suggest_drafts);
-        assert_eq!(app.drafts[0].proposal.title, "Global draft");
-        app.switch_assistant_context(Some(meeting));
-        assert_eq!(app.drafts[0].proposal.title, "Meeting draft");
-        assert!(app.drafts[0].needs_review(&app.assistant_revision));
-        assert!(input.try_recv().is_err());
-    }
-
-    #[test]
-    fn asking_again_preserves_kept_drafts_and_freezes_the_suggestion_mode() {
-        let (mut app, _, mut input) = assistant_fixture();
-        app.keep_local_proposal(fixture_proposal("Keep across questions"));
-        app.suggest_drafts = true;
-        app.question = "Suggest a fixture follow-up".into();
-        app.ask_question();
-        let ai::Command::Ask(question) = input.try_recv().unwrap() else {
-            panic!("Question was not admitted")
-        };
-        assert!(question.suggest_drafts);
-        assert_eq!(app.drafts.len(), 1);
-        app.suggest_drafts = false;
-        assert!(question.suggest_drafts);
-    }
-
-    #[test]
     fn invalid_typed_proposals_do_not_reach_the_native_panel() {
         let (mut app, output, _) = assistant_fixture();
         let mut answer = fixture_answer("Fixture");
@@ -7132,57 +7040,6 @@ mod tests {
         app.receive();
         assert!(app.answer.is_none());
         assert!(app.ai_error.as_ref().unwrap().contains("Title"));
-    }
-
-    #[test]
-    fn model_proposals_need_explicit_local_keep_and_context_warnings_block_admission() {
-        let (mut app, output, mut input) = assistant_fixture();
-        let mut answer = fixture_answer("Nothing has been sent");
-        answer.proposals = Arc::new(vec![fixture_proposal("Candidate")]);
-        app.active_request = Some(10);
-        output
-            .send(ai::Notice::Answer {
-                id: 10,
-                result: Ok(answer),
-            })
-            .unwrap();
-        app.receive();
-        assert!(app.drafts.is_empty());
-        let proposal = app.answer.as_ref().unwrap().proposals[0].clone();
-        app.context_error = Some("Requested context could not be admitted".into());
-        app.keep_local_proposal(proposal.clone());
-        app.new_local_draft();
-        assert!(app.drafts.is_empty());
-        assert!(
-            app.draft_error
-                .as_ref()
-                .unwrap()
-                .contains("context warning")
-        );
-        app.context_error = None;
-        app.keep_local_proposal(proposal);
-        assert_eq!(app.drafts.len(), 1);
-        assert!(input.try_recv().is_err());
-    }
-
-    #[test]
-    fn draft_editor_identities_survive_removal_and_cannot_collide_across_contexts() {
-        let (mut app, _, _) = assistant_fixture();
-        app.new_local_draft();
-        app.new_local_draft();
-        let retained_id = app.drafts[1].id;
-        app.drafts.remove(0);
-        app.new_local_draft();
-        assert_eq!(app.drafts[0].id, retained_id);
-        assert!(app.drafts[1].id > retained_id);
-        let last_global_id = app.drafts[1].id;
-        app.switch_assistant_context(Some(tomlook::calendar::demo(Local::now(), 1).remove(0)));
-        app.new_local_draft();
-        assert!(app.drafts[0].id > last_global_id);
-        app.draft_id = u64::MAX;
-        app.new_local_draft();
-        assert_eq!(app.drafts.len(), 1);
-        assert!(app.draft_error.as_ref().unwrap().contains("identity limit"));
     }
 
     fn fixture_answer(text: impl Into<String>) -> ai::Answer {
@@ -7229,6 +7086,9 @@ mod tests {
         let ai::Command::Ask(question) = input.try_recv().unwrap() else {
             panic!("Question not admitted")
         };
+        assert!(!app.switch_assistant_context(Some(meeting.clone())));
+        app.cancel_ai();
+        assert!(matches!(input.try_recv(), Ok(ai::Command::Cancel(id)) if id == question.id));
         assert!(app.switch_assistant_context(Some(meeting.clone())));
         output
             .send(ai::Notice::Answer {
@@ -7341,6 +7201,43 @@ mod tests {
         let mut app = Tomlook::initial(None, Some(engine), None);
         app.ai_ready = true;
         (app, notices, input)
+    }
+
+    #[test]
+    fn review_slashes_enqueue_typed_background_work_without_an_ask_or_calendar_write() {
+        use tomlook::recommendations::Review;
+        let (mut app, _, mut ai_commands) = assistant_fixture();
+        let (commands, worker_commands) = mpsc::sync_channel(1);
+        app.worker = Some(Worker {
+            commands,
+            notices: Arc::new(Default::default()),
+            activity: Arc::new(std::sync::Mutex::new(Arc::new(Default::default()))),
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done: None,
+        });
+        app.calendar_owner = Some("owner".into());
+        for (question, expected) in [
+            ("/travel", Review::Travel),
+            ("/categories", Review::Categories),
+        ] {
+            app.question = question.into();
+            app.ask_question();
+            let Command::ReviewRecommendations { kind, account } =
+                worker_commands.try_recv().unwrap()
+            else {
+                panic!("Review did not enter the storage queue");
+            };
+            assert_eq!(kind, expected);
+            assert_eq!(account, "owner");
+            assert!(app.active_request.is_none());
+            assert!(app.answer.as_ref().unwrap().text.contains("14"));
+            assert!(ai_commands.try_recv().is_err());
+        }
+        app.question = "/travel".into();
+        app.ask_question();
+        app.ask_question();
+        assert!(app.ai_error.as_ref().unwrap().contains("queue is full"));
+        assert!(ai_commands.try_recv().is_err());
     }
 
     #[test]
@@ -7634,7 +7531,9 @@ mod tests {
         assert_ne!(app.anchor, tomlook::calendar::fixture_anchor());
         draw(&mut app, vec![key(Key::Escape, Modifiers::NONE)]);
         assert!(!app.assistant);
-        assert!(app.active_request.is_none());
+        assert_eq!(app.active_request, Some(7));
+        assert!(commands.try_recv().is_err());
+        app.cancel_ai();
         assert!(matches!(commands.try_recv(), Ok(ai::Command::Cancel(7))));
         assert!(commands.try_recv().is_err());
         assert_eq!(app.calendar.events.len(), 5000);
@@ -7723,7 +7622,7 @@ mod tests {
     }
 
     #[test]
-    fn switched_context_cancels_its_request_and_cannot_receive_its_late_answer() {
+    fn busy_context_is_frozen_and_its_answer_stays_in_its_original_scope() {
         let (mut app, output, mut input) = assistant_fixture();
         app.question = "Global question".into();
         app.ask_question();
@@ -7731,8 +7630,10 @@ mod tests {
             panic!("question was not admitted");
         };
         let meeting = tomlook::calendar::demo(Local::now(), 1).remove(0);
-        assert!(app.switch_assistant_context(Some(meeting)));
-        assert!(matches!(input.try_recv().unwrap(), ai::Command::Cancel(id) if id == question.id));
+        assert!(!app.switch_assistant_context(Some(meeting.clone())));
+        assert!(input.try_recv().is_err());
+        assert!(app.assistant_context.is_none());
+        assert_eq!(app.active_request, Some(question.id));
         output
             .send(ai::Notice::Answer {
                 id: question.id,
@@ -7740,17 +7641,155 @@ mod tests {
             })
             .unwrap();
         app.receive();
-        assert!(app.answer.is_none());
+        assert_eq!(
+            app.answer.as_ref().unwrap().text.as_str(),
+            "Late global answer"
+        );
         assert!(app.active_request.is_none());
+        assert!(app.switch_assistant_context(Some(meeting)));
+        assert!(app.answer.is_none());
         assert!(app.switch_assistant_context(None));
         assert_eq!(app.question, "Global question");
-        assert!(app.answer.is_none());
-        assert!(
-            app.ai_error
-                .as_ref()
-                .unwrap()
-                .contains("Cancellation requested")
+        assert_eq!(
+            app.answer.as_ref().unwrap().text.as_str(),
+            "Late global answer"
         );
+    }
+
+    #[test]
+    fn ask_presentation_changes_keep_one_request_and_hidden_completion() {
+        let (mut app, notices, mut commands) = assistant_fixture();
+        let context = egui::Context::default();
+        app.assistant = true;
+        app.question = "/today".into();
+        app.ask_question();
+        let ai::Command::Ask(question) = commands.try_recv().unwrap() else {
+            panic!("Question not admitted");
+        };
+        assert!(!question.suggest_drafts);
+        assert!(!question.question.starts_with('/'));
+        for action in [ask::Action::Detach, ask::Action::Dock, ask::Action::Hide] {
+            app.apply_ask_input(app.ask_view().input(action), &context);
+            assert_eq!(app.active_request, Some(question.id));
+            assert_eq!(app.question, "/today");
+            assert!(commands.try_recv().is_err());
+        }
+        notices
+            .send(ai::Notice::Answer {
+                id: question.id + 1,
+                result: Ok(fixture_answer("Stale result")),
+            })
+            .unwrap();
+        app.receive();
+        assert!(!app.ask_unread);
+        notices
+            .send(ai::Notice::Answer {
+                id: question.id,
+                result: Ok(fixture_answer("Finished while hidden")),
+            })
+            .unwrap();
+        app.receive();
+        assert!(app.ask_unread);
+        assert!(!app.messages_open);
+        app.toggle_assistant(&context);
+        assert!(!app.ask_unread);
+        assert_eq!(
+            app.answer.as_ref().unwrap().text.as_str(),
+            "Finished while hidden"
+        );
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn detached_edits_survive_parent_updates_and_transfer_on_docking() {
+        let (mut app, notices, mut commands) = assistant_fixture();
+        let context = egui::Context::default();
+        app.assistant = true;
+        app.assistant_detached = true;
+        app.question = "Original question".into();
+        app.sync_detached_ask(&context);
+        app.detached_ask.lock().unwrap().view.question = "Edited in the native window".into();
+        notices
+            .send(ai::Notice::Sources("Unrelated background update".into()))
+            .unwrap();
+        app.receive();
+        app.sync_detached_ask(&context);
+        let input = app
+            .detached_ask
+            .lock()
+            .unwrap()
+            .view
+            .input(ask::Action::Dock);
+        assert_eq!(input.question, "Edited in the native window");
+        app.ask_output.try_send(input).unwrap();
+        app.receive_ask_inputs(&context);
+        assert!(!app.assistant_detached);
+        assert_eq!(app.question, "Edited in the native window");
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn calendar_selection_does_not_retarget_an_active_contextual_question() {
+        let (mut app, _, mut commands) = assistant_fixture();
+        app.calendar = Arc::new(
+            Calendar::build(tomlook::calendar::fixture(2), Default::default(), vec![]).unwrap(),
+        );
+        let original = app.calendar.events[0].clone();
+        assert!(app.switch_assistant_context(Some(original.clone())));
+        app.question = "/prepare".into();
+        app.ask_question();
+        let ai::Command::Ask(question) = commands.try_recv().unwrap() else {
+            panic!("Question not admitted");
+        };
+        app.select(1);
+        assert_eq!(app.assistant_context.as_ref().unwrap().id, original.id);
+        assert_eq!(question.meeting.as_ref().unwrap().id, original.id);
+        assert_eq!(app.active_request, Some(question.id));
+        assert!(commands.try_recv().is_err());
+        app.apply_ask_input(
+            app.ask_view().input(ask::Action::Stop),
+            &egui::Context::default(),
+        );
+        assert!(matches!(commands.try_recv(), Ok(ai::Command::Cancel(id)) if id == question.id));
+        assert!(app.active_request.is_none());
+    }
+
+    #[test]
+    fn detached_submission_rejects_a_changed_meeting_snapshot() {
+        let (mut app, _, mut commands) = assistant_fixture();
+        let mut event = tomlook::calendar::fixture(1).remove(0);
+        app.switch_assistant_context(Some(event.clone()));
+        app.question = "Review this meeting".into();
+        let stale = app.ask_view().input(ask::Action::Submit);
+        event.title.push_str(" changed");
+        app.switch_assistant_context(Some(event));
+        app.apply_ask_input(stale, &egui::Context::default());
+        assert!(commands.try_recv().is_err());
+        assert!(app.ai_error.as_ref().unwrap().contains("context changed"));
+    }
+
+    #[test]
+    fn detached_scope_changes_save_unsent_edits_and_do_not_leak_between_empty_contexts() {
+        let (mut app, _, mut commands) = assistant_fixture();
+        let context = egui::Context::default();
+        app.assistant_detached = true;
+        app.sync_detached_ask(&context);
+        app.detached_ask.lock().unwrap().view.question = "Unsent global question".into();
+        let event = tomlook::calendar::fixture(1).remove(0);
+        assert!(app.switch_assistant_context(Some(event)));
+        app.sync_detached_ask(&context);
+        assert!(app.detached_ask.lock().unwrap().view.question.is_empty());
+        assert_eq!(
+            app.assistant_states[&None].question,
+            "Unsent global question"
+        );
+        assert!(app.switch_assistant_context(None));
+        app.sync_detached_ask(&context);
+        assert_eq!(
+            app.detached_ask.lock().unwrap().view.question,
+            "Unsent global question"
+        );
+        assert!(commands.try_recv().is_err());
     }
 
     #[test]
@@ -7897,7 +7936,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_question_popup_renders_markdown_and_hides_drafts_by_default() {
+    fn simple_question_panel_renders_markdown_without_concept_controls() {
         for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
             let (mut app, _, mut commands) = assistant_fixture();
             app.preferences.language = language;
@@ -7906,7 +7945,6 @@ mod tests {
             app.answer = Some(fixture_answer(
                 "# Overview\n\n**Important** and *useful*.\n\n- First step\n- Second step\n\n[Source](https://example.com)\n\n```text\nsample code\n```",
             ));
-            app.push_local_draft(fixture_proposal("Preserved hidden draft"));
             let context = egui::Context::default();
             let mut rendered = String::new();
             let mut heading_size = 0.0_f32;
@@ -7920,7 +7958,7 @@ mod tests {
                         )),
                         ..Default::default()
                     },
-                    |ui| app.assistant_dialog(ui.ctx()),
+                    |ui| app.assistant_panel(ui),
                 );
                 for shape in &output.shapes {
                     append_shape_text(&shape.shape, &mut rendered);
@@ -7950,12 +7988,14 @@ mod tests {
                 !rendered.contains(language.text("New local draft").as_ref()),
                 "{rendered}"
             );
-            assert!(!rendered.contains("Preserved hidden draft"), "{rendered}");
+            assert!(
+                !rendered.contains(language.text("More options").as_ref()),
+                "{rendered}"
+            );
             assert!(heading_size > body_size && body_size > 0.0);
-            assert_eq!(app.drafts.len(), 1);
             assert!(
                 commands.try_recv().is_err(),
-                "Opening the popup must not ask AI"
+                "Opening the panel must not ask AI"
             );
             assert_eq!(
                 context.memory(|memory| memory.focused()),
@@ -7965,7 +8005,7 @@ mod tests {
     }
 
     #[test]
-    fn waiting_popup_does_not_expose_raw_partial_markdown_or_block_on_progress() {
+    fn waiting_panel_does_not_expose_raw_partial_markdown_or_block_on_progress() {
         let (mut app, _, mut commands) = assistant_fixture();
         app.assistant = true;
         app.active_request = Some(7);
@@ -7976,9 +8016,8 @@ mod tests {
         let context = egui::Context::default();
         let mut rendered = String::new();
         for _ in 0..3 {
-            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-                app.assistant_dialog(ui.ctx())
-            });
+            let mut output =
+                context.run_ui(egui::RawInput::default(), |ui| app.assistant_panel(ui));
             for shape in &output.shapes {
                 append_shape_text(&shape.shape, &mut rendered);
             }
@@ -7996,6 +8035,7 @@ mod tests {
         let context = egui::Context::default();
         app.assistant = true;
         app.focus_assistant = true;
+        app.question = "Saved ordinary question".into();
         let mut output = context.run_ui(egui::RawInput::default(), |ui| {
             app.assistant_panel(ui);
         });

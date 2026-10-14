@@ -9,6 +9,29 @@ const POLICY_REVISION: u8 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
+pub enum Review {
+    Travel,
+    Categories,
+}
+
+impl Review {
+    pub fn includes(self, kind: Kind) -> bool {
+        match self {
+            Self::Travel => kind.is_travel(),
+            Self::Categories => kind == Kind::Category,
+        }
+    }
+
+    pub fn eligible(self, event: &Event) -> bool {
+        !event.unconfirmed()
+            && !cancelled(event)
+            && !logistics_buffer(event)
+            && (self != Self::Travel || !event.is_all_day)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
 pub enum Kind {
     Category,
     Preparation,

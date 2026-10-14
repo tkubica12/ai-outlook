@@ -197,19 +197,44 @@ ownership is labeled as such. No outreach is submitted.
 message templates. New UI literals must enter that catalog; coverage, uniqueness,
 dates, templates and persisted preferences have regression checks.
 EN/CZ is a direct header control, not a settings dialog. Calendar view changes
-and language switching never submit research. Switching invalidates old-language
-assistant answers and cancels an in-flight question; unsent text and local drafts
-are preserved. Future questions and draft suggestions use the selected language.
+and language switching never submit research. Switching language preserves the
+current question and answer, including a running request. Future questions use
+the selected language.
 Original user/source text and raw external technical diagnostics remain original.
-**Ask** and **Ctrl+Space** open a focused question-and-answer popup rather than
-shrinking the calendar into a side panel. Enter asks; Shift+Enter adds a line.
+**Ask** and **Ctrl+Space** open a resizable right-side question-and-answer panel,
+sharing the meeting-detail slot rather than adding a second sidebar.
+**Detach Ask** opens a real, movable native window with its own taskbar entry;
+**Dock Ask** returns it to the calendar. Both views share one request and retain
+the question, answer and explicit meeting context. Enter asks; Shift+Enter adds
+a line. Hide, native-window Close, and Ctrl+Space only hide Ask, never cancel it.
+Escape first dismisses visible command suggestions, then hides the panel.
+**Stop** explicitly requests cancellation. A quiet Ask status in the main header
+shows a running question or an unread completed result, independently of the
+recommendation bell.
 Answers render CommonMark headings, emphasis, lists, code, tables and safe
 HTTP(S) links. Parsing happens once on the AI executor; the UI shares the prepared
 document. Images are not fetched and HTML is never executed. While waiting,
 only a compact progress indicator is shown, not raw unfinished Markdown.
 Copy and expandable source evidence remain available with the final answer.
-Local draft controls and optional suggestion mode live under **More options**;
-ordinary questions do not request drafts, send messages or change the calendar.
+There are no local-concept controls or **More options**. Seven local shortcuts
+appear below the composer: `/today`, `/week`, `/prepare`, `/conflicts`, `/find`,
+`/travel`, `/categories`.
+Typing filters their names/descriptions; Up/Down selects, Tab completes, and
+clicking anywhere on a row completes it. Completion never submits a model call.
+`/prepare` requires an explicit meeting context; `/find` requires search text.
+`/travel` and `/categories` take no arguments and check the next rolling 14 days,
+independently of the selected meeting. They reuse the asynchronous Insights
+worker and durable bounded queue, including its single background slot, verified
+calendar coverage, account binding, daily budget and retry safeguards.
+Travel reviews publish only before/after travel proposals; category reviews
+publish only category proposals. Existing unrelated recommendations remain
+untouched, duplicate requests share running research, and saved skips remain
+respected. Results appear in the recommendation bell and still require approval
+before a calendar write. The two checks can also run when automatic preparation
+is paused; ordinary questions retain their separate interactive slot.
+Selecting a different calendar meeting never retargets Ask. Context changes are
+blocked while a question runs; changing the underlying meeting or account still
+invalidates stale output. Questions do not send messages or change the calendar.
 App-owned recovery, connector and index status messages are translated, including
 all-day card labels and their accessibility names. Unconfirmed all-day meetings
 keep the all-day label rather than showing a misleading midnight time.
@@ -265,8 +290,8 @@ localized in EN/CZ. The category arrow is drawn natively, not a font-dependent g
 Conflict cards use current confirmed counterparts and local overlap times rather
 than model-written UTC prose. Upcoming suggestions
 cover fourteen days; follow-up cards activate after the source meeting ends.
-**Draft follow-up** opens the existing assistant with a localized draft request
-and **Suggest drafts** enabled. It preserves an existing unsent question, does
+**Draft follow-up** opens Ask with a localized request for follow-up text.
+It preserves an existing unsent question, does
 not submit research automatically, and never sends mail. Unknown decisions,
 owners and dates must remain placeholders until evidence establishes them.
 Skip atomically saves a separate account/meeting/action/category intent key, independent
@@ -472,7 +497,7 @@ authentication credential): refreshes preserve other cached dates for the same
 account, and the first successful refresh for a different account replaces the
 old account's cache. Disconnect and Exit retain calendar data.
 Disconnect or a lost WorkIQ connection invalidates cached AI answers across
-contexts; local questions and local drafts remain available.
+contexts; unsent questions remain available.
 Reads cover at most 42 local days, 128 requests, 5,000 unique events and a
 16 MiB normalized snapshot, with a two-minute operation deadline. Meetings
 support up to 500 attendees. WorkIQ blocks Graph pagination tokens, so the
@@ -942,7 +967,7 @@ production `x-apikey` header on every WebIQ request. The observed live failure
 occurred during the verification read, after discovery; these diagnostic
 changes do not establish its cause or prove a successful owner connection.
 Saved assistant answers are invalidated when connections change or are removed;
-unsent questions and local drafts are retained. Token and device-flow lifetimes
+unsent questions are retained. Token and device-flow lifetimes
 are measured from receipt, not extended by subsequent account/browser checks.
 Cancellation is retained even after the AI task finishes but before its result
 is published. Both questions and Insights recheck the active request,
@@ -983,7 +1008,8 @@ executor, two request slots, bounded command channels and coalesced notices and
 streaming. Calendar navigation does not wait for a model or briefing.
 Ctrl+Space opens the assistant, Enter submits a question from its editor,
 Shift+Enter inserts a newline, Ctrl+Shift+P opens searchable commands,
-and Escape closes it and requests cancellation. Global questions and captured
+and Escape dismisses command suggestions or hides it without cancellation.
+Only **Stop** requests cancellation. Global questions and captured
 meeting context are separate; changing a meeting invalidates its old answer.
 Draft questions and last answers are retained separately
 for up to 32 contexts in memory. Configured WebIQ and WorkIQ tools are offered
@@ -1003,31 +1029,17 @@ identities cannot collide with preparation, and an unadmitted question
 preserves the previous answer. Cancellation reports an uncertain provider
 outcome rather than claiming the operation definitely stopped.
 
-**Local drafts** work without connecting AI. Add an editable task note, email
-draft or calendar suggestion with a proposed target, title and body. These are
-plain local data: no send, schedule, remote draft, CRM record or execution path
-exists. Targets remain unverified. Keep at most eight drafts per assistant
-context in memory; new questions do not erase them, and Exit clears them.
-If the meeting snapshot changes, existing drafts remain available but are
-flagged for explicit local review. A refused context blocks draft admission.
-Title/target/body limits are 200/512/4,000 UTF-8 bytes; invalid edits are
-identified inline. Discard removes only the selected in-memory draft.
-Draft editors retain ordinary typing and cursor/navigation keys rather than
-triggering calendar view/period/meeting shortcuts. Global panel/search commands
-and Escape remain available; calendar keyboard commands still work when a
-non-editor control has focus. New or explicitly kept drafts open their editor
-and focus the title; switching context clears an outstanding editor-focus request.
-
-Opt into **Suggest local drafts with the next answer** to request a typed
-response containing an answer and up to four `task`, `email` or `calendar`
-proposals. Strict decoding and validation run on the SDK worker; unknown fields,
-action kinds, approval flags, oversized fields and malformed responses fail
-visibly rather than becoming an action. Known app credentials are masked and
-post-redaction sizes are rechecked. Structured JSON is not streamed into the
-panel. Candidate proposals share the answer's context/stale-result guards and
-become editable drafts only after **Keep local draft**. This opt-in is scoped to
-the current context and does not change ordinary answers or preparation.
-Local review is not permission for a future remote write.
+Ask contains only questions, formatted answers and expandable retrieved sources.
+The former local draft editor and optional typed-proposal mode are not exposed.
+Question shortcuts expand into read-only questions immediately before admission,
+with the same UTF-8 size limits and single-flight guards as ordinary questions.
+The two ad-hoc review commands instead enqueue typed background work; they never
+ask the model to execute a slash string or expose calendar-mutation tools.
+The separate window uses a deferred viewport: typing repaints that window, not
+the calendar. Its bounded action channel and shared view use nonblocking access;
+final notices update the answer even when the main window is hidden. Ask uses a
+static waiting label, not a continuously animated calendar repaint, and unused
+partial Markdown updates no longer wake the root viewport.
 
 Use `connections.example.json` as a schema example, replace the placeholder
 runtime/endpoints, and save an app-owned `connections.json` in the `--state`

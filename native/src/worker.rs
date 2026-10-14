@@ -58,6 +58,10 @@ pub enum Command {
     },
     Promote(String),
     PrepareNow(String),
+    ReviewRecommendations {
+        kind: crate::recommendations::Review,
+        account: String,
+    },
     Retry(String),
     TogglePause,
     EnablePreparation(bool),
@@ -769,8 +773,14 @@ impl Worker {
                         }
                             .map_err(|_| "Encode context identity failed")?;
                         let revision = format!("{:x}", Sha256::digest(binding));
+                        let reviewing = queue.jobs.values().any(|job| job.review.is_some());
                         match queue.set_analysis_revision(&revision) {
-                            Ok(changed) => dirty |= changed,
+                            Ok(changed) => {
+                                dirty |= changed;
+                                if changed && reviewing {
+                                    notify(Notice::Error("Calendar review stopped after the account or AI configuration changed. Run the command again.".into()));
+                                }
+                            }
                             Err(error) => failure = Some(error),
                         }
                     }
@@ -822,7 +832,7 @@ impl Worker {
                     if !exiting && (preferences.paused || !preferences.prepare_enabled)
                         && let Some(Sdk { commands, .. }) = &sdk {
                             for (id, flight) in &queue.flights {
-                                if queue.jobs.get(&flight.event_id).is_some_and(|job| job.manual) { continue; }
+                                if queue.jobs.get(&flight.event_id).is_some_and(|job| job.manual || job.review.is_some()) { continue; }
                                 if commands.try_send(ai::Command::Cancel(*id | (1 << 63))).is_err() {
                                     failure = Some("Preparation cancellation could not be admitted; no new jobs will start".into());
                                 }
@@ -870,6 +880,9 @@ impl Worker {
                                             if let Some(event) = calendar.events.iter().find(|event| event.id == flight.event_id) {
                                                 payload["tomlook_event_fingerprint"] = event.fingerprint().into();
                                                 if let Some(account) = store.calendar_owner()? {
+                                                    let review = queue.jobs.get(&flight.event_id).and_then(|job| job.review.as_ref());
+                                                    let publish_kind = |kind| review.is_none_or(|review|
+                                                        !flight.translation_only && review.covers(event, now) && review.includes(kind));
                                                     let suggestions: Vec<crate::recommendations::Suggestion> =
                                                         serde_json::from_value(payload.get("recommendations").cloned().unwrap_or_else(|| serde_json::json!([])))
                                                             .map_err(|_| "Invalid saved recommendation schema")?;
@@ -883,6 +896,7 @@ impl Worker {
                                                     for previous in inbox.values_mut().filter(|previous|
                                                         previous.account == account && previous.event_id == event.id
                                                         && previous.suggestion.kind != crate::recommendations::Kind::Manual
+                                                        && publish_kind(previous.suggestion.kind)
                                                         && matches!(previous.state, crate::recommendations::State::Pending | crate::recommendations::State::NotSent)) {
                                                         if !suggestions.iter().any(|suggestion| suggestion.kind == previous.suggestion.kind
                                                             && suggestion.category == previous.suggestion.category
@@ -892,6 +906,7 @@ impl Worker {
                                                         }
                                                     }
                                                     for suggestion in suggestions {
+                                                        if !publish_kind(suggestion.kind) { continue; }
                                                         if event.unconfirmed() { continue; }
                                                         if event.start > now + chrono::Duration::days(14) { continue; }
                                                         if suggestion.kind == crate::recommendations::Kind::Category &&
@@ -1007,7 +1022,7 @@ impl Worker {
                                 match store.save_queue(&queue) {
                                     Ok(()) => {
                                         if let Some(event) = calendar.events.iter().find(|event| event.id == flight.event_id) {
-                                            let previous = if flight.foreground { None } else {
+                                            let previous = if flight.foreground || queue.jobs.get(&flight.event_id).is_some_and(|job| job.review.is_some()) { None } else {
                                                 store.briefing(&event.id)?
                                                     .map(|raw| serde_json::from_str::<serde_json::Value>(&raw))
                                                     .transpose().map_err(|_| "Saved Insights are invalid during language backfill")?
@@ -1015,6 +1030,10 @@ impl Worker {
                                                         (value["tomlook_event_fingerprint"].as_str() == Some(event.fingerprint().as_str()) ||
                                                          value["tomlook_fingerprint"].as_str() == Some(crate::scheduler::fingerprint_for(event, &legacy_revision).as_str())))
                                             };
+                                            if previous.is_some() {
+                                                queue.flights.get_mut(&id).ok_or("Preparation flight disappeared before translation")?.translation_only = true;
+                                                store.save_queue(&queue)?;
+                                            }
                                             if commands.try_send(ai::Command::Prepare(Box::new(ai::Preparation {
                                                 id, event: {
                                                     let mut event = event.clone();
@@ -1108,7 +1127,7 @@ impl Worker {
                             break Command::Wake;
                         }
                     };
-                    let recommendation_command = matches!(&command, Command::ConfirmRecommendation { .. } | Command::ConfirmMeetingAction { .. } | Command::RecheckCalendarResult(_) | Command::DismissRecommendation(_));
+                    let recommendation_command = matches!(&command, Command::ConfirmRecommendation { .. } | Command::ConfirmMeetingAction { .. } | Command::RecheckCalendarResult(_) | Command::DismissRecommendation(_) | Command::ReviewRecommendations { .. });
                     let result = match command {
                         Command::DemoScreenshot { path, image } => {
                             if options.demo.is_none() {
@@ -1311,6 +1330,27 @@ impl Worker {
                                 })
                             } else { Err("The selected meeting is no longer available.".into()) }
                         }
+                        Command::ReviewRecommendations { kind, account } => (|| {
+                            if exiting || options.demo.is_some() {
+                                return Err("Calendar reviews need the live worker; previews never submit requests.".into());
+                            }
+                            if store.calendar_owner()?.as_deref() != Some(account.as_str()) {
+                                return Err("Calendar account changed before the review; nothing was queued.".into());
+                            }
+                            if failure.is_some() {
+                                return Err("Resolve the previous preparation failure before starting a calendar review.".into());
+                            }
+                            if !sdk.as_ref().is_some_and(|sdk|
+                                sdk.ready.load(Ordering::Acquire) && sdk.workiq_ready.load(Ordering::Acquire)
+                                && sdk.analysis_revision.get().is_some() && !sdk.terminated.load(Ordering::Acquire))
+                            {
+                                return Err("Connect AI and WorkIQ before starting a calendar review.".into());
+                            }
+                            queue.request_review(&calendar, chrono::Local::now().fixed_offset(), kind)?;
+                            store.save_queue(&queue)?;
+                            dirty = true;
+                            Ok(())
+                        })(),
                         Command::Retry(id) => { if queue.retry(&id) { failure = None; } Ok(()) }
                         Command::TogglePause => { preferences.paused = !preferences.paused; store.save_preferences(&preferences) }
                         Command::Wake => Ok(()),
@@ -1364,6 +1404,192 @@ impl Worker {
 mod tests {
     use super::*;
     use chrono::Local;
+
+    #[test]
+    fn reviews_publish_only_requested_kinds_to_the_persistent_bell_without_writes() {
+        use crate::recommendations::{Kind, Recommendation, Review, Suggestion};
+        let root = tempfile::tempdir().unwrap();
+        let now = Local::now().fixed_offset();
+        let mut events = crate::calendar::fixture(2);
+        for event in &mut events {
+            event.title = "Review integration meeting".into();
+            event.status = "accepted".into();
+            event.start = now + chrono::Duration::days(1);
+            event.end = event.start + chrono::Duration::hours(1);
+            event.is_all_day = false;
+            event.extra.clear();
+        }
+        events[0].category = "Call".into();
+        events[1].category = "Office".into();
+        events[1].status = "cancelled".into();
+        let calendar = Calendar::build(
+            events,
+            (0..=14)
+                .map(|day| now.date_naive() + chrono::Duration::days(day))
+                .collect(),
+            Vec::new(),
+        )
+        .unwrap();
+        let mut store = Store::open(root.path()).unwrap();
+        let calendar = store.save_workiq_calendar(&calendar, "owner").unwrap();
+        store
+            .save_preferences(&Preferences {
+                prepare_enabled: false,
+                paused: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let event = calendar
+            .events
+            .iter()
+            .find(|event| event.category == "Call")
+            .unwrap();
+        let category = Recommendation::from_insights(
+            event,
+            "owner",
+            Suggestion {
+                kind: Kind::Category,
+                category: Some("Office".into()),
+                minutes: None,
+                reason: "Previously proposed category".into(),
+                reason_cs: "Previous category".into(),
+            },
+            now,
+        )
+        .unwrap();
+        store
+            .save_recommendations(&[(category.id.clone(), category.clone())].into())
+            .unwrap();
+        let mut worker = Worker::start(
+            Options {
+                state: root.path().into(),
+                legacy_root: root.path().into(),
+                demo: None,
+            },
+            egui::Context::default(),
+        )
+        .unwrap();
+        let (commands, mut executor) = tokio::sync::mpsc::channel(32);
+        let profile = Arc::new(std::sync::OnceLock::new());
+        profile.set("a".repeat(64)).unwrap();
+        worker
+            .commands
+            .send(Command::AttachAi {
+                commands,
+                ready: Arc::new(AtomicBool::new(true)),
+                occupied: Arc::new(AtomicUsize::new(0)),
+                terminated: Arc::new(AtomicBool::new(false)),
+                analysis_revision: profile,
+                workiq_ready: Arc::new(AtomicBool::new(true)),
+            })
+            .unwrap();
+        let briefing = serde_json::json!({
+            "summary": "Review", "sources": [], "gaps": [], "preparation": [],
+            "talking_points": [], "open_questions": [], "risks": [],
+            "recommendations": [
+                {"kind":"category", "reason":"New category explanation", "reason_cs":"New category explanation", "category":"Office"},
+                {"kind":"travel", "reason":"Allow time to arrive", "reason_cs":"Allow time to arrive", "minutes":30},
+                {"kind":"travel_after", "reason":"Allow time to leave", "reason_cs":"Allow time to leave", "minutes":30}
+            ]
+        }).to_string();
+        let mut travel_before = None;
+        for kind in [Review::Travel, Review::Categories] {
+            worker
+                .commands
+                .send(Command::ReviewRecommendations {
+                    kind,
+                    account: "owner".into(),
+                })
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut delivered = false;
+            while std::time::Instant::now() < deadline {
+                while let Ok(command) = executor.try_recv() {
+                    match command {
+                        ai::Command::Prepare(preparation) => {
+                            assert!(!preparation.foreground);
+                            assert!(
+                                preparation.previous.is_none(),
+                                "Reviews must do fresh research, not only translate old Insights"
+                            );
+                            preparation
+                                .reply
+                                .try_send(ai::Prepared {
+                                    id: preparation.id,
+                                    result: ai::PreparationResult::Finished(Ok(Arc::new(
+                                        briefing.clone(),
+                                    ))),
+                                })
+                                .unwrap();
+                            preparation.wake.send(Command::Wake).unwrap();
+                            delivered = true;
+                        }
+                        ai::Command::CalendarChange { .. } | ai::Command::Ask(_) => {
+                            panic!("Review submitted an unrelated operation")
+                        }
+                        _ => {}
+                    }
+                }
+                let inbox = store.recommendations().unwrap();
+                if delivered
+                    && inbox.len() == 3
+                    && store
+                        .queue()
+                        .unwrap()
+                        .jobs
+                        .get(&event.id)
+                        .is_some_and(|job| job.state == State::Completed)
+                {
+                    if kind == Review::Travel {
+                        assert_eq!(
+                            inbox[&category.id], category,
+                            "Travel review must not update the category proposal"
+                        );
+                        travel_before = Some(
+                            inbox
+                                .values()
+                                .filter(|record| record.suggestion.kind.is_travel())
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        );
+                    } else {
+                        assert_eq!(
+                            inbox[&category.id].suggestion.reason,
+                            "New category explanation"
+                        );
+                        assert_eq!(
+                            inbox
+                                .values()
+                                .filter(|record| record.suggestion.kind.is_travel())
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                            travel_before.clone().unwrap()
+                        );
+                    }
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(delivered, "Background review was not dispatched");
+            assert!(
+                store
+                    .queue()
+                    .unwrap()
+                    .jobs
+                    .get(&event.id)
+                    .is_some_and(|job| job.state == State::Completed)
+            );
+        }
+        worker.stop.store(true, Ordering::Release);
+        worker.commands.send(Command::Exit).unwrap();
+        worker
+            .done
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn calendar_dispatch_persists_before_enqueue_and_blocks_unresolved_sibling_writes() {

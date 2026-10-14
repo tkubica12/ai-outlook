@@ -37,9 +37,9 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The latest native Windows release is **[v0.2.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.2.0)**.
-Read the [release notes](docs/releases/v0.2.0.md) for changes since v0.1.0.
-Download **[Tomlook-v0.2.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.2.0/Tomlook-v0.2.0-win-x64.zip)**
+The latest native Windows release is **[v0.3.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.3.0)**.
+Read the [release notes](docs/releases/v0.3.0.md) for changes since v0.2.0.
+Download **[Tomlook-v0.3.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.3.0/Tomlook-v0.3.0-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable, unsigned,
 and does not install anything.
@@ -182,6 +182,13 @@ calendar or assistant does not start Copilot. See [native setup](native/README.m
 for the separate identity/configuration boundary and remaining acceptance gates.
 The panel keeps each context's draft and last answer separate in
 bounded memory; Exit clears them. No disk conversation retention is enabled.
+Ask docks on the right or detaches into its own native window. Hiding it keeps
+the request running; only Stop cancels. Locally filtered `/today`, `/week`,
+`/prepare`, `/conflicts` and `/find` shortcuts complete read-only questions
+without submitting until Enter or Ask.
+`/travel` and `/categories` run ad-hoc checks of the next 14 days in the
+background. Travel-before/after or category proposals go to the recommendation
+bell, not just the Ask answer; no calendar write occurs without approval.
 The SDK still owns an installed proprietary Copilot runtime child, not a Rust
 rewrite of that runtime. Preparation requires isolated authentication and
 verified calendar coverage and a matching WorkIQ account. Enter asks a question,
