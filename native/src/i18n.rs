@@ -153,6 +153,273 @@ fn capture<'a>(pattern: &str, text: &'a str) -> Option<Vec<&'a str>> {
 }
 
 pub const TEXTS: &[(&str, &str)] = &[
+    (
+        "Automatic routing context exceeds its bounds; choose a mode explicitly",
+        "Kontext automatického výběru překročil limit; vyberte režim ručně.",
+    ),
+    (
+        "Configure Microsoft-Decision-1 in decision-router.json, or choose Quick or Thorough",
+        "Nastavte Microsoft-Decision-1 v decision-router.json nebo zvolte Rychle či Důkladně.",
+    ),
+    (
+        "Microsoft-Decision-1 needs a valid Azure CLI sign-in for the configured tenant and subscription; choose a mode explicitly",
+        "Microsoft-Decision-1 vyžaduje platné přihlášení Azure CLI pro nastavený tenant a předplatné; vyberte režim ručně.",
+    ),
+    (
+        "Microsoft-Decision-1 returned an invalid decision; choose a mode explicitly",
+        "Microsoft-Decision-1 vrátil neplatné rozhodnutí; vyberte režim ručně.",
+    ),
+    (
+        "Microsoft-Decision-1 routing timed out; choose a mode explicitly",
+        "Vypršel čas pro výběr pomocí Microsoft-Decision-1; vyberte režim ručně.",
+    ),
+    (
+        "Microsoft-Decision-1 connection failed; choose a mode explicitly",
+        "Spojení s Microsoft-Decision-1 se nezdařilo; vyberte režim ručně.",
+    ),
+    (
+        "Create Microsoft-Decision-1 connection failed",
+        "Nepodařilo se vytvořit spojení s Microsoft-Decision-1.",
+    ),
+    (
+        "Choosing a mode with Microsoft-Decision-1",
+        "Vybírám režim pomocí Microsoft-Decision-1",
+    ),
+    ("Discard saved research", "Zahodit uložený výzkum"),
+    ("Confirm discard", "Potvrdit zahození"),
+    (
+        "This permanently removes only these saved findings, not meetings or source documents.",
+        "Trvale se odstraní pouze tato uložená zjištění, nikoli schůzky nebo zdrojové dokumenty.",
+    ),
+    (
+        "This answer reached its remote-read budget",
+        "Odpověď vyčerpala povolený počet vzdálených čtení.",
+    ),
+    (
+        "This answer reached its local-read budget",
+        "Odpověď vyčerpala povolený počet místních čtení.",
+    ),
+    (
+        "AI execution capacity is busy; nothing was submitted",
+        "Všechny povolené úlohy už běží; dotaz nebyl odeslán.",
+    ),
+    (
+        "Automatic routing returned an invalid decision; choose a mode explicitly",
+        "Automatický výběr vrátil neplatné rozhodnutí; vyberte režim ručně.",
+    ),
+    (
+        "Automatic routing selected an unsupported mode; choose a mode explicitly",
+        "Automatický výběr zvolil nepodporovaný režim; vyberte režim ručně.",
+    ),
+    (
+        "Automatic routing session creation timed out; choose a mode explicitly",
+        "Vypršel čas pro automatický výběr; vyberte režim ručně.",
+    ),
+    (
+        "Creating the chat session timed out",
+        "Vypršel čas pro vytvoření chatu.",
+    ),
+    (
+        "Sending the chat request timed out",
+        "Vypršel čas pro odeslání dotazu.",
+    ),
+    (
+        "Copilot reported a chat session error; partial findings are not success",
+        "Copilot ohlásil chybu chatu; průběžná zjištění nejsou dokončený výsledek.",
+    ),
+    (
+        "Copilot completed without an answer",
+        "Copilot skončil bez odpovědi.",
+    ),
+    (
+        "This question was stopped; no further read was sent",
+        "Dotaz byl zastaven; další čtení nebylo odesláno.",
+    ),
+    (
+        "Conversation context exceeds its bounds; start a new chat",
+        "Kontext rozhovoru dosáhl limitu; začněte nový chat.",
+    ),
+    ("New chat", "Nový chat"),
+    ("Retry question", "Zkusit dotaz znovu"),
+    (
+        "This answer lane is busy; choose the other mode, wait or stop its question",
+        "Tento režim už zpracovává dotaz; zvolte druhý, počkejte nebo dotaz zastavte.",
+    ),
+    (
+        "A local command is already running; wait for its result",
+        "Místní příkaz už běží; počkejte na jeho výsledek.",
+    ),
+    ("Quick", "Rychle"),
+    ("Thorough", "Důkladně"),
+    ("Send", "Odeslat"),
+    ("You", "Vy"),
+    ("Thinking", "Přemýšlím"),
+    ("Your calendar, in conversation", "Váš kalendář v rozhovoru"),
+    (
+        "Ask naturally, or type / for instant local commands. Thorough research leaves the quick-answer lane free.",
+        "Zeptejte se přirozeně nebo napište / pro okamžité místní příkazy. Během důkladného výzkumu můžete zadat rychlý dotaz.",
+    ),
+    (
+        "Microsoft-Decision-1 selects Quick or Thorough; no local guessing",
+        "Microsoft-Decision-1 vybere rychlou odpověď nebo důkladný výzkum; bez místního odhadování",
+    ),
+    (
+        "GPT-6 Luna / low / targeted reads",
+        "GPT-6 Luna / low / cílené hledání",
+    ),
+    (
+        "GPT-6.1 Sol / medium / resumable research",
+        "GPT-6.1 Sol / medium / výzkum s pokračováním",
+    ),
+    ("Activity", "Postup práce"),
+    ("Open a meeting", "Otevřít schůzku"),
+    ("Could not complete", "Nepodařilo se dokončit"),
+    ("Interrupted research", "Přerušený výzkum"),
+    ("Continue research", "Pokračovat ve výzkumu"),
+    (
+        "Continue from saved findings; the original provider call is not resumed.",
+        "Pokračuje se z uložených zjištění, nikoli obnovením původního běhu u poskytovatele.",
+    ),
+    (
+        "Today's saved calendar / no AI",
+        "Dnešní uložený kalendář / bez AI",
+    ),
+    (
+        "This week's saved calendar / no AI",
+        "Uložený kalendář tohoto týdne / bez AI",
+    ),
+    (
+        "Fuzzy search saved meetings / no AI",
+        "Hledat i s překlepy v uložených schůzkách / bez AI",
+    ),
+    (
+        "Read saved meeting Insights / no AI",
+        "Přečíst uložený přehled schůzky / bez AI",
+    ),
+    ("Local calendar / no AI", "Místní kalendář / bez AI"),
+    ("Local calendar", "Místní kalendář"),
+    (
+        "Saved Insights may be stale for this meeting.",
+        "Uložený přehled nemusí odpovídat aktuální schůzce.",
+    ),
+    (
+        "No saved Insights. Open the meeting to prepare them.",
+        "Schůzka nemá uložený přehled. Otevřete ji pro jeho přípravu.",
+    ),
+    (
+        "No matches in the saved calendar.",
+        "V uloženém kalendáři nebyla nalezena shoda.",
+    ),
+    (
+        "Showing the 25 best matches. Narrow /search to see more.",
+        "Zobrazeno 25 nejlepších shod. Upřesněte hledání pomocí /search.",
+    ),
+    (
+        "Approximate keyword match; verify the meeting.",
+        "Přibližná shoda klíčových slov; ověřte správnou schůzku.",
+    ),
+    (
+        "Cache coverage is incomplete; no matches do not prove there are no meetings.",
+        "Místní kalendář nepokrývá celé období; prázdný výsledek neznamená, že nemáte schůzky.",
+    ),
+    ("Oldest calendar refresh", "Nejstarší aktualizace kalendáře"),
+    (
+        "Calendar refresh time is unknown.",
+        "Čas aktualizace kalendáře není znám.",
+    ),
+    ("Preparing the request", "Připravuji požadavek"),
+    ("Choosing a mode", "Vybírám režim"),
+    ("Starting thorough research", "Spouštím důkladný výzkum"),
+    ("Starting a quick answer", "Připravuji rychlou odpověď"),
+    ("Writing the answer", "Píšu odpověď"),
+    ("Searching saved meetings", "Hledám v uložených schůzkách"),
+    ("Reading a saved meeting", "Čtu uloženou schůzku"),
+    ("Reading saved Insights", "Čtu uložený přehled"),
+    ("Searching local materials", "Hledám místní podklady"),
+    ("Reading a local document", "Čtu místní dokument"),
+    (
+        "Reading mail or calendar in Microsoft 365",
+        "Čtu poštu nebo kalendář v Microsoft 365",
+    ),
+    (
+        "Searching Microsoft 365 context",
+        "Hledám kontext v Microsoft 365",
+    ),
+    ("Reading cloud materials", "Čtu cloudové podklady"),
+    ("Searching GitHub", "Hledám na GitHubu"),
+    ("Searching public sources", "Hledám ve veřejných zdrojích"),
+    ("Reading an authorized source", "Čtu povolený zdroj"),
+    ("Saved calendar search", "Hledání v uloženém kalendáři"),
+    ("Saved meeting", "Uložená schůzka"),
+    ("Saved Insights", "Uložený přehled"),
+    (
+        "This chat holds 32 questions; start a new chat to continue",
+        "Tento chat obsahuje 32 dotazů; pro další začněte nový chat.",
+    ),
+    (
+        "Choose a meeting context before reading saved Insights",
+        "Pro čtení uloženého přehledu zvolte kontext schůzky.",
+    ),
+    (
+        "This local command takes no arguments. Use /search followed by meeting words.",
+        "Tento místní příkaz nemá parametry. Pro hledání použijte /search a slova ze schůzky.",
+    ),
+    (
+        "After /search, enter up to 200 characters from the meeting title, person or location.",
+        "Za /search napište nejvýše 200 znaků z názvu schůzky, jména nebo místa.",
+    ),
+    (
+        "Meeting is no longer in the local calendar; refresh and search again",
+        "Schůzka už není v místním kalendáři; aktualizujte ho a hledejte znovu.",
+    ),
+    (
+        "The cached calendar account changed; refresh before searching",
+        "Účet místního kalendáře se změnil; před hledáním ho aktualizujte.",
+    ),
+    (
+        "Research reached its ten-minute budget. Saved findings can be continued explicitly.",
+        "Výzkum dosáhl desetiminutového limitu. Z uložených zjištění můžete výslovně pokračovat.",
+    ),
+    (
+        "The quick-answer budget expired; retry or choose Thorough for a larger investigation.",
+        "Vypršel limit rychlé odpovědi. Zkuste dotaz znovu nebo pro rozsáhlejší hledání zvolte Důkladně.",
+    ),
+    (
+        "Stopped. Partial findings are not a completed answer.",
+        "Zastaveno. Průběžná zjištění nejsou dokončenou odpovědí.",
+    ),
+    (
+        "A thorough research is already running; quick questions remain available",
+        "Důkladný výzkum už běží; rychlé dotazy můžete zadávat dál.",
+    ),
+    (
+        "A quick question or automatic routing is already running; wait or stop it first",
+        "Rychlý dotaz nebo výběr režimu už běží; počkejte nebo ho zastavte.",
+    ),
+    (
+        "Auto selected thorough research, but that lane is busy; choose Quick or wait for the running research",
+        "Auto zvolilo důkladný výzkum, ale ten už běží. Zvolte Rychle nebo počkejte na jeho dokončení.",
+    ),
+    (
+        "The saved research meeting changed; start a new question",
+        "Schůzka uloženého výzkumu se změnila; začněte novým dotazem.",
+    ),
+    (
+        "This saved research task is unavailable",
+        "Tento uložený výzkum není dostupný.",
+    ),
+    (
+        "Research connections or source scope changed; start a new question instead of reusing this checkpoint",
+        "Změnila se připojení nebo rozsah zdrojů výzkumu; místo pokračování položte nový dotaz.",
+    ),
+    (
+        "Connect the calendar account before starting resumable research",
+        "Před spuštěním výzkumu s pokračováním připojte účet kalendáře.",
+    ),
+    (
+        "Eight interrupted research tasks are saved; finish a saved task before starting another",
+        "Je uloženo osm přerušených výzkumů; před novým některý dokončete nebo zahoďte.",
+    ),
     ("Demo", "Demo"),
     (
         "Offline demo - fictional calendar",
@@ -1419,6 +1686,20 @@ pub const TEXTS: &[(&str, &str)] = &[
 ];
 
 const PATTERNS: &[(&str, &str)] = &[
+    (
+        "Microsoft-Decision-1 returned HTTP {}; choose a mode explicitly",
+        "Microsoft-Decision-1 vrátil HTTP {0}; vyberte režim ručně.",
+    ),
+    ("{}: Retrieved", "{0}: Načteno"),
+    ("{}: Retrieval failed", "{0}: Načtení se nezdařilo"),
+    (
+        "The signed-in Tomlook runtime does not offer {}; no other model was substituted",
+        "Přihlášený runtime Tomlooku nenabízí {0}; jiný model nebyl použit.",
+    ),
+    (
+        "{} does not advertise reasoning effort {}; update the isolated runtime or account entitlement",
+        "{0} nenabízí úroveň přemýšlení {1}; aktualizujte izolovaný runtime nebo oprávnění účtu.",
+    ),
     ("And {} more overlaps", "A další překryvy: {0}"),
     (
         "Calendar provider rejected the write with HTTP {}; nothing was changed by this request",

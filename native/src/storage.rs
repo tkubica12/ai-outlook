@@ -64,6 +64,24 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn read_only(root: &Path) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            root.join("tomlook.db"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| "The local calendar cache is unavailable")?;
+        connection
+            .busy_timeout(std::time::Duration::from_millis(100))
+            .map_err(|_| "Configure read-only calendar access failed")?;
+        connection
+            .execute_batch("PRAGMA query_only=ON; BEGIN DEFERRED;")
+            .map_err(|_| "Open a consistent calendar snapshot failed")?;
+        Ok(Self {
+            connection,
+            root: root.into(),
+        })
+    }
+
     fn read_recommendation_dismissals(connection: &Connection) -> Result<BTreeSet<String>> {
         let payload: Option<String> = connection
             .query_row(

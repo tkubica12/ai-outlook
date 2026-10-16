@@ -204,23 +204,51 @@ Original user/source text and raw external technical diagnostics remain original
 **Ask** and **Ctrl+Space** open a resizable right-side question-and-answer panel,
 sharing the meeting-detail slot rather than adding a second sidebar.
 **Detach Ask** opens a real, movable native window with its own taskbar entry;
-**Dock Ask** returns it to the calendar. Both views share one request and retain
-the question, answer and explicit meeting context. Enter asks; Shift+Enter adds
-a line. Hide, native-window Close, and Ctrl+Space only hide Ask, never cancel it.
+**Dock Ask** returns it to the calendar. Both views share the conversation,
+unsent draft, mode and explicit meeting context. New chat, detach/dock and hide
+are theme-aware vector icons grouped in the Ask header, with translated tooltips,
+accessible button names and visible keyboard focus. Enter asks; Shift+Enter adds
+a line. Meeting links select the meeting and open its saved Insights without
+losing the conversation or draft.
+Hide, native-window Close, and Ctrl+Space only hide Ask, never cancel it.
 Escape first dismisses visible command suggestions, then hides the panel.
 **Stop** explicitly requests cancellation. A quiet Ask status in the main header
 shows a running question or an unread completed result, independently of the
 recommendation bell.
 Answers render CommonMark headings, emphasis, lists, code, tables and safe
 HTTP(S) links. Parsing happens once on the AI executor; the UI shares the prepared
-document. Images are not fetched and HTML is never executed. While waiting,
-only a compact progress indicator is shown, not raw unfinished Markdown.
+document. Images are not fetched and HTML is never executed. Admitted questions
+clear the composer and become user bubbles. The assistant shows a spinner,
+elapsed time, actual tool/stage activity and bounded, prepared streaming Markdown.
+Internal reasoning is never displayed. Earlier turns collapse after the six
+most recent full turns to bound layout cost.
 Copy and expandable source evidence remain available with the final answer.
-There are no local-concept controls or **More options**. Seven local shortcuts
-appear below the composer: `/today`, `/week`, `/prepare`, `/conflicts`, `/find`,
-`/travel`, `/categories`.
+There are no local-concept controls or **More options**. Nine shortcuts appear
+below the composer only after `/`: `/today`, `/week`, `/search`, `/insights`,
+`/prepare`, `/conflicts`, `/find`, `/travel`, `/categories`.
 Typing filters their names/descriptions; Up/Down selects, Tab completes, and
 clicking anywhere on a row completes it. Completion never submits a model call.
+`/today`, `/week`, `/search <words>` and contextual `/insights` execute algorithms
+on the storage worker without AI, including offline or during Thorough research.
+Search matches all supplied keywords across meeting names, people, locations and
+categories in the saved future calendar. The shared Rust search index ignores
+case, separators and common Latin/Czech accents, and ranks normalized matches
+ahead of typo candidates. Alphabetic keywords of 4-9 characters allow one edit;
+10-64 allow two, including adjacent transpositions. Short and numeric keywords
+are not typo-corrected. Adjacent name parts are indexed within a single metadata
+field, never across different attendees or fields. `NorthStar`, `North Star`
+and `North-Star` agree without customer-specific aliases. Vocabulary matching
+is compiled once per search, not once per meeting or UI frame. `/search` lists
+the best candidates first, with chronology as a tie-breaker, and labels fuzzy
+results for verification. It never calls Luna. The calendar's live filter
+retains inexpensive normalized substring filtering, not fuzzy scoring on render.
+Date coverage is not proof of name resolution;
+the assistant must retry a narrower name token or inspect a bounded calendar range
+before drawing a negative conclusion. Timed meeting tools include a complete
+local date/time range; answers must preserve both dates for multi-day meetings,
+and keep invitation responses separate from tentative categories.
+Results include freshness/coverage,
+up to 25 ranked matches and meeting links. Narrow the query for more.
 `/prepare` requires an explicit meeting context; `/find` requires search text.
 `/travel` and `/categories` take no arguments and check the next rolling 14 days,
 independently of the selected meeting. They reuse the asynchronous Insights
@@ -1004,14 +1032,14 @@ Browser sign-in uses the SDK's experimental accounts API with no terminal,
 model request or automatically approved plaintext-credential consent. An
 unsupported runtime API or provider interaction is an explicit failure, not
 a fallback to personal credentials. The native application uses a separate SDK
-executor, two request slots, bounded command channels and coalesced notices and
+executor, bounded request lanes/channels and coalesced notices and
 streaming. Calendar navigation does not wait for a model or briefing.
 Ctrl+Space opens the assistant, Enter submits a question from its editor,
 Shift+Enter inserts a newline, Ctrl+Shift+P opens searchable commands,
 and Escape dismisses command suggestions or hides it without cancellation.
 Only **Stop** requests cancellation. Global questions and captured
 meeting context are separate; changing a meeting invalidates its old answer.
-Draft questions and last answers are retained separately
+Drafts and up to 32 conversation turns are retained separately
 for up to 32 contexts in memory. Configured WebIQ and WorkIQ tools are offered
 without a public-topic editor. Public search rejects private identifiers and
 app credentials; prompts prohibit sharing workplace or local-file contents.
@@ -1019,10 +1047,10 @@ A changed meeting snapshot invalidates its old
 answer; reopening the same snapshot does not cancel an ongoing question.
 At the memory limit, a new context is refused visibly instead of evicting
 drafts or submitting against the old meeting. Exit clears this state.
-Disk conversation retention has not been selected by the owner and is not
-enabled. Questions remain independent SDK requests, not a persistent
-multi-turn transcript sent to the model. Full claim-to-passage verification and
-real-provider acceptance still require live checks.
+Ordinary chat is memory-only. Each independent isolated SDK request receives
+the bounded completed conversation history (48 KiB); running/failed turns are
+not silently treated as completed context. Large recent answers use an explicitly
+labelled excerpt. Full claim-to-passage verification still requires source review.
 Opening the panel requests editor focus; closing it returns focus to search.
 Question/topic limits are checked as UTF-8 bytes before submission, request
 identities cannot collide with preparation, and an unadmitted question
@@ -1031,15 +1059,118 @@ outcome rather than claiming the operation definitely stopped.
 
 Ask contains only questions, formatted answers and expandable retrieved sources.
 The former local draft editor and optional typed-proposal mode are not exposed.
-Question shortcuts expand into read-only questions immediately before admission,
-with the same UTF-8 size limits and single-flight guards as ordinary questions.
+Cloud question shortcuts expand immediately before admission; local commands
+instead share the typed cached-calendar algorithms used by model tools.
 The two ad-hoc review commands instead enqueue typed background work; they never
 ask the model to execute a slash string or expose calendar-mutation tools.
 The separate window uses a deferred viewport: typing repaints that window, not
 the calendar. Its bounded action channel and shared view use nonblocking access;
-final notices update the answer even when the main window is hidden. Ask uses a
-static waiting label, not a continuously animated calendar repaint, and unused
-partial Markdown updates no longer wake the root viewport.
+final notices update the chat even when the main window is hidden. Animation
+repaints only a visible Ask surface; streaming preparation runs on the executor.
+
+### Ask profiles, cache and durable research
+
+**Quick** selects `gpt-6-luna` with `low` reasoning: 60 seconds of execution,
+four remote reads and twelve combined local reads. **Thorough** selects
+`gpt-6.1-sol` / `medium`: ten minutes, forty remote reads and eighty local reads.
+Session setup has a separate thirty-second bound. **Auto** calls
+Microsoft-Decision-1's typed `choice` API directly, without creating another
+Copilot session. A fixed rubric and labeled examples distinguish direct retrieval
+of explicit facts (including a month's calendar listing or reading a named
+README) from discovering relationships, commitments, preparation requirements
+or the user's presenter-versus-listener role. A short question about one demo
+can need Thorough: finding which meeting needs it requires evidence of the
+connection, not a similar calendar title. Extracting an already established
+finding from recent context remains Quick; resolving a previously uncertain
+connection is research. Brevity, date range and the word "demo" alone do not
+determine the profile. Only `fast` and `deep` with valid normalized probabilities are
+accepted, mapping to Luna/low and Sol/medium respectively. Recent context is
+bounded to two turns; context is data, never routing instructions.
+Routing and answering share one admitted daily request; Foundry inference is
+billed separately from Copilot and is not a Copilot billing multiplier. Routing
+latency is recorded without question contents. Choosing Quick or Thorough
+explicitly avoids this extra network call. Missing model IDs/efforts and
+invalid routing are explicit errors, never silent model substitutions.
+The existing `connections.json` `model` setting still controls legacy meeting
+preparation, not these fixed Ask profiles.
+
+Auto additionally requires app-owned `decision-router.json`; copy
+`decision-router.example.json` beside `connections.json` and set the actual
+Foundry resource endpoint, deployment name, existing Azure CLI executable,
+tenant and subscription. The deployment name is independent of the model name
+(for example `mai-decision-1` for the model `Microsoft-Decision-1`).
+Only credential-free HTTPS Azure Foundry resource endpoints are accepted;
+redirects are disabled. No API key or bearer token is stored in this file.
+The router lazily obtains a Cognitive Services Entra token from the explicitly
+configured existing Azure CLI sign-in and retains it in memory until renewal.
+It never signs in, creates a deployment or changes grants on the user's behalf.
+On Windows MSI installations it runs the CLI's bundled isolated Python module
+directly, avoiding an intermediate shell or orphaned CLI child on cancellation.
+Token acquisition and inference each have an eight-second bound; requests are
+asynchronous, cancellable and response-size limited. Missing/expired sign-in,
+HTTP failures, timeouts and invalid choices are visible errors; manual profiles
+and offline slash commands remain usable. Restart/reconnect after changing this
+configuration. No Azure SDK dependency or new package version is required.
+
+One Quick/Auto lane and one Thorough lane can run concurrently. Auto acquires
+the Thorough lane before releasing its Quick lane. A running preparation can
+coexist within the three-job executor cap; new preparation retains its existing
+two-job admission and single-background-job safeguards. Local slash queries use
+the separate storage worker.
+
+Both cloud profiles see the same narrowly allowlisted reads: typed cached
+calendar search/meeting/Insights, authorized indexed local search/text chunks,
+native WorkIQ reads/context and configured public WebIQ/GitHub reads. A cache
+tool opens a short-lived read-only SQLite snapshot, rechecks its account owner,
+reports per-day coverage/refresh times and marks stale Insights. Search bounds,
+pagination and unknown fields are validated in Rust. There is no arbitrary
+SQL, shell or drive access. Cache and indexed-document reads share two blocking
+read permits; a timed-out disk read retains its permit until it actually exits.
+Host counters enforce aggregate local/remote budgets; prompt instructions prefer
+relevant cached evidence rather than mandatory broad prefetches.
+For natural-language calendar lookup, the model interprets intent, supplies
+distinctive keywords and date bounds, inspects candidate metadata and
+`search_match` evidence, rejects unrelated similar names, and then answers.
+Each matched keyword reports its field, normalized token, match kind and edit
+distance. This is retrieval evidence, not semantic identity or a probability.
+Default ordering is relevance then time; `order: "start"` supports nearest
+meeting requests without hiding earlier candidates behind stronger later name
+matches. Empty queries are chronological. Alternative keyword searches and
+bounded calendar inspection remain available before a negative conclusion.
+
+Thorough jobs checkpoint question, bounded conversation/findings/evidence,
+account, exact selected-meeting identity/fingerprint and connection/source
+binding in private `ask-research.db` beside the application database. This file
+can contain personal derived findings/source excerpts and follows the profile's
+Windows-user filesystem access, not a claim of encrypted conversation storage.
+At most eight unfinished jobs are retained; they are never silently evicted.
+Completed checkpoints are pruned on later saves. Interrupted jobs appear in Ask
+with **Continue research** and a separately confirmed **Discard saved research**.
+Continuation is a new model request using historical findings, not resumption
+of a disconnected provider call. Changed accounts, meetings or source bindings
+require a new question; discard provides a repair path for incompatible jobs.
+Only bounded evidence excerpts are saved; they are not a complete source archive.
+Stop and timeouts abort/detach the owned session, retain partial findings
+honestly and never report an unfinished answer as success.
+
+The ignored `decision_live` tests use `TOMLOOK_LIVE_CHAT_ROOT` and a new private
+`TOMLOOK_LIVE_DECISION_OUTPUT` receipt per run. Select one test at a time with
+`--exact --ignored`: `decision_routes_regressions_and_measures_warm_latency`
+exercises the real configured router on forty development/regression intents,
+balanced between twenty Quick and twenty Thorough cases. These include the
+reported spoken demo-to-meeting regression, direct
+lookups, implicit commitments, attendee roles, selected-meeting context and
+verified-versus-unverified follow-ups. Test formulations are not included in the
+router's examples. `decision_routes_post_freeze_holdouts` checks twelve separate
+balanced formulations authored after freezing the repaired rubric, without
+tuning on their outcomes. Each receipt records false-Quick and false-Thorough counts
+separately, plus warm median and p95 latency; all cases must classify correctly
+and the warm median must stay below three seconds. Requests are paced by 1.2
+seconds outside the measured routing interval to respect deployment rate limits.
+These are bounded labeled sets, not a general classifier-accuracy claim.
+The tests do not provision resources, change authentication, read mail or
+calendar data, or execute the questions; only the labeled requests and synthetic
+context are classified.
 
 Use `connections.example.json` as a schema example, replace the placeholder
 runtime/endpoints, and save an app-owned `connections.json` in the `--state`

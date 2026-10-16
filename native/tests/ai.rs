@@ -32,6 +32,38 @@ fn preview_never_starts_a_runtime_and_shutdown_is_bounded() {
         }
     ));
     assert!(!root.path().join("copilot").exists());
+    engine
+        .commands
+        .blocking_send(Command::Chat(Box::new(tomlook::chat::Request {
+            question: Question {
+                id: 2,
+                question: "Synthetic chat".into(),
+                meeting: None,
+                account: None,
+                public_topic: None,
+                suggest_drafts: false,
+                language: tomlook::i18n::Language::En,
+            },
+            mode: tomlook::chat::Mode::Deep,
+            history: Vec::new(),
+            resume: None,
+        })))
+        .unwrap();
+    assert!(matches!(
+        engine.notices.recv_timeout(Duration::from_secs(3)).unwrap(),
+        Notice::Answer {
+            id: 2,
+            result: Err(_)
+        }
+    ));
+    engine
+        .commands
+        .blocking_send(Command::RecoverChat("fixture@example.invalid".into()))
+        .unwrap();
+    assert!(
+        matches!(engine.notices.recv_timeout(Duration::from_secs(3)).unwrap(),Notice::ChatRecovered { result:Ok(saved),.. } if saved.is_empty())
+    );
+    assert!(!root.path().join("ask-research.db").exists());
     engine.commands.blocking_send(Command::ProbeWorkiq).unwrap();
     let notice = engine.notices.recv_timeout(Duration::from_secs(3)).unwrap();
     assert!(matches!(notice, Notice::Workiq { message } if message.contains("never starts")));

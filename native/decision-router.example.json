@@ -1,0 +1,7 @@
+{
+  "endpoint": "https://YOUR_RESOURCE.services.ai.azure.com/",
+  "deployment": "mai-decision-1",
+  "azure_cli": "C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin\\az.cmd",
+  "tenant": "00000000-0000-0000-0000-000000000001",
+  "subscription": "00000000-0000-0000-0000-000000000002"
+}

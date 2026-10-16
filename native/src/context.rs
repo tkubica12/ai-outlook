@@ -13,6 +13,12 @@ use std::{
 pub const SEARCH: &str = "tomlook_local_search";
 pub const READ: &str = "tomlook_local_read";
 
+pub(crate) fn read_gate() -> Arc<tokio::sync::Semaphore> {
+    static GATE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
+        .clone()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SearchArgs {
@@ -379,6 +385,7 @@ struct LocalRead {
     index: Option<Arc<crate::source_index::Index>>,
     remaining: Arc<AtomicUsize>,
     recorder: Arc<Recorder>,
+    chat: Option<Arc<crate::chat::Run>>,
 }
 
 #[async_trait]
@@ -394,11 +401,23 @@ impl ToolHandler for LocalRead {
             }
             crate::copilot::reserve_workiq_read(&self.remaining)
                 .map_err(|_| "This answer reached its local-read budget")?;
+            let permit = read_gate()
+                .acquire_owned()
+                .await
+                .map_err(|_| "Local read admission stopped")?;
+            if self
+                .chat
+                .as_ref()
+                .is_some_and(|run| run.cancelled.load(std::sync::atomic::Ordering::Acquire))
+            {
+                return Err("This question was stopped; no further read was sent".into());
+            }
             let roots = self.roots.clone();
             let index = self.index.clone();
             tokio::time::timeout(
                 Duration::from_secs(5),
                 tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
                     if name == SEARCH {
                         let args: SearchArgs = serde_json::from_value(invocation.arguments)
                             .map_err(|_| "Invalid context search")?;
@@ -422,6 +441,9 @@ impl ToolHandler for LocalRead {
             .map_err(|_| "Local context worker stopped")?
         }
         .await;
+        if let (Some(run), Ok(value)) = (&self.chat, &result) {
+            run.protect_result(value);
+        }
         Ok(result_for(&self.recorder, &invocation.tool_name, result))
     }
 }
@@ -469,6 +491,20 @@ pub fn indexed_tools(
     )
 }
 
+pub fn indexed_chat_tools(
+    index: Arc<crate::source_index::Index>,
+    recorder: Arc<Recorder>,
+    run: Arc<crate::chat::Run>,
+) -> Vec<Tool> {
+    read_tools(Arc::new(LocalRead {
+        roots: Arc::new(Vec::new()),
+        index: Some(index),
+        remaining: run.local.clone(),
+        recorder,
+        chat: Some(run),
+    }))
+}
+
 fn source_tools(
     roots: Vec<PathBuf>,
     index: Option<Arc<crate::source_index::Index>>,
@@ -480,7 +516,12 @@ fn source_tools(
         index,
         remaining: Arc::new(AtomicUsize::new(budget)),
         recorder,
+        chat: None,
     });
+    read_tools(handler)
+}
+
+fn read_tools(handler: Arc<LocalRead>) -> Vec<Tool> {
     vec![
         Tool::new(SEARCH).with_description("Search paths and indexed document text in authorized repository collections and local folders. Use specific topic/customer words. The result reports freshness, limits and partial coverage. New repositories are discovered automatically. Never send private filenames or contents to public web.")
             .with_parameters(json!({"type":"object","properties":{"query":{"type":"string","maxLength":200}},"required":["query"],"additionalProperties":false})).with_handler(handler.clone()),

@@ -80,6 +80,41 @@ fn categories_are_precomputed_deduplicated_and_sorted() {
 }
 
 #[test]
+fn name_search_ignores_separators_without_joining_unrelated_fields_or_attendees() {
+    let mut events = calendar::fixture(4);
+    for event in &mut events {
+        event.title = "Unrelated meeting".into();
+        event.organizer.clear();
+        event.attendees.clear();
+        event.location.clear();
+        event.category.clear();
+    }
+    events[0].title = "North. Star / Workshop".into();
+    events[1].title = "Dr".into();
+    events[1].organizer = "Example".into();
+    events[2].attendees = vec!["Dr".into(), "Example".into()];
+    events[3].title = "ČESKÝ TÝM / Demo".into();
+    let calendar = Calendar::build(events, BTreeSet::new(), Vec::new()).unwrap();
+    for query in ["NorthStar", "north-star", "NORTH.STAR", "North Star"] {
+        let matches = (0..calendar.events.len())
+            .filter(|index| calendar.matches(*index, query, ""))
+            .count();
+        assert_eq!(matches, 1, "{query}");
+    }
+    assert_eq!(
+        (0..calendar.events.len())
+            .filter(|index| calendar.matches(*index, "českýtým", ""))
+            .count(),
+        1
+    );
+    for index in 0..calendar.events.len() {
+        assert!(!calendar.matches(index, "DrExample", ""));
+        assert!(!calendar.matches(index, "---", ""));
+        assert!(calendar.matches(index, "", ""));
+    }
+}
+
+#[test]
 fn identity_lookup_matches_sorted_events_and_rebuilds_without_stale_entries() {
     let mut events = calendar::fixture(5000);
     events.reverse();

@@ -1,6 +1,6 @@
 [package]
 name = "tomlook"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -27,7 +27,7 @@ url = "=2.5.8"
 rmcp = { version = "=3.5.1", default-features = false, features = ["client", "auth", "reqwest-native-tls", "transport-streamable-http-client-reqwest"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "native-tls"] }
 github-copilot-sdk = { version = "=1.0.18-preview.0", default-features = false, features = ["runtime"] }
-tokio = { version = "=1.53.2", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+tokio = { version = "=1.53.2", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util", "process"] }
 async-trait = "=0.1.92"
 base64 = "=0.22.1"
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "ico"] }

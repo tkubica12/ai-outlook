@@ -281,9 +281,29 @@ pub struct Calendar {
     pub days: BTreeMap<NaiveDate, Day>,
     pub coverage: BTreeSet<NaiveDate>,
     pub search: Vec<String>,
+    search_normalized: Vec<String>,
+    pub(crate) search_index: crate::search::Index,
     pub categories: Vec<String>,
     category_keys: Vec<Vec<String>>,
     pub warnings: Vec<String>,
+}
+
+pub struct SearchQuery {
+    text: String,
+    normalized: String,
+}
+
+impl SearchQuery {
+    pub fn new(text: &str) -> Self {
+        Self {
+            text: text.to_lowercase(),
+            normalized: search_key(text),
+        }
+    }
+}
+
+fn search_key(text: &str) -> String {
+    crate::search::key(text)
 }
 
 impl Calendar {
@@ -343,6 +363,20 @@ impl Calendar {
                 )
                 .to_lowercase(),
             );
+            // Never join a company name across unrelated fields or different attendees.
+            result.search_normalized.push(
+                [
+                    event.title.as_str(),
+                    event.organizer.as_str(),
+                    event.location.as_str(),
+                    event.category.as_str(),
+                ]
+                .into_iter()
+                .chain(event.attendees.iter().map(String::as_str))
+                .map(search_key)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            );
             let start = event.start.with_timezone(&Local);
             let end = event.end.with_timezone(&Local);
             let (mut date, last) = event.calendar_dates();
@@ -370,6 +404,7 @@ impl Calendar {
         for day in result.days.values_mut() {
             Self::layout_slots(&mut day.timed);
         }
+        result.search_index = crate::search::Index::build(&result.events);
         Ok(result)
     }
 
@@ -416,7 +451,13 @@ impl Calendar {
     }
 
     pub fn matches(&self, index: usize, query: &str, category: &str) -> bool {
-        self.search[index].contains(query)
+        self.matches_query(index, &SearchQuery::new(query), category)
+    }
+
+    pub fn matches_query(&self, index: usize, query: &SearchQuery, category: &str) -> bool {
+        (self.search[index].contains(&query.text)
+            || (!query.normalized.is_empty()
+                && self.search_normalized[index].contains(&query.normalized)))
             && (category.is_empty()
                 || self.category_keys[index].iter().any(|tag| {
                     tag.chars()

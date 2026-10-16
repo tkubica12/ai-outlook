@@ -318,12 +318,14 @@ struct AssistantState {
     answer: Option<ai::Answer>,
     error: Option<String>,
     fingerprint: Option<String>,
+    chat: Arc<tomlook::chat::Conversation>,
 }
 
 #[derive(Default)]
 struct DetachedAsk {
     view: ask::View,
     synced_question: String,
+    synced_mode: tomlook::chat::Mode,
     failure: Option<String>,
 }
 
@@ -439,6 +441,10 @@ pub struct Tomlook {
     question: String,
     request_id: u64,
     active_request: Option<u64>,
+    chat: Arc<tomlook::chat::Conversation>,
+    ask_mode: tomlook::chat::Mode,
+    research_recoveries: Arc<Vec<tomlook::chat::Checkpoint>>,
+    recovery_account: Option<String>,
     answer: Option<ai::Answer>,
     ai_error: Option<String>,
     activity: Arc<tomlook::worker::Activity>,
@@ -679,6 +685,10 @@ impl Tomlook {
             question: String::new(),
             request_id: 0,
             active_request: None,
+            chat: Default::default(),
+            ask_mode: Default::default(),
+            research_recoveries: Default::default(),
+            recovery_account: None,
             answer: None,
             ai_error: None,
             activity: Arc::new(tomlook::worker::Activity::default()),
@@ -790,7 +800,17 @@ impl Tomlook {
                         self.briefing = None;
                     }
                     self.calendar = calendar;
+                    if self.calendar_owner != calendar_owner {
+                        self.invalidate_connection_answers();
+                        self.research_recoveries = Default::default();
+                    }
                     self.calendar_owner = calendar_owner;
+                    if self.recovery_account != self.calendar_owner {
+                        self.recovery_account = self.calendar_owner.clone();
+                        if let Some(account) = self.calendar_owner.clone() {
+                            self.ai_command(ai::Command::RecoverChat(account));
+                        }
+                    }
                     if self.hosted_workiq_account.is_empty() {
                         self.hosted_workiq_account = if preferences.work_email.is_empty() {
                             self.calendar_owner.clone().unwrap_or_default()
@@ -835,6 +855,33 @@ impl Tomlook {
                 Notice::Error(error) => {
                     self.error = Some(error);
                     self.loading = false;
+                }
+                Notice::LocalAnswer { id, result } => {
+                    if self
+                        .chat
+                        .turns
+                        .iter()
+                        .any(|turn| turn.id == id && turn.running)
+                    {
+                        if self.active_request == Some(id) {
+                            self.active_request = None;
+                        }
+                        match result {
+                            Ok(result) => {
+                                if let Some(turn) = Arc::make_mut(&mut self.chat)
+                                    .turns
+                                    .iter_mut()
+                                    .find(|turn| turn.id == id)
+                                {
+                                    turn.meetings = result.meetings;
+                                }
+                                self.answer = Some(result.answer.clone());
+                                Arc::make_mut(&mut self.chat).finish(id, Ok(result.answer));
+                            }
+                            Err(error) => Arc::make_mut(&mut self.chat).finish(id, Err(error)),
+                        }
+                        self.ask_unread = !self.assistant;
+                    }
                 }
             }
         }
@@ -980,42 +1027,64 @@ impl Tomlook {
                     self.connection = message;
                     self.command(Command::Wake);
                 }
-                ai::Notice::Answer { id, result } if self.active_request == Some(id) => {
-                    self.active_request = None;
-                    self.ask_unread = !self.assistant;
-                    match result {
-                        Ok(answer) if answer.text.len() <= 64_000 => {
-                            let validation = answer.evidence.validate().and_then(|()| {
-                                if answer.proposals.len() > proposals::PROPOSAL_LIMIT {
-                                    return Err(
-                                        "AI response exceeded the local-proposal limit".into()
-                                    );
-                                }
-                                for proposal in answer.proposals.iter() {
-                                    proposal.validate()?;
-                                }
-                                Ok(())
-                            });
-                            match validation {
-                                Ok(()) => {
-                                    self.answer = Some(answer);
-                                    self.ai_error = None;
-                                }
-                                Err(error) => {
-                                    self.answer = None;
-                                    self.ai_error = Some(error);
-                                }
+                ai::Notice::ChatProgress { id, progress } => {
+                    if let Some(turn) = Arc::make_mut(&mut self.chat)
+                        .turns
+                        .iter_mut()
+                        .find(|turn| turn.id == id && turn.running)
+                    {
+                        if progress.mode == tomlook::chat::Mode::Deep
+                            && self.active_request == Some(id)
+                        {
+                            self.active_request = None;
+                        }
+                        turn.progress = progress;
+                        Arc::make_mut(&mut self.chat).revision += 1;
+                    }
+                }
+                ai::Notice::ChatRecovered { account, result } => {
+                    if self.calendar_owner.as_deref() == Some(account.as_str()) {
+                        match result {
+                            Ok(saved) => {
+                                self.research_recoveries = Arc::new(
+                                    saved
+                                        .into_iter()
+                                        .filter(|saved| {
+                                            !self.chat.turns.iter().any(|turn| {
+                                                turn.running
+                                                    && turn.progress.research_key.as_deref()
+                                                        == Some(&saved.key)
+                                            })
+                                        })
+                                        .collect(),
+                                )
                             }
-                        }
-                        Ok(_) => {
-                            self.ai_error = Some("AI answer exceeded the 64 KiB response limit; no answer was published.".into());
-                            self.answer = None;
-                        }
-                        Err(error) => {
-                            self.ai_error = Some(error);
-                            self.answer = None;
+                            Err(error) => self.ai_error = Some(error),
                         }
                     }
+                }
+                ai::Notice::Answer { id, result }
+                    if self.active_request == Some(id)
+                        || self
+                            .chat
+                            .turns
+                            .iter()
+                            .any(|turn| turn.id == id && turn.running) =>
+                {
+                    if self.active_request == Some(id) {
+                        self.active_request = None;
+                    }
+                    self.ask_unread = !self.assistant;
+                    let result=result.and_then(|answer| {
+                        if answer.text.len()>64_000 { return Err("AI answer exceeded the 64 KiB response limit; no answer was published.".into()); }
+                        answer.evidence.validate()?;
+                        if answer.proposals.len()>proposals::PROPOSAL_LIMIT { return Err("AI response exceeded the local-proposal limit".into()); }
+                        for proposal in answer.proposals.iter() { proposal.validate()?; }
+                        Ok(answer)
+                    });
+                    self.answer = result.as_ref().ok().cloned();
+                    self.ai_error = result.as_ref().err().cloned();
+                    Arc::make_mut(&mut self.chat).finish(id, result);
                 }
                 ai::Notice::Answer { .. } => {}
                 ai::Notice::Stopped => {
@@ -1033,6 +1102,16 @@ impl Tomlook {
                         self.answer = None;
                         self.ask_unread = !self.assistant;
                         self.ai_error = Some("AI stopped without a completed answer; provider outcome may be unknown".into());
+                    }
+                    let ids = self
+                        .chat
+                        .turns
+                        .iter()
+                        .filter(|turn| turn.running)
+                        .map(|turn| turn.id)
+                        .collect::<Vec<_>>();
+                    for id in ids {
+                        Arc::make_mut(&mut self.chat).finish(id,Err("AI stopped without a completed answer; provider outcome may be unknown".into()));
                     }
                 }
             }
@@ -1222,7 +1301,7 @@ impl Tomlook {
         let down = consume(Modifiers::NONE, Key::ArrowDown);
         if up || down {
             let days = self.visible_days();
-            let query = self.query.to_lowercase();
+            let query = tomlook::calendar::SearchQuery::new(&self.query);
             let visible = days
                 .iter()
                 .filter_map(|day| self.calendar.days.get(day))
@@ -1276,8 +1355,8 @@ impl Tomlook {
         date >= days[0] && date <= *days.last().expect("nonempty view")
     }
 
-    fn matches_event(&self, index: usize, query: &str) -> bool {
-        self.calendar.matches(index, query, &self.category)
+    fn matches_event(&self, index: usize, query: &tomlook::calendar::SearchQuery) -> bool {
+        self.calendar.matches_query(index, query, &self.category)
             && !(self.preferences.hide_unconfirmed && self.calendar.events[index].unconfirmed())
     }
 
@@ -1415,7 +1494,7 @@ impl Tomlook {
                     self.save_preferences();
                 }
                 if ui
-                    .button(if self.active_request.is_some() {
+                    .button(if self.active_request.is_some() || self.chat.running() {
                         format!(
                             "{} · {}",
                             language.text("Ask"),
@@ -2178,7 +2257,7 @@ impl Tomlook {
     fn month(&mut self, ui: &mut egui::Ui) {
         let language = self.preferences.language;
         let dates = View::Month.days(self.anchor);
-        let query = self.query.to_lowercase();
+        let query = tomlook::calendar::SearchQuery::new(&self.query);
         let width = (ui.available_width() - 6.0 * 6.0) / 7.0;
         let height = ((ui.available_height() - 30.0 - 5.0 * 6.0) / 6.0).max(94.0);
         ui.horizontal(|ui| {
@@ -2257,7 +2336,7 @@ impl Tomlook {
     fn timeline(&mut self, ui: &mut egui::Ui) {
         let language = self.preferences.language;
         let dates = self.visible_days();
-        let query = self.query.to_lowercase();
+        let query = tomlook::calendar::SearchQuery::new(&self.query);
         let day_width = ((ui.available_width() - 48.0) / dates.len() as f32).max(95.0);
         egui::ScrollArea::horizontal()
             .id_salt("timeline-horizontal")
@@ -2395,7 +2474,7 @@ impl Tomlook {
                             line,
                         );
                         let mut day = self.calendar.days.get(date).cloned().unwrap_or_default();
-                        if !query.is_empty()
+                        if !self.query.is_empty()
                             || !self.category.is_empty()
                             || self.preferences.hide_unconfirmed
                         {
@@ -3003,12 +3082,34 @@ impl Tomlook {
     }
 
     fn cancel_ai(&mut self) {
-        if let Some(id) = self.active_request.take() {
-            self.ask_unread = !self.assistant;
-            self.ai_error = Some("Cancellation requested; partial output is not a completed answer. Provider outcome may be unknown.".into());
-            if !self.ai_command(ai::Command::Cancel(id)) {
-                self.error = Some("AI cancellation could not be submitted. Its result will be discarded, but the provider request may continue until timeout or application exit.".into());
-            }
+        let mut ids = self
+            .chat
+            .turns
+            .iter()
+            .filter(|turn| turn.running)
+            .map(|turn| turn.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        ids.extend(self.active_request);
+        for id in ids {
+            self.cancel_chat_request(id);
+        }
+    }
+
+    fn cancel_chat_request(&mut self, id: u64) {
+        let local = self
+            .chat
+            .turns
+            .iter()
+            .any(|turn| turn.id == id && turn.progress.stage == "Local calendar");
+        if self.active_request == Some(id) {
+            self.active_request = None;
+        }
+        self.ask_unread = !self.assistant;
+        let message = "Cancellation requested; partial output is not a completed answer. Provider outcome may be unknown.";
+        self.ai_error = Some(message.into());
+        Arc::make_mut(&mut self.chat).finish(id, Err(message.into()));
+        if !local && !self.ai_command(ai::Command::Cancel(id)) {
+            self.error=Some("AI cancellation could not be submitted. Its result will be discarded, but the provider request may continue until timeout or application exit.".into());
         }
     }
 
@@ -3016,9 +3117,11 @@ impl Tomlook {
         self.ai_error = None;
         self.cancel_ai();
         self.answer = None;
+        self.chat = Default::default();
         for state in self.assistant_states.values_mut() {
             state.answer = None;
             state.error = None;
+            state.chat = Default::default();
         }
     }
 
@@ -3058,13 +3161,14 @@ impl Tomlook {
             if self.assistant_context.as_ref().map(Event::fingerprint) != fingerprint {
                 self.cancel_ai();
                 self.answer = None;
+                self.chat = Default::default();
                 self.ai_error = Some("Meeting context changed. The previous answer was invalidated; review your draft before asking again.".into());
             }
             self.assistant_context = next;
             self.assistant_revision = fingerprint;
             return true;
         }
-        if self.active_request.is_some() {
+        if self.active_request.is_some() || self.chat.running() {
             self.ai_error =
                 Some("Stop the current question before changing its meeting context.".into());
             return false;
@@ -3083,15 +3187,20 @@ impl Tomlook {
                 answer: self.answer.take(),
                 error: self.ai_error.take(),
                 fingerprint: self.assistant_context.as_ref().map(Event::fingerprint),
+                chat: std::mem::take(&mut self.chat),
             },
         );
-        if restored.fingerprint != fingerprint && restored.answer.is_some() {
+        if restored.fingerprint != fingerprint
+            && (restored.answer.is_some() || !restored.chat.turns.is_empty())
+        {
             restored.answer = None;
+            restored.chat = Default::default();
             restored.error = Some("Meeting context changed. The previous answer was invalidated; review your draft before asking again.".into());
         }
         self.question = restored.question;
         self.answer = restored.answer;
         self.ai_error = restored.error;
+        self.chat = restored.chat;
         self.assistant_context = next;
         self.assistant_revision = fingerprint;
         self.context_error = None;
@@ -3102,11 +3211,13 @@ impl Tomlook {
     }
 
     fn ask_question(&mut self) {
-        if self.active_request.is_some() {
+        if self.context_error.is_some() {
+            self.ai_error = Some("Connect AI before asking.".into());
             return;
         }
-        if !self.ai_ready || self.context_error.is_some() {
-            self.ai_error = Some("Connect AI before asking.".into());
+        if self.chat.turns.len() >= tomlook::chat::TURN_LIMIT {
+            self.ai_error =
+                Some("This chat holds 32 questions; start a new chat to continue".into());
             return;
         }
         if self.question.trim().is_empty() || self.question.len() > 8000 {
@@ -3124,47 +3235,152 @@ impl Tomlook {
                 return;
             }
         };
+        if matches!(submission, ask::Submission::Question(_))
+            && self.chat.turns.iter().any(|turn| {
+                turn.running
+                    && turn.progress.stage != "Local calendar"
+                    && (turn.progress.mode == tomlook::chat::Mode::Deep)
+                        == (self.ask_mode == tomlook::chat::Mode::Deep)
+            })
+        {
+            self.ai_error = Some(
+                "This answer lane is busy; choose the other mode, wait or stop its question".into(),
+            );
+            return;
+        }
+        if matches!(submission, ask::Submission::Question(_))
+            && self.active_request.is_some()
+            && self.chat.turns.is_empty()
+            && self.ask_mode != tomlook::chat::Mode::Deep
+        {
+            return;
+        }
+        if matches!(submission, ask::Submission::Local(_))
+            && self
+                .chat
+                .turns
+                .iter()
+                .any(|turn| turn.running && turn.progress.stage == "Local calendar")
+        {
+            self.ai_error = Some("A local command is already running; wait for its result".into());
+            return;
+        }
         let Some(id) = self.request_id.checked_add(1).filter(|id| *id < 1 << 63) else {
             self.ai_error = Some("Assistant request identity limit reached. No question was submitted; restart Tomlook.".into());
             return;
         };
         self.request_id = id;
         self.ai_error = None;
+        let raw = self.question.clone();
         let question = match submission {
             ask::Submission::Question(question) => question,
             ask::Submission::Review(kind) => {
-                self.request_recommendation_review(kind);
+                if !self.ai_ready {
+                    self.ai_error = Some("Connect AI before asking.".into());
+                    return;
+                }
+                if self.request_recommendation_review(kind) {
+                    if let Err(error) =
+                        Arc::make_mut(&mut self.chat).admit(id, raw, tomlook::chat::Mode::Fast)
+                    {
+                        self.ai_error = Some(error);
+                        return;
+                    }
+                    if let Some(answer) = self.answer.clone() {
+                        Arc::make_mut(&mut self.chat).finish(id, Ok(answer));
+                    }
+                    self.question.clear();
+                    self.focus_assistant = true;
+                }
+                return;
+            }
+            ask::Submission::Local(query) => {
+                let command = Command::AskLocal {
+                    id,
+                    query,
+                    account: self.calendar_owner.clone(),
+                    meeting: self.assistant_context.clone(),
+                    language: self.preferences.language,
+                };
+                let sent = self.worker.as_ref().map(|worker| {
+                    worker
+                        .commands
+                        .try_send(command)
+                        .map_err(|error| matches!(error, mpsc::TrySendError::Full(_)))
+                });
+                match sent {
+                    Some(Ok(())) => {
+                        if let Err(error) =
+                            Arc::make_mut(&mut self.chat).admit(id, raw, tomlook::chat::Mode::Fast)
+                        {
+                            self.ai_error = Some(error);
+                            return;
+                        }
+                        if let Some(turn) = Arc::make_mut(&mut self.chat).turns.back_mut() {
+                            turn.progress.stage = "Local calendar".into();
+                        }
+                        self.question.clear();
+                        self.focus_assistant = true;
+                        self.ask_unread = false;
+                    }
+                    Some(Err(true)) => {
+                        self.ai_error =
+                            Some("Local queue is full. Nothing was submitted; try again.".into())
+                    }
+                    _ => {
+                        self.ai_error =
+                            Some("The storage worker is unavailable. Restart Tomlook.".into())
+                    }
+                }
                 return;
             }
         };
-        if self.ai_command(ai::Command::Ask(Box::new(Question {
-            id,
-            question,
-            meeting: self.assistant_context.clone(),
-            account: self.calendar_owner.clone(),
-            public_topic: None,
-            suggest_drafts: false,
-            language: self.preferences.language,
-        }))) {
-            self.active_request = Some(id);
+        if !self.ai_ready {
+            self.ai_error = Some("Connect AI before asking.".into());
+            return;
+        }
+        let request = tomlook::chat::Request {
+            question: Question {
+                id,
+                question,
+                meeting: self.assistant_context.clone(),
+                account: self.calendar_owner.clone(),
+                public_topic: None,
+                suggest_drafts: false,
+                language: self.preferences.language,
+            },
+            mode: self.ask_mode,
+            history: self.chat.history(),
+            resume: None,
+        };
+        if self.ai_command(ai::Command::Chat(Box::new(request))) {
+            if let Err(error) = Arc::make_mut(&mut self.chat).admit(id, raw, self.ask_mode) {
+                self.ai_error = Some(error);
+                return;
+            }
+            if self.ask_mode != tomlook::chat::Mode::Deep {
+                self.active_request = Some(id);
+            }
             self.answer = None;
             self.ask_unread = false;
+            self.question.clear();
+            self.focus_assistant = true;
         }
     }
 
-    fn request_recommendation_review(&mut self, kind: tomlook::recommendations::Review) {
+    fn request_recommendation_review(&mut self, kind: tomlook::recommendations::Review) -> bool {
         let Some(account) = self
             .calendar_owner
             .clone()
             .filter(|account| !account.is_empty())
         else {
             self.ai_error = Some("Connect AI and WorkIQ before starting a calendar review.".into());
-            return;
+            return false;
         };
         let command = Command::ReviewRecommendations { kind, account };
         let Some(worker) = &self.worker else {
             self.ai_error = Some("The storage worker is unavailable. Restart Tomlook.".into());
-            return;
+            return false;
         };
         match worker.commands.try_send(command) {
             Ok(()) => {
@@ -3182,13 +3398,113 @@ impl Tomlook {
                     Arc::new(Vec::new()),
                 ));
                 self.ask_unread = false;
+                true
             }
             Err(mpsc::TrySendError::Full(_)) => {
                 self.ai_error =
                     Some("Local queue is full. Nothing was submitted; try again.".into());
+                false
             }
-            _ => self.ai_error = Some("The storage worker is unavailable. Restart Tomlook.".into()),
+            _ => {
+                self.ai_error = Some("The storage worker is unavailable. Restart Tomlook.".into());
+                false
+            }
         }
+    }
+
+    fn resume_research(&mut self, key: String) {
+        let Some(saved) = self
+            .research_recoveries
+            .iter()
+            .find(|saved| saved.key == key)
+            .cloned()
+        else {
+            self.ai_error = Some("This saved research task is unavailable".into());
+            return;
+        };
+        let meeting = if let Some(event) = &saved.meeting {
+            match self
+                .calendar
+                .events
+                .iter()
+                .find(|candidate| {
+                    candidate.id == event.id && candidate.fingerprint() == event.fingerprint
+                })
+                .cloned()
+            {
+                Some(current) => Some(current),
+                None => {
+                    self.ai_error =
+                        Some("The saved research meeting changed; start a new question".into());
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if !self.ai_ready || !self.switch_assistant_context(meeting.clone()) {
+            return;
+        }
+        if self.chat.turns.len() >= tomlook::chat::TURN_LIMIT {
+            self.ai_error =
+                Some("This chat holds 32 questions; start a new chat to continue".into());
+            return;
+        }
+        let Some(id) = self.request_id.checked_add(1).filter(|id| *id < 1 << 63) else {
+            self.ai_error=Some("Assistant request identity limit reached. No question was submitted; restart Tomlook.".into());
+            return;
+        };
+        let request = tomlook::chat::Request {
+            question: Question {
+                id,
+                question: saved.question.clone(),
+                meeting,
+                account: self.calendar_owner.clone(),
+                public_topic: None,
+                suggest_drafts: false,
+                language: saved.language,
+            },
+            mode: tomlook::chat::Mode::Deep,
+            history: saved.history,
+            resume: Some(key.clone()),
+        };
+        if self.ai_command(ai::Command::Chat(Box::new(request))) {
+            self.request_id = id;
+            if let Err(error) =
+                Arc::make_mut(&mut self.chat).admit(id, saved.question, tomlook::chat::Mode::Deep)
+            {
+                self.ai_error = Some(error);
+                return;
+            }
+            self.research_recoveries = Arc::new(
+                self.research_recoveries
+                    .iter()
+                    .filter(|saved| saved.key != key)
+                    .cloned()
+                    .collect(),
+            );
+            self.ai_error = None;
+            self.ask_unread = false;
+        }
+    }
+
+    fn retry_chat_question(&mut self, id: u64) {
+        let Some(turn) = self
+            .chat
+            .turns
+            .iter()
+            .find(|turn| turn.id == id && !turn.running && turn.error.is_some())
+            .cloned()
+        else {
+            return;
+        };
+        let draft = std::mem::replace(&mut self.question, turn.question);
+        let mode = std::mem::replace(&mut self.ask_mode, turn.progress.mode);
+        self.ask_question();
+        if !draft.is_empty() {
+            self.question = draft;
+        }
+        self.ask_mode = mode;
     }
 
     fn prepare_follow_up(&mut self, recommendation: &tomlook::recommendations::Recommendation) {
@@ -3223,7 +3539,18 @@ impl Tomlook {
         ask::View {
             question: self.question.clone(),
             answer: self.answer.clone(),
-            error: self.context_error.clone().or_else(|| self.ai_error.clone()),
+            error: self.context_error.clone().or_else(|| {
+                self.ai_error
+                    .as_ref()
+                    .filter(|error| {
+                        !self
+                            .chat
+                            .turns
+                            .iter()
+                            .any(|turn| turn.error.as_ref() == Some(*error))
+                    })
+                    .cloned()
+            }),
             context: self.assistant_context.clone(),
             revision: self.assistant_revision.clone(),
             selected: self.selected.is_some(),
@@ -3234,6 +3561,9 @@ impl Tomlook {
             focus: self.focus_assistant,
             language: self.preferences.language,
             accent: self.accent(),
+            chat: self.chat.clone(),
+            recoveries: self.research_recoveries.clone(),
+            mode: self.ask_mode,
             ..Default::default()
         }
     }
@@ -3263,6 +3593,7 @@ impl Tomlook {
             self.question = input.question;
             self.ask_cursor = input.cursor;
             self.ask_menu_dismissed = input.menu_dismissed;
+            self.ask_mode = input.mode;
         }
         match input.action {
             ask::Action::Submit if !same_context => {
@@ -3272,6 +3603,39 @@ impl Tomlook {
             }
             ask::Action::Submit => self.ask_question(),
             ask::Action::Stop => self.cancel_ai(),
+            ask::Action::StopRequest(id) => self.cancel_chat_request(id),
+            ask::Action::ModeChanged => {}
+            ask::Action::NewChat => {
+                if !self.chat.running() && self.active_request.is_none() {
+                    self.chat = Default::default();
+                    self.answer = None;
+                    self.ai_error = None;
+                    self.focus_assistant = true;
+                }
+            }
+            ask::Action::OpenMeeting(id) => {
+                if let Some(index) = self.calendar.events.iter().position(|event| event.id == id) {
+                    let event = self.calendar.events[index].clone();
+                    self.open_recommended_meeting(&event);
+                } else {
+                    self.ai_error = Some(
+                        "Meeting is no longer in the local calendar; refresh and search again"
+                            .into(),
+                    );
+                }
+            }
+            ask::Action::Resume(key) => self.resume_research(key),
+            ask::Action::DiscardResearch(key) => {
+                if let Some(account) = self.calendar_owner.clone()
+                    && self
+                        .research_recoveries
+                        .iter()
+                        .any(|saved| saved.key == key && saved.account == account)
+                {
+                    self.ai_command(ai::Command::DiscardChat { account, key });
+                }
+            }
+            ask::Action::Retry(id) => self.retry_chat_question(id),
             ask::Action::Hide => {
                 self.assistant = false;
                 self.focus_assistant = false;
@@ -3362,6 +3726,9 @@ impl Tomlook {
             || shared.view.context.as_ref().map(|event| event.id.as_str())
                 != desired.context.as_ref().map(|event| event.id.as_str());
         let changed = shared.synced_question != desired.question
+            || !Arc::ptr_eq(&shared.view.chat, &desired.chat)
+            || !Arc::ptr_eq(&shared.view.recoveries, &desired.recoveries)
+            || shared.synced_mode != desired.mode
             || answer_changed
             || shared.view.error != desired.error
             || context_changed
@@ -3378,6 +3745,12 @@ impl Tomlook {
             shared.view.menu_dismissed = desired.menu_dismissed;
         }
         shared.view.answer = desired.answer;
+        shared.view.chat = desired.chat;
+        shared.view.recoveries = desired.recoveries;
+        if shared.synced_mode != desired.mode {
+            shared.synced_mode = desired.mode;
+            shared.view.mode = desired.mode;
+        }
         shared.view.error = desired.error;
         shared.view.context = desired.context;
         shared.view.revision = desired.revision;
@@ -3399,6 +3772,7 @@ impl Tomlook {
         self.question = view.question.clone();
         self.ask_cursor = view.cursor;
         self.ask_menu_dismissed = view.menu_dismissed;
+        self.ask_mode = view.mode;
         self.focus_assistant = view.focus;
         self.ask_unread = false;
         if let Some(action) = action {
@@ -7083,9 +7457,10 @@ mod tests {
         );
         app.question = "New global question".into();
         app.ask_question();
-        let ai::Command::Ask(question) = input.try_recv().unwrap() else {
+        let ai::Command::Chat(request) = input.try_recv().unwrap() else {
             panic!("Question not admitted")
         };
+        let question = request.question;
         assert!(!app.switch_assistant_context(Some(meeting.clone())));
         app.cancel_ai();
         assert!(matches!(input.try_recv(), Ok(ai::Command::Cancel(id)) if id == question.id));
@@ -7204,6 +7579,154 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_chat_results_keep_their_turn_and_complete_history() {
+        let (mut app, notices, mut commands) = assistant_fixture();
+        app.ask_mode = tomlook::chat::Mode::Deep;
+        app.question = "Research synthetic preparation".into();
+        app.ask_question();
+        let ai::Command::Chat(deep) = commands.try_recv().unwrap() else {
+            panic!("Missing deep request");
+        };
+        assert!(app.question.is_empty());
+        notices
+            .send(ai::Notice::ChatProgress {
+                id: deep.question.id,
+                progress: tomlook::chat::Progress {
+                    mode: tomlook::chat::Mode::Deep,
+                    stage: "Searching local materials".into(),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        app.receive();
+        app.ask_mode = tomlook::chat::Mode::Fast;
+        app.question = "A quick synthetic question".into();
+        app.ask_question();
+        let ai::Command::Chat(fast) = commands.try_recv().unwrap() else {
+            panic!("Missing quick request");
+        };
+        assert!(
+            fast.history.is_empty(),
+            "Unfinished research is not completed conversation"
+        );
+        notices
+            .send(ai::Notice::Answer {
+                id: fast.question.id,
+                result: Ok(fixture_answer("Quick answer")),
+            })
+            .unwrap();
+        app.receive();
+        assert!(app.chat.turns[0].running);
+        assert_eq!(
+            app.chat.turns[1].answer.as_ref().unwrap().text.as_str(),
+            "Quick answer"
+        );
+        notices
+            .send(ai::Notice::Answer {
+                id: deep.question.id,
+                result: Ok(fixture_answer("Deep findings")),
+            })
+            .unwrap();
+        app.receive();
+        assert!(!app.chat.running());
+        app.question = "Use those findings".into();
+        app.ask_question();
+        let ai::Command::Chat(follow_up) = commands.try_recv().unwrap() else {
+            panic!("Missing follow-up");
+        };
+        assert_eq!(follow_up.history.len(), 2);
+        assert_eq!(follow_up.history[0].answer, "Deep findings");
+        assert_eq!(follow_up.history[1].answer, "Quick answer");
+    }
+
+    #[test]
+    fn chat_meeting_links_open_insights_and_preserve_drafts_and_running_work() {
+        let (mut app, _, mut commands) = assistant_fixture();
+        let event = tomlook::calendar::fixture(1).remove(0);
+        app.calendar =
+            Arc::new(Calendar::build(vec![event.clone()], Default::default(), vec![]).unwrap());
+        app.preferences.view = View::Week;
+        app.assistant = true;
+        app.focus_assistant = true;
+        app.question = "Unsent follow-up".into();
+        Arc::make_mut(&mut app.chat)
+            .admit(100, "Running research".into(), tomlook::chat::Mode::Deep)
+            .unwrap();
+        let chat = app.chat.clone();
+        let context = egui::Context::default();
+        let input = app
+            .ask_view()
+            .input(ask::Action::OpenMeeting(event.id.clone()));
+        app.apply_ask_input(input, &context);
+        assert_eq!(app.selected, Some(0));
+        assert!(app.assistant);
+        assert!(app.insights_expanded);
+        assert_eq!(app.question, "Unsent follow-up");
+        assert!(Arc::ptr_eq(&chat, &app.chat));
+        assert!(app.chat.running());
+        assert!(commands.try_recv().is_err());
+
+        app.assistant = true;
+        app.assistant_detached = true;
+        let input = app.ask_view().input(ask::Action::OpenMeeting(event.id));
+        app.apply_ask_input(input, &context);
+        assert!(app.assistant, "A separate Ask window stays open");
+        assert_eq!(app.question, "Unsent follow-up");
+        assert!(app.chat.running());
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn local_slash_is_admitted_offline_during_research_and_preserves_rejected_drafts() {
+        let (mut app, _, mut ai_commands) = assistant_fixture();
+        let (commands, worker_commands) = mpsc::sync_channel(1);
+        let notices = Arc::new(tomlook::worker::Notices::default());
+        app.worker = Some(Worker {
+            commands,
+            notices: notices.clone(),
+            activity: Default::default(),
+            stop: Default::default(),
+            done: None,
+        });
+        app.ai_ready = false;
+        Arc::make_mut(&mut app.chat)
+            .admit(
+                90,
+                "Running synthetic research".into(),
+                tomlook::chat::Mode::Deep,
+            )
+            .unwrap();
+        app.question = "/search Northstar".into();
+        app.ask_question();
+        let Command::AskLocal { id, query, .. } = worker_commands.try_recv().unwrap() else {
+            panic!("Not a local query");
+        };
+        assert_eq!(
+            query,
+            tomlook::chat_cache::LocalQuery::Search("Northstar".into())
+        );
+        assert!(app.question.is_empty());
+        assert!(ai_commands.try_recv().is_err());
+        Arc::make_mut(&mut app.chat).finish(id, Ok(fixture_answer("Saved match")));
+        assert!(app.chat.turns[0].running);
+        assert!(!app.chat.turns[1].running);
+        app.worker
+            .as_ref()
+            .unwrap()
+            .commands
+            .try_send(Command::Wake)
+            .unwrap();
+        app.question = "/today".into();
+        app.ask_question();
+        assert_eq!(
+            app.question, "/today",
+            "Rejected local draft must not disappear"
+        );
+        assert_eq!(app.chat.turns.len(), 2);
+        assert!(app.ai_error.as_ref().unwrap().contains("queue is full"));
+    }
+
+    #[test]
     fn review_slashes_enqueue_typed_background_work_without_an_ask_or_calendar_write() {
         use tomlook::recommendations::Review;
         let (mut app, _, mut ai_commands) = assistant_fixture();
@@ -7235,6 +7758,7 @@ mod tests {
         }
         app.question = "/travel".into();
         app.ask_question();
+        app.question = "/travel".into();
         app.ask_question();
         assert!(app.ai_error.as_ref().unwrap().contains("queue is full"));
         assert!(ai_commands.try_recv().is_err());
@@ -7626,9 +8150,10 @@ mod tests {
         let (mut app, output, mut input) = assistant_fixture();
         app.question = "Global question".into();
         app.ask_question();
-        let Some(ai::Command::Ask(question)) = input.try_recv().ok() else {
+        let Some(ai::Command::Chat(request)) = input.try_recv().ok() else {
             panic!("question was not admitted");
         };
+        let question = request.question;
         let meeting = tomlook::calendar::demo(Local::now(), 1).remove(0);
         assert!(!app.switch_assistant_context(Some(meeting.clone())));
         assert!(input.try_recv().is_err());
@@ -7649,7 +8174,8 @@ mod tests {
         assert!(app.switch_assistant_context(Some(meeting)));
         assert!(app.answer.is_none());
         assert!(app.switch_assistant_context(None));
-        assert_eq!(app.question, "Global question");
+        assert!(app.question.is_empty());
+        assert_eq!(app.chat.turns.back().unwrap().question, "Global question");
         assert_eq!(
             app.answer.as_ref().unwrap().text.as_str(),
             "Late global answer"
@@ -7661,17 +8187,19 @@ mod tests {
         let (mut app, notices, mut commands) = assistant_fixture();
         let context = egui::Context::default();
         app.assistant = true;
-        app.question = "/today".into();
+        app.question = "Summarize today".into();
         app.ask_question();
-        let ai::Command::Ask(question) = commands.try_recv().unwrap() else {
+        let ai::Command::Chat(request) = commands.try_recv().unwrap() else {
             panic!("Question not admitted");
         };
+        let question = request.question;
         assert!(!question.suggest_drafts);
         assert!(!question.question.starts_with('/'));
         for action in [ask::Action::Detach, ask::Action::Dock, ask::Action::Hide] {
             app.apply_ask_input(app.ask_view().input(action), &context);
             assert_eq!(app.active_request, Some(question.id));
-            assert_eq!(app.question, "/today");
+            assert!(app.question.is_empty());
+            assert_eq!(app.chat.turns.back().unwrap().question, "Summarize today");
             assert!(commands.try_recv().is_err());
         }
         notices
@@ -7738,9 +8266,10 @@ mod tests {
         assert!(app.switch_assistant_context(Some(original.clone())));
         app.question = "/prepare".into();
         app.ask_question();
-        let ai::Command::Ask(question) = commands.try_recv().unwrap() else {
+        let ai::Command::Chat(request) = commands.try_recv().unwrap() else {
             panic!("Question not admitted");
         };
+        let question = request.question;
         app.select(1);
         assert_eq!(app.assistant_context.as_ref().unwrap().id, original.id);
         assert_eq!(question.meeting.as_ref().unwrap().id, original.id);
@@ -7799,18 +8328,19 @@ mod tests {
         app.switch_assistant_context(Some(meeting.clone()));
         app.question = "Question".into();
         app.ask_question();
-        assert!(matches!(input.try_recv().unwrap(), ai::Command::Ask(_)));
+        assert!(matches!(input.try_recv().unwrap(), ai::Command::Chat(_)));
         let active = app.active_request;
         assert!(app.switch_assistant_context(Some(meeting.clone())));
         assert_eq!(app.active_request, active);
         assert!(input.try_recv().is_err());
         app.cancel_ai();
+        app.question = "New unsent draft".into();
         app.answer = Some(fixture_answer("Previous answer"));
         app.switch_assistant_context(None);
         meeting.title = "Updated meeting".into();
         app.switch_assistant_context(Some(meeting));
         assert!(app.answer.is_none());
-        assert_eq!(app.question, "Question");
+        assert_eq!(app.question, "New unsent draft");
         assert!(app.ai_error.as_ref().unwrap().contains("invalidated"));
     }
 
@@ -7842,12 +8372,13 @@ mod tests {
         app.question = "Question".into();
         app.ask_question();
         app.ask_question();
-        assert!(matches!(input.try_recv().unwrap(), ai::Command::Ask(_)));
+        assert!(matches!(input.try_recv().unwrap(), ai::Command::Chat(_)));
         assert!(input.try_recv().is_err());
         app.cancel_ai();
         assert!(matches!(input.try_recv().unwrap(), ai::Command::Cancel(_)));
         app.answer = Some(fixture_answer("Last completed answer"));
         drop(input);
+        app.question = "Retry after worker failure".into();
         app.ask_question();
         assert!(app.active_request.is_none());
         assert_eq!(
@@ -8092,9 +8623,10 @@ mod tests {
             });
             output.textures_delta.clear();
         }
-        let ai::Command::Ask(question) = commands.try_recv().unwrap() else {
+        let ai::Command::Chat(request) = commands.try_recv().unwrap() else {
             panic!("expected one question");
         };
+        let question = request.question;
         assert!(question.public_topic.is_none());
         assert!(commands.try_recv().is_err());
     }
@@ -8382,10 +8914,11 @@ mod tests {
         events[1].status = "accepted".into();
         app.calendar = Arc::new(Calendar::build(events, Default::default(), Vec::new()).unwrap());
         app.preferences.language = tomlook::i18n::Language::Cs;
-        assert!(app.matches_event(0, ""));
+        let query = tomlook::calendar::SearchQuery::new("");
+        assert!(app.matches_event(0, &query));
         app.preferences.hide_unconfirmed = true;
-        assert!(!app.matches_event(0, ""));
-        assert!(app.matches_event(1, ""));
+        assert!(!app.matches_event(0, &query));
+        assert!(app.matches_event(1, &query));
         let context = egui::Context::default();
         for height in [23.0, 38.0, 100.0] {
             let mut output = context.run_ui(egui::RawInput::default(), |ui| {

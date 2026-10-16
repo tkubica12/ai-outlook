@@ -25,6 +25,13 @@ pub struct Options {
 }
 
 pub enum Command {
+    AskLocal {
+        id: u64,
+        query: crate::chat_cache::LocalQuery,
+        account: Option<String>,
+        meeting: Option<calendar::Event>,
+        language: crate::i18n::Language,
+    },
     DemoScreenshot {
         path: PathBuf,
         image: Arc<egui::ColorImage>,
@@ -81,6 +88,10 @@ pub enum Command {
 }
 
 pub enum Notice {
+    LocalAnswer {
+        id: u64,
+        result: Result<crate::chat_cache::LocalAnswer, String>,
+    },
     Loaded {
         calendar: Arc<Calendar>,
         preferences: Preferences,
@@ -103,7 +114,7 @@ pub struct Worker {
 
 #[derive(Default)]
 pub struct Notices {
-    pending: Mutex<[Option<Notice>; 3]>,
+    pending: Mutex<[Option<Notice>; 4]>,
     poisoned: AtomicBool,
 }
 
@@ -113,6 +124,7 @@ impl Notices {
             Notice::Loaded { .. } => 0,
             Notice::Detail { .. } => 1,
             Notice::Error(_) => 2,
+            Notice::LocalAnswer { .. } => 3,
         };
         self.pending
             .lock()
@@ -1129,6 +1141,13 @@ impl Worker {
                     };
                     let recommendation_command = matches!(&command, Command::ConfirmRecommendation { .. } | Command::ConfirmMeetingAction { .. } | Command::RecheckCalendarResult(_) | Command::DismissRecommendation(_) | Command::ReviewRecommendations { .. });
                     let result = match command {
+                        Command::AskLocal { id,query,account,meeting,language } => {
+                            let result = if options.demo.is_none() && (account.is_none() || account != store.calendar_owner()?) {
+                                Err("The cached calendar account changed; refresh before searching".into())
+                            } else { crate::chat_cache::local_answer(&store,&calendar,query,meeting,language,options.demo.is_some()) };
+                            notify(Notice::LocalAnswer { id,result });
+                            Ok(())
+                        }
                         Command::DemoScreenshot { path, image } => {
                             if options.demo.is_none() {
                                 Err("Screenshot export is restricted to synthetic previews".into())

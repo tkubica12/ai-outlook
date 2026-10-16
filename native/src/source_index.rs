@@ -190,6 +190,10 @@ fn discover(
 }
 
 impl Index {
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
     pub fn has_local_sources(&self) -> bool {
         !self.config.is_empty()
     }

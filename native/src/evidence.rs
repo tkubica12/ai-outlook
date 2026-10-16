@@ -135,7 +135,7 @@ impl Redactor {
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Record {
     pub ordinal: usize,
     pub tool: String,
@@ -148,7 +148,7 @@ pub struct Record {
     pub links: Vec<String>,
 }
 
-#[derive(Clone, Default, Debug, serde::Serialize)]
+#[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
     pub records: Vec<Record>,
     pub omitted: usize,
@@ -179,6 +179,9 @@ impl Snapshot {
 
 pub fn source_label<'a>(tool: &'a str, resource: Option<&str>) -> &'a str {
     match tool {
+        crate::chat_cache::SEARCH => "Saved calendar search",
+        crate::chat_cache::DETAIL => "Saved meeting",
+        crate::chat_cache::INSIGHTS => "Saved Insights",
         crate::workiq::connection::CONTEXT_TOOL => "Workplace search summary",
         crate::workiq::connection::SDK_TOOL => {
             match resource.map(|value| value.split('?').next().unwrap_or(value)) {
