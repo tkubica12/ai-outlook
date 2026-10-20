@@ -134,6 +134,54 @@ explicitly supplied; `showAs=free` and meeting title prefixes do not establish i
 
 ## Language and structured Insights
 
+### Creating appointments
+
+Click an empty timeline time for a 30-minute appointment, or drag either
+direction for an exact 15-minute-snapped interval. The timeline exposes the full
+24 hours, initially scrolled to 08:00. Dragging selects time rather than scrolling;
+the wheel and scrollbars still scroll. **New event** provides a keyboard-accessible
+entry point in every view. Escape, focus loss during selection and closing the
+editor never approve a write.
+
+The bilingual editor offers time sliders, title, description, direct categories,
+Private (automatically selecting an existing personal category), Teams and
+optional paired travel reserves. Reserves default to 30 minutes each, are
+adjustable in 15-minute steps, remain uncategorized, inherit private sensitivity,
+and never create online meetings. Both date/time boundaries are resolved
+independently in the local timezone; missing or ambiguous DST times are rejected.
+Unknown calendar coverage and cached overlaps are explicitly shown, not treated
+as verified availability.
+
+The storage worker durably records the account-bound exact approval before the
+native WorkIQ executor submits anything. The event and each reserve use distinct
+stable Graph transaction IDs. The provider checks its create schema and, when
+requested, the calendar's allowed Teams providers. It reads back title, times,
+categories, privacy, busy state, description, transaction identity and Teams join
+URL before proceeding to the next part. There are no model calls, participants
+or room invitations. **Messages → Event creation** preserves progress and partial
+outcomes across restart. Interrupted/unknown writes are not replayed. Only a
+definitively not-submitted/rejected approval may be explicitly submitted again.
+Private sensitivity follows Outlook semantics, including delegate exceptions;
+it is not encryption or a guarantee against privileged mailbox access.
+
+The same creation pipeline supports **Add travel blocks before and after** from
+an existing owned timed meeting's context menu (also Shift+F10 or Meeting actions).
+The compact confirmation shows the unchanged meeting, both adjacent intervals
+and one 15–180-minute slider, defaulting to 30 minutes. Approval includes the
+original event's exact identity/fingerprint, not a replacement event. The worker
+and provider reject changed meetings, series masters, missing privacy metadata,
+incomplete fresh coverage and occupied intervals, including existing reserves.
+Only the two busy, non-Teams reserves are created. Private/personal/confidential
+parents receive private reserves; normal parents receive normal reserves.
+An unresolved operation for the same parent must be reviewed before another
+request can be approved.
+
+The calendar Teams flow follows Microsoft's
+[online meeting guidance](https://learn.microsoft.com/en-us/graph/outlook-calendar-online-meetings)
+and [create-event contract](https://learn.microsoft.com/en-us/graph/api/user-post-events?view=graph-rest-1.0).
+Tenant policy can still reject writes or online meetings; offline tests do not
+prove a particular tenant has granted those capabilities.
+
 Right-click a meeting or press **Shift+F10** on the selected meeting to open
 the same native actions. The detail pane also has a **Meeting actions** button.
 Category changes replace all previous categories with one existing category;

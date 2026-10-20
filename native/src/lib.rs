@@ -13,6 +13,7 @@ pub mod copilot;
 mod credentials;
 pub mod decision;
 pub mod evidence;
+pub mod event_creation;
 pub mod fixture_cache;
 mod html_text;
 pub mod i18n;

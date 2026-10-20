@@ -58,6 +58,11 @@ struct Sources {
 }
 
 pub enum Command {
+    CreateEvents {
+        record: Box<crate::event_creation::Record>,
+        reply: async_mpsc::Sender<crate::event_creation::CreationResult>,
+        wake: std::sync::mpsc::SyncSender<crate::worker::Command>,
+    },
     CalendarChange {
         operation: Box<crate::recommendations::Operation>,
         verify_only: bool,
@@ -736,6 +741,37 @@ impl Engine {
                         _ = tokio::time::sleep_until(next_source_refresh), if !stopping && !demo && !sources_busy && source_index.as_ref().is_some_and(|index| index.has_local_sources()) => {}
                         command = input.recv(), if !stopping => {
                             match command {
+                                Some(Command::CreateEvents { record, reply, wake }) => {
+                                    let connection = workiq.clone().filter(|connection| !demo && !calendar_mutating
+                                        && connection.is_active() && connection.account == record.account);
+                                    let admitted = connection.is_some();
+                                    if admitted { calendar_mutating = true; }
+                                    let telemetry = telemetry.clone();
+                                    tasks.spawn(async move {
+                                        use crate::event_creation::{CreationResult, State};
+                                        let id = record.id.clone();
+                                        let outcome = match connection {
+                                            Some(connection) => {
+                                                telemetry.record("calendar", "confirmed_creation_started", None, 0);
+                                                // Each provider call has its own deadline. Keep verified earlier
+                                                // parts if a later write fails instead of losing partial success.
+                                                crate::workiq::connection::calendar_write::create_events(connection.as_ref(), &record).await
+                                            }
+                                            None => CreationResult { id, state: State::NotSent, events: Vec::new(),
+                                                message: "Calendar writes are unavailable or busy; nothing was submitted".into() },
+                                        };
+                                        telemetry.record("calendar", match outcome.state {
+                                            State::Created => "creation_readback_verified",
+                                            State::NotSent => "creation_not_submitted_or_rejected",
+                                            _ => "creation_requires_review",
+                                        }, None, 0);
+                                        let result = tokio::time::timeout(Duration::from_secs(10), reply.send(outcome)).await
+                                            .map_err(|_| "Event creation outcome delivery timed out".to_owned())
+                                            .and_then(|result| result.map_err(|_| "Event creation outcome could not reach storage".to_owned()));
+                                        let _ = wake.try_send(crate::worker::Command::Wake);
+                                        Completion::CalendarDelivered { admitted, result }
+                                    });
+                                }
                                 Some(Command::CalendarChange { operation, verify_only, reply, wake }) => {
                                     let connection = workiq.clone().filter(|connection| !demo && !calendar_mutating
                                         && connection.is_active() && connection.account == operation.recommendation.account);

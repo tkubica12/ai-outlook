@@ -64,6 +64,57 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn event_creations(&self) -> Result<std::collections::BTreeMap<String, crate::event_creation::Record>> {
+        let mut query = self.connection.prepare(
+            "SELECT payload FROM settings WHERE key LIKE 'event-creation-%' ORDER BY rowid DESC LIMIT 513"
+        ).map_err(|_| "Read event creation history failed")?;
+        let rows = query.query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| "Read event creation history failed")?;
+        let mut records = std::collections::BTreeMap::new();
+        for row in rows {
+            let payload = row.map_err(|_| "Read event creation history failed")?;
+            if payload.len() > 64 * 1024 { return Err("Saved event creation exceeds its safety limit".into()); }
+            let mut record: crate::event_creation::Record = serde_json::from_str(&payload)
+                .map_err(|_| "Saved event creation is invalid")?;
+            record.validate()?;
+            if record.state == crate::event_creation::State::Creating {
+                record.state = crate::event_creation::State::Review;
+                record.message = crate::workiq::connection::calendar_write::UNCERTAIN.into();
+            }
+            records.insert(record.id.clone(), record);
+        }
+        if records.len() > 512 { return Err("Event creation history reached its safety limit".into()); }
+        Ok(records)
+    }
+
+    pub fn approve_event_creation(&self, record: &crate::event_creation::Record) -> Result<()> {
+        record.validate()?;
+        if record.state != crate::event_creation::State::Creating
+            || self.calendar_owner()?.as_deref() != Some(record.account.as_str()) {
+            return Err("Calendar account or event creation approval changed".into());
+        }
+        let payload = serde_json::to_string(record).map_err(|_| "Encode event creation approval failed")?;
+        if payload.len() > 64 * 1024 { return Err("Saved event creation exceeds its safety limit".into()); }
+        self.connection.execute(
+            "INSERT INTO settings(key,payload) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET payload=excluded.payload
+             WHERE json_extract(settings.payload,'$.state')='NotSent'",
+            params![format!("event-creation-{}", record.id),payload])
+            .and_then(|count| if count == 1 { Ok(()) } else { Err(rusqlite::Error::InvalidQuery) })
+            .map_err(|_| "Event creation approval was already consumed or could not be saved")?;
+        Ok(())
+    }
+
+    pub fn save_event_creation(&self, record: &crate::event_creation::Record) -> Result<()> {
+        let payload = serde_json::to_string(record).map_err(|_| "Encode event creation result failed")?;
+        if self.connection.execute("UPDATE settings SET payload=?1 WHERE key=?2",
+            params![payload,format!("event-creation-{}", record.id)])
+            .map_err(|_| "Persist event creation result failed")? != 1 {
+            return Err("Event creation approval no longer exists".into());
+        }
+        Ok(())
+    }
+
     pub fn read_only(root: &Path) -> Result<Self> {
         let connection = Connection::open_with_flags(
             root.join("tomlook.db"),

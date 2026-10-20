@@ -23,7 +23,7 @@ pub mod cloud;
 
 pub const SDK_TOOL: &str = "tomlook_workiq_fetch";
 pub const CONTEXT_TOOL: &str = "tomlook_workiq_context";
-const EVENT_FIELDS: &str = "id,subject,start,end,categories,attendees,organizer,location,responseStatus,showAs,isAllDay,isOrganizer,webLink,isCancelled,type";
+const EVENT_FIELDS: &str = "id,subject,start,end,categories,attendees,organizer,location,responseStatus,showAs,isAllDay,isOrganizer,webLink,isCancelled,type,sensitivity,isOnlineMeeting,onlineMeetingProvider,onlineMeeting";
 pub(crate) const CONTEXT_TIMEOUT: &str = "WorkIQ context read timed out";
 pub(super) const READ_TOO_LARGE: &str =
     "WorkIQ read exceeded its 1 MiB data limit; narrow the query";
@@ -786,6 +786,11 @@ fn graph_time(value: GraphTime) -> Result<DateTime<FixedOffset>, String> {
 }
 
 fn parse_event(value: Value) -> Result<Event, String> {
+    let creation_metadata = [
+        "sensitivity", "isOnlineMeeting", "onlineMeetingProvider", "onlineMeeting",
+        "transactionId", "body",
+    ].into_iter().filter_map(|key| value.get(key).map(|value| (key.to_owned(), value.clone())))
+        .collect::<BTreeMap<_, _>>();
     let event: GraphEvent =
         serde_json::from_value(value).map_err(|_| "WorkIQ calendar event has an invalid shape")?;
     if event.id.len() > 4000
@@ -827,6 +832,7 @@ fn parse_event(value: Value) -> Result<Event, String> {
         ("showAs".into(), json!(event.show_as)),
         ("categories".into(), json!(event.categories)),
     ]);
+    extra.extend(creation_metadata);
     if let Some(event_type) = event.event_type {
         extra.insert("type".into(), json!(event_type));
     }

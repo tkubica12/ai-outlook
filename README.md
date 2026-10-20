@@ -37,9 +37,9 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The latest native Windows release is **[v0.4.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.4.0)**.
-Read the [release notes](docs/releases/v0.4.0.md) for changes since v0.3.0.
-Download **[Tomlook-v0.4.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.4.0/Tomlook-v0.4.0-win-x64.zip)**
+The latest native Windows release is **[v0.5.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.5.0)**.
+Read the [release notes](docs/releases/v0.5.0.md) for changes since v0.4.0.
+Download **[Tomlook-v0.5.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.5.0/Tomlook-v0.5.0-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable, unsigned,
 and does not install anything.
@@ -118,6 +118,33 @@ used, never a title prefix or merely a free availability slot. When the provider
 does not expose Follow, Tomlook cannot reliably distinguish it from no response.
 Expanded Insights use section cards, action headings and source counts rather
 than one continuous text block.
+
+Create an appointment by clicking an empty timeline slot or dragging its start
+and end (either direction), or use **New event** in any view. The compact EN/CZ
+editor has 15-minute time sliders, title, optional description, direct category
+buttons, a **Private** lock and optional **Teams**. Enabling Private selects an
+existing `osobní`/`personal` category; all created items inherit Outlook private
+sensitivity, including travel reserves. Delegates explicitly permitted to read
+private items may still see details. **Add travel blocks before and after**
+creates two adjacent busy appointments, 30 minutes each by default, adjustable
+from 15 to 180 minutes. Travel is uncategorized and has no Teams link.
+The editor warns about cached conflicts and missing coverage. No attendees,
+room reservations, recurrence or invitation sending are included.
+**Create event** is the explicit approval for the displayed event and both
+optional reserves. Teams uses Graph's calendar `isOnlineMeeting` /
+`teamsForBusiness` support, checked against the connected calendar before writing.
+The returned join URL appears in meeting details. Progress and exact/partial
+outcomes are saved under **Messages → Event creation**. Each write is read back;
+unknown or interrupted outcomes are never automatically replayed, and successful
+earlier parts are not rolled back if a later reserve fails. Check Outlook before
+recreating anything after an uncertain result.
+For an existing owned, timed meeting, right-click and choose **Add travel blocks
+before and after**. Confirm the two displayed intervals (30 minutes each by
+default, adjustable to 15–180 minutes). This creates only the reserves, never
+another copy of the meeting. Privacy is inherited; a fresh meeting/availability
+check prevents writes against changed meetings or occupied intervals, including
+already existing travel blocks.
+
 The neutral status-bar bell opens a larger recommendation list with one selected
 detail, clear action, meeting and rationale. Skip is remembered across research,
 metadata changes and restarts. `office` means the home/employer office; customer or partner

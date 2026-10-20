@@ -91,6 +91,99 @@ pub trait Api: Send + Sync {
     async fn removed(&self, _id: &str) -> Result<bool, String> {
         Err("Calendar removal read-back is unavailable".into())
     }
+    async fn creation_capability(&self, _teams: bool) -> Result<(), String> {
+        Err("Calendar provider has no verified event creation capability".into())
+    }
+    async fn create(&self, _part: &crate::event_creation::Part) -> Result<String, SubmissionError> {
+        Err(SubmissionError::InvalidRequest)
+    }
+    async fn created_event(&self, id: &str) -> Result<Event, String> {
+        self.event(id).await
+    }
+}
+
+pub async fn create_events(
+    api: &impl Api,
+    record: &crate::event_creation::Record,
+) -> crate::event_creation::CreationResult {
+    use crate::event_creation::{CreationResult, State};
+    let mut result = CreationResult {
+        id: record.id.clone(), state: State::NotSent, events: Vec::new(), message: String::new(),
+    };
+    let validation = async {
+        record.validate()?;
+        if record.state != State::Creating || record.account != api.account() {
+            return Err("Calendar account or event creation approval changed".to_owned());
+        }
+        api.creation_capability(record.draft.teams).await?;
+        if let Some(parent) = &record.parent {
+            let current = api.event(&parent.id).await?;
+            if crate::scheduler::fingerprint(&current) != crate::scheduler::fingerprint(parent) {
+                return Err("Meeting changed after the recommendation; no calendar write was submitted".into());
+            }
+            crate::event_creation::validate_travel_parent(&current)?;
+            let parts = record.parts();
+            let first = parts.first().ok_or("Travel time is unavailable")?.start.with_timezone(&Local).date_naive();
+            let last = parts.last().ok_or("Travel time is unavailable")?.end.with_timezone(&Local).date_naive();
+            let calendar = api.calendar(Range::new(first, last)?).await?;
+            if !(0..=(last - first).num_days()).all(|offset| calendar.coverage.contains(&(first + chrono::Duration::days(offset)))) {
+                return Err("Calendar coverage is incomplete; no write was submitted".into());
+            }
+            if calendar.events.iter().any(|event| event.id != parent.id
+                && event.extra.get("isCancelled").and_then(Value::as_bool) != Some(true)
+                && event.extra.get("showAs").and_then(Value::as_str) != Some("free")
+                && parts.iter().any(|part| event.start < part.end && event.end > part.start)) {
+                return Err("The proposed interval is no longer free; no calendar write was submitted".into());
+            }
+        }
+        Ok::<(), String>(())
+    }.await;
+    if let Err(message) = validation {
+        result.message = message;
+        return result;
+    }
+    for part in record.parts() {
+        let id = match api.create(&part).await {
+            Ok(id) => id,
+            Err(error) => {
+                result.state = if result.events.is_empty() && !matches!(error, SubmissionError::Unknown) {
+                    State::NotSent
+                } else { State::Review };
+                result.message = match error {
+                    SubmissionError::Denied => POLICY_BLOCKED.into(),
+                    SubmissionError::Rejected(status) => format!("Calendar provider rejected the write with HTTP {status}; nothing was changed by this request"),
+                    SubmissionError::RejectedWithCode(status, code) => format!("Calendar provider rejected the write with HTTP {status} ({code}); nothing was changed by this request"),
+                    SubmissionError::InvalidRequest => "Confirmed calendar request is invalid; no write was submitted".into(),
+                    SubmissionError::Unknown => UNCERTAIN.into(),
+                };
+                if !result.events.is_empty() {
+                    result.message = format!("{}\n{}", "Some events were created; remaining events were not completed. Inspect Outlook before creating anything again.", result.message);
+                }
+                return result;
+            }
+        };
+        let mut verified = None;
+        for attempt in 0..4 {
+            if let Ok(event) = api.created_event(&id).await
+                && event.id == id && part.verified(&event) {
+                verified = Some(event);
+                break;
+            }
+            if attempt < 3 { tokio::time::sleep(Duration::from_millis(500)).await; }
+        }
+        let Some(mut event) = verified else {
+            result.state = State::Review;
+            result.message = "Event creation could not be verified completely. Inspect Outlook; no write will be repeated automatically.".into();
+            return result;
+        };
+        // Full invitation text is only needed for this read-back, not the calendar cache.
+        event.extra.remove("body");
+        event.extra.remove("transactionId");
+        result.events.push(event);
+    }
+    result.state = State::Created;
+    result.message = "All requested events were created and verified".into();
+    result
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -382,6 +475,37 @@ impl Api for Connection {
         Ok(())
     }
 
+    async fn creation_capability(&self, teams: bool) -> Result<(), String> {
+        if !self.is_active() {
+            return Err("WorkIQ is disconnected; sign in again".into());
+        }
+        let schema = discover_schema(self, true).await?;
+        let schema = schema.get("data").unwrap_or(&schema);
+        if !compatible_creation_schema(schema) {
+            return Err("Calendar provider has no compatible event creation schema; nothing was submitted".into());
+        }
+        if teams {
+            let calendar = self.fetch_in("/me/calendar?$select=allowedOnlineMeetingProviders", &self.admission.calendar).await?;
+            if !calendar["allowedOnlineMeetingProviders"].as_array().is_some_and(|providers| providers.iter().any(|provider| provider == "teamsForBusiness")) {
+                return Err("This calendar does not support Teams meetings; turn off Teams or ask your administrator".into());
+            }
+        }
+        Ok(())
+    }
+    async fn create(&self, part: &crate::event_creation::Part) -> Result<String, SubmissionError> {
+        if !self.is_active() { return Err(SubmissionError::InvalidRequest); }
+        let arguments = json!({"parentUrl":"/me/events","jsonBody":part.body().to_string()});
+        let request = CallToolRequestParams::new("create_entity").with_arguments(
+            arguments.as_object().cloned().ok_or(SubmissionError::InvalidRequest)?);
+        let result = tokio::time::timeout(Duration::from_secs(60), self.peer.call_tool(request))
+            .await.map_err(|_| SubmissionError::Unknown)?.map_err(|_| SubmissionError::Unknown)?;
+        created_id(&result)
+    }
+    async fn created_event(&self, id: &str) -> Result<Event, String> {
+        parse_event(self.fetch_in(
+            &format!("{}?$select={EVENT_FIELDS},transactionId,body", event_path(id)?),
+            &self.admission.calendar).await?)
+    }
     async fn event(&self, id: &str) -> Result<Event, String> {
         parse_event(
             self.fetch_in(
@@ -425,6 +549,30 @@ impl Api for Connection {
             .map_err(|_| SubmissionError::Unknown)?
             .map_err(|_| SubmissionError::Unknown)?;
         submission_result(&result, operation)
+    }
+}
+
+fn compatible_creation_schema(schema: &Value) -> bool {
+    compatible_schema(schema, true)
+        && ["body", "sensitivity", "isOnlineMeeting", "onlineMeetingProvider", "attendees"]
+            .iter().all(|name| {
+                // Like subject/categories, sensitivity is inherited from outlookItem
+                // and is omitted by WorkIQ's flattened microsoft.graph.event schema.
+                schema_property(schema, schema, name, 0).map_or(*name == "sensitivity", |property| {
+                    property["readOnly"] != true
+                })
+            })
+}
+
+fn created_id(result: &rmcp::model::CallToolResult) -> Result<String, SubmissionError> {
+    let payload = hosted::read_json_payload(result).map_err(|_| SubmissionError::Unknown)?;
+    match payload["statusCode"].as_u64() {
+        Some(401 | 403) => Err(SubmissionError::Denied),
+        Some(status @ (400 | 404 | 409 | 412 | 422 | 429)) => Err(provider_error_code(&payload)
+            .map_or(SubmissionError::Rejected(status as u16), |code| SubmissionError::RejectedWithCode(status as u16, code))),
+        Some(200 | 201) if result.is_error != Some(true) => payload["data"]["id"].as_str()
+            .filter(|id| event_path(id).is_ok()).map(str::to_owned).ok_or(SubmissionError::Unknown),
+        _ => Err(SubmissionError::Unknown),
     }
 }
 
@@ -627,6 +775,167 @@ mod tests {
         Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
+
+    struct CreationFake {
+        bodies: Mutex<Vec<Value>>,
+        writes: AtomicUsize,
+        reject: Option<usize>,
+        unknown: bool,
+        unsupported: bool,
+        wrong_readback: bool,
+        parent: Option<Event>,
+        busy: bool,
+        incomplete: bool,
+    }
+
+    #[async_trait]
+    impl Api for CreationFake {
+        fn account(&self) -> &str { "owner" }
+        async fn schema(&self, _: bool) -> Result<(), String> { Ok(()) }
+        async fn event(&self, id: &str) -> Result<Event, String> {
+            if let Some(parent) = &self.parent && parent.id == id { return Ok(parent.clone()); }
+            let index = id.strip_prefix("created-").unwrap().parse::<usize>().unwrap();
+            let mut body = self.bodies.lock().unwrap()[index].clone();
+            body["id"] = json!(id);
+            body["isOrganizer"] = json!(true);
+            if body["isOnlineMeeting"] == true {
+                body["onlineMeeting"] = json!({"joinUrl":"https://teams.microsoft.com/l/meetup-join/example"});
+            }
+            if self.wrong_readback { body["sensitivity"] = json!("normal"); }
+            parse_event(body)
+        }
+        async fn calendar(&self, range: Range) -> Result<Calendar, String> {
+            let parent = self.parent.as_ref().expect("New appointments do not need a calendar read");
+            let mut events = vec![parent.clone()];
+            if self.busy {
+                let mut blocker = parent.clone();
+                blocker.id = "already-existing-travel".into();
+                blocker.end = parent.start;
+                blocker.start = parent.start - chrono::Duration::minutes(30);
+                blocker.extra.insert("showAs".into(), json!("busy"));
+                events.push(blocker);
+            }
+            let coverage = if self.incomplete { Default::default() } else {
+                (0..=(range.last - range.first).num_days()).map(|offset| range.first + chrono::Duration::days(offset)).collect()
+            };
+            Calendar::build(events, coverage, Vec::new())
+        }
+        async fn submit(&self, _: &Operation) -> Result<String, SubmissionError> { panic!("Creation must use its exact approval") }
+        async fn creation_capability(&self, _: bool) -> Result<(), String> {
+            if self.unsupported { Err("Unsupported calendar".into()) } else { Ok(()) }
+        }
+        async fn create(&self, part: &crate::event_creation::Part) -> Result<String, SubmissionError> {
+            let index = self.writes.fetch_add(1, Ordering::Relaxed);
+            if self.reject == Some(index) {
+                return Err(if self.unknown { SubmissionError::Unknown } else { SubmissionError::Denied });
+            }
+            self.bodies.lock().unwrap().push(part.body());
+            Ok(format!("created-{index}"))
+        }
+    }
+
+    fn creation_fake() -> CreationFake {
+        CreationFake { bodies: Mutex::new(Vec::new()), writes: AtomicUsize::new(0),
+            reject: None, unknown: false, unsupported: false, wrong_readback: false,
+            parent: None, busy: false, incomplete: false }
+    }
+
+    #[tokio::test]
+    async fn existing_meeting_creates_only_two_private_travel_blocks_without_copying_or_updating_parent() {
+        use crate::event_creation::{Record, State, tests::parent};
+        let record = Record::travel("owner".into(), parent(), 45, crate::i18n::Language::En).unwrap();
+        let mut fake = creation_fake();
+        fake.parent = record.parent.clone();
+        let result = create_events(&fake, &record).await;
+        assert_eq!(result.state, State::Created);
+        assert_eq!(result.events.len(), 2);
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 2);
+        let bodies = fake.bodies.lock().unwrap();
+        assert!(bodies.iter().all(|body| body["subject"] != record.draft.title
+            && body["sensitivity"] == "private" && body["isOnlineMeeting"] == false));
+    }
+
+    #[tokio::test]
+    async fn existing_meeting_travel_rejects_changed_parent_missing_coverage_and_existing_buffers() {
+        use crate::event_creation::{Record, State, tests::parent};
+        let record = Record::travel("owner".into(), parent(), 30, crate::i18n::Language::En).unwrap();
+        for case in 0..3 {
+            let mut fake = creation_fake();
+            fake.parent = record.parent.clone();
+            match case {
+                0 => fake.parent.as_mut().unwrap().title = "Changed after approval".into(),
+                1 => fake.incomplete = true,
+                _ => fake.busy = true,
+            }
+            let result = create_events(&fake, &record).await;
+            assert_eq!(result.state, State::NotSent);
+            assert_eq!(fake.writes.load(Ordering::Relaxed), 0);
+        }
+        let mut fake = creation_fake();
+        fake.parent = record.parent.clone();
+        fake.reject = Some(1);
+        let result = create_events(&fake, &record).await;
+        assert_eq!(result.state, State::Review);
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn creation_verifies_all_three_events_and_stops_at_rejected_or_uncertain_parts() {
+        use crate::event_creation::{Record, State, tests::draft};
+        let record = Record::new("owner".into(), draft()).unwrap();
+        let fake = creation_fake();
+        let result = create_events(&fake, &record).await;
+        assert_eq!(result.state, State::Created);
+        assert_eq!(result.events.len(), 3);
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 3);
+        assert!(result.events.iter().all(|event| !event.extra.contains_key("body")));
+        for (index, unknown, state, verified) in [
+            (0, false, State::NotSent, 0), (0, true, State::Review, 0),
+            (1, false, State::Review, 1), (2, false, State::Review, 2),
+        ] {
+            let mut fake = creation_fake();
+            fake.reject = Some(index);
+            fake.unknown = unknown;
+            let result = create_events(&fake, &record).await;
+            assert_eq!(result.state, state);
+            assert_eq!(result.events.len(), verified);
+            assert_eq!(fake.writes.load(Ordering::Relaxed), index + 1, "Never retry a write");
+            assert!(!result.message.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn creation_requires_exact_account_supported_schema_and_private_readback() {
+        use crate::event_creation::{Record, State, tests::draft};
+        let mut record = Record::new("other".into(), draft()).unwrap();
+        let fake = creation_fake();
+        assert_eq!(create_events(&fake, &record).await.state, State::NotSent);
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 0);
+        record = Record::new("owner".into(), draft()).unwrap();
+        let mut fake = creation_fake();
+        fake.unsupported = true;
+        assert_eq!(create_events(&fake, &record).await.state, State::NotSent);
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 0);
+        fake.unsupported = false;
+        fake.wrong_readback = true;
+        assert_eq!(create_events(&fake, &record).await.state, State::Review);
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 1, "No buffers after unverified private event");
+    }
+
+    #[test]
+    fn creation_schema_accepts_known_inherited_sensitivity_but_not_read_only_or_missing_teams() {
+        let mut schema = json!({"title":"microsoft.graph.event","type":"object","properties":{
+            "start":{},"end":{},"showAs":{},"isAllDay":{},"transactionId":{},"isReminderOn":{},
+            "body":{},"attendees":{},"isOnlineMeeting":{},"onlineMeetingProvider":{}
+        }});
+        assert!(compatible_creation_schema(&schema));
+        schema["properties"]["sensitivity"] = json!({"readOnly":true});
+        assert!(!compatible_creation_schema(&schema));
+        schema["properties"]["sensitivity"] = json!({"type":"string"});
+        schema["properties"].as_object_mut().unwrap().remove("onlineMeetingProvider");
+        assert!(!compatible_creation_schema(&schema));
+    }
 
     #[tokio::test]
     #[ignore = "Requires an explicit saved approval fingerprint and app-owned WorkIQ sign-in; performs reads only"]
