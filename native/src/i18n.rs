@@ -153,57 +153,325 @@ fn capture<'a>(pattern: &str, text: &'a str) -> Option<Vec<&'a str>> {
 }
 
 pub const TEXTS: &[(&str, &str)] = &[
+    ("Settings", "Nastavení"),
+    ("Auto: not checked", "Auto: neověřeno"),
+    ("Auto: checking...", "Auto: ověřování..."),
+    ("Auto: Azure signed in", "Auto: Azure přihlášeno"),
+    ("Auto: sign-in required", "Auto: nutné přihlášení"),
+    ("Auto: not configured", "Auto: nenastaveno"),
+    ("Auto: unavailable", "Auto: nedostupné"),
+    ("Auto: signing in...", "Auto: přihlašování..."),
+    (
+        "Azure sign-in verified. Deployment access is checked when Auto runs.",
+        "Přihlášení Azure je ověřené. Přístup k nasazenému modelu se ověří při použití Auto.",
+    ),
+    (
+        "Checking Auto Azure sign-in...",
+        "Ověřuje se přihlášení Azure pro Auto...",
+    ),
+    (
+        "Starting Azure device-code sign-in...",
+        "Spouští se přihlášení Azure pomocí kódu...",
+    ),
+    (
+        "Enter this code on Microsoft's device sign-in page.",
+        "Zadejte tento kód na přihlašovací stránce Microsoftu.",
+    ),
+    ("Copy code", "Kopírovat kód"),
+    (
+        "Open Microsoft device sign-in",
+        "Otevřít přihlášení Microsoft",
+    ),
+    ("Cancel Azure sign-in", "Zrušit přihlášení Azure"),
+    (
+        "Sign in to Azure (device code)",
+        "Přihlásit Azure pomocí kódu",
+    ),
+    ("Check Auto connection", "Ověřit připojení Auto"),
+    ("Fix Auto connection", "Vyřešit připojení Auto"),
+    (
+        "Quick and Thorough use Copilot without Auto's Azure sign-in.",
+        "Režimy Rychle a Důkladně používají Copilot a toto přihlášení Azure nepotřebují.",
+    ),
+    (
+        "Uses your Azure CLI profile; its default account may change during sign-in.",
+        "Používá váš profil Azure CLI; přihlášení může změnit jeho výchozí účet.",
+    ),
+    (
+        "Azure device-code sign-in cancelled. No question was retried.",
+        "Přihlášení Azure bylo zrušeno. Žádný dotaz nebyl znovu odeslán.",
+    ),
+    (
+        "Azure device-code sign-in timed out. Start sign-in again for a new code.",
+        "Platnost přihlášení Azure vypršela. Nový kód získáte opětovným spuštěním přihlášení.",
+    ),
+    (
+        "Azure device-code sign-in failed or was blocked by tenant policy. Check the configured tenant and try again.",
+        "Přihlášení Azure se nezdařilo nebo ho blokují pravidla tenantu. Zkontrolujte nastavený tenant a zkuste to znovu.",
+    ),
+    (
+        "Configured Azure CLI could not start. Check its installation and decision-router.json.",
+        "Nastavené Azure CLI nelze spustit. Zkontrolujte instalaci a decision-router.json.",
+    ),
+    (
+        "Azure sign-in check timed out. Check connectivity and retry.",
+        "Ověření přihlášení Azure překročilo časový limit. Zkontrolujte připojení a zkuste to znovu.",
+    ),
+    (
+        "Offline demo never opens Azure sign-in.",
+        "Offline ukázka nikdy nespouští přihlášení Azure.",
+    ),
+    (
+        "Retrying isolated AI connection...",
+        "Obnovuje se izolované připojení AI...",
+    ),
+    (
+        "WorkIQ connection interrupted.",
+        "Připojení WorkIQ bylo přerušeno.",
+    ),
+    ("Display", "Zobrazení"),
+    ("Language", "Jazyk"),
+    ("Theme", "Motiv"),
+    (
+        "Calendar provider returned a different meeting; no write was submitted",
+        "Poskytovatel kalendáře vrátil jinou schůzku. Žádný zápis nebyl odeslán.",
+    ),
+    ("AI prompts", "AI prompty"),
+    (
+        "Personal guidance only; evidence, privacy and write-safety rules stay enforced.",
+        "Osobní pokyny pro AI; pravidla pro podklady, soukromí a bezpečné zápisy zůstávají platná.",
+    ),
+    ("Before the meeting", "Před schůzkou"),
+    ("After the meeting", "Po schůzce"),
+    ("Quick answers", "Rychlé odpovědi"),
+    ("Thorough research", "Důkladné zjišťování"),
+    ("Workplace research", "Pracovní kontext"),
+    ("Save prompts", "Uložit prompty"),
+    ("Restore default", "Obnovit výchozí"),
+    (
+        "Saved notes are not reprocessed when prompts change.",
+        "Změna promptů nezpracovává již uložené zápisy znovu.",
+    ),
+    (
+        "Each prompt needs 1 to 4000 UTF-8 bytes and no unsupported control characters",
+        "Každý prompt musí obsahovat 1 až 4000 bajtů UTF-8 a nesmí obsahovat nepodporované řídicí znaky.",
+    ),
+    ("Previous month", "Předchozí měsíc"),
+    ("Next month", "Následující měsíc"),
+    ("Follow", "Sledovat"),
+    ("Stop following", "Přestat sledovat"),
+    (
+        "Follow is for invitations, not meetings you organize",
+        "Follow lze použít u pozvánek, ne u schůzek, které organizujete.",
+    ),
+    (
+        "Refresh the calendar first; Follow needs verified invitation details",
+        "Nejprve obnovte kalendář. Follow vyžaduje ověřené údaje o pozvánce.",
+    ),
+    ("This meeting is not followed", "Tato schůzka nemá Follow."),
+    (
+        "Follow requires room for one more calendar category",
+        "Pro Follow je potřeba místo na jednu další kategorii.",
+    ),
+    (
+        "Adds Follow, keeps other categories and marks this occurrence as free. Your invitation response is unchanged; the organizer is not notified.",
+        "Přidá kategorii Follow, zachová ostatní kategorie a označí tento výskyt jako volno. Odpověď na pozvánku se nemění a organizátor nedostane oznámení.",
+    ),
+    (
+        "Removes Follow only. Availability stays unchanged; the organizer is not notified.",
+        "Odebere pouze kategorii Follow. Dostupnost se nemění a organizátor nedostane oznámení.",
+    ),
+    ("Meeting ended", "Schůzka již proběhla"),
+    ("Meeting notes", "Zápis ze schůzky"),
+    ("Check transcript", "Zkontrolovat přepis"),
+    (
+        "No AI meeting notes yet.",
+        "AI zápis zatím není k dispozici.",
+    ),
+    ("AI meeting notes ready", "AI zápis je připraven"),
+    ("AI preparation ready", "AI příprava je připravena"),
+    ("My tasks", "Moje úkoly"),
+    ("Mentions of me", "Zmínky o mně"),
+    (
+        "Technical takeaways and materials",
+        "Technické poznatky a materiály",
+    ),
+    (
+        "Decisions and unresolved issues",
+        "Rozhodnutí a otevřené body",
+    ),
+    ("Original meeting source", "Původní zdroj schůzky"),
+    ("Required", "Povinný"),
+    ("Optional", "Nepovinný"),
+    ("Resource", "Prostředek"),
+    ("Role unavailable", "Role není dostupná"),
+    (
+        "Previous attempt; no calendar change was sent.",
+        "Předchozí pokus; žádná změna kalendáře nebyla odeslána.",
+    ),
+    ("Retry calendar change", "Zkusit změnu znovu"),
+    (
+        "Checking transcript and meeting chat",
+        "Kontroluji přepis a chat schůzky",
+    ),
+    (
+        "Waiting for a transcript (up to 7 days after the meeting)",
+        "Čeká na přepis, nejdéle 7 dní po schůzce",
+    ),
+    (
+        "Automatic notes cover accepted or followed online meetings from the last 7 days.",
+        "Automatické zápisy zahrnují přijaté nebo sledované online schůzky za posledních 7 dní.",
+    ),
+    (
+        "Meeting notes require an accepted or followed online meeting that ended within the last 7 days",
+        "Zápis vyžaduje přijatou nebo sledovanou online schůzku, která skončila během posledních 7 dní.",
+    ),
+    (
+        "AI notes from the original transcript and available meeting chat; verify assignments against sources",
+        "AI zápis z původního přepisu a dostupného chatu; úkoly ověřte v původních zdrojích",
+    ),
+    (
+        "Read-only research interrupted; other meetings can continue",
+        "Zjišťování bylo přerušeno; ostatní schůzky se mohou zpracovávat dál",
+    ),
     ("Create travel blocks", "Vytvořit přesuny"),
     ("Creating travel blocks", "Vytváření přesunů"),
     ("Travel blocks created", "Přesuny vytvořeny"),
     ("Travel blocks not created", "Přesuny nebyly vytvořeny"),
-    ("Check travel blocks in Outlook", "Zkontrolujte přesuny v Outlooku"),
-    ("The existing meeting stays unchanged; only two travel blocks are created.", "Původní schůzka zůstane beze změny; vytvoří se pouze dva přesuny."),
-    ("Travel blocks require your own timed meeting", "Přesuny lze přidat pouze k vlastní schůzce s konkrétním časem"),
-    ("Refresh the calendar first; the meeting's privacy is unavailable", "Nejprve obnovte kalendář; soukromí schůzky zatím není známé"),
+    (
+        "Check travel blocks in Outlook",
+        "Zkontrolujte přesuny v Outlooku",
+    ),
+    (
+        "The existing meeting stays unchanged; only two travel blocks are created.",
+        "Původní schůzka zůstane beze změny; vytvoří se pouze dva přesuny.",
+    ),
+    (
+        "Travel blocks require your own timed meeting",
+        "Přesuny lze přidat pouze k vlastní schůzce s konkrétním časem",
+    ),
+    (
+        "Refresh the calendar first; the meeting's privacy is unavailable",
+        "Nejprve obnovte kalendář; soukromí schůzky zatím není známé",
+    ),
     ("Travel time is unavailable", "Délka přesunu není dostupná"),
     ("New event", "Nová událost"),
-    ("Click or drag an empty time in the calendar", "Klikněte do volného času nebo vyberte interval tažením myši"),
+    (
+        "Click or drag an empty time in the calendar",
+        "Klikněte do volného času nebo vyberte interval tažením myši",
+    ),
     ("Event title", "Název události"),
     ("Start", "Začátek"),
     ("End", "Konec"),
-    ("Local time; 15-minute steps. 24:00 is the next midnight.", "Místní čas, kroky po 15 minutách. 24:00 je půlnoc následujícího dne."),
+    (
+        "Local time; 15-minute steps. 24:00 is the next midnight.",
+        "Místní čas, kroky po 15 minutách. 24:00 je půlnoc následujícího dne.",
+    ),
     ("Description (optional)", "Popis (nepovinný)"),
     ("Private event", "Soukromá událost"),
-    ("Private in Outlook; delegates allowed to view private items may still see details.", "Soukromá v Outlooku; delegáti s oprávněním zobrazovat soukromé položky mohou podrobnosti stále vidět."),
-    ("No personal category was found; choose a category above.", "Osobní kategorie nebyla nalezena; vyberte kategorii nahoře."),
+    (
+        "Private in Outlook; delegates allowed to view private items may still see details.",
+        "Soukromá v Outlooku; delegáti s oprávněním zobrazovat soukromé položky mohou podrobnosti stále vidět.",
+    ),
+    (
+        "No personal category was found; choose a category above.",
+        "Osobní kategorie nebyla nalezena; vyberte kategorii nahoře.",
+    ),
     ("Teams meeting", "Schůzka v Teams"),
     ("Join Teams meeting", "Připojit se v Teams"),
-    ("Add travel blocks before and after", "Přidat přesun před událostí i po ní"),
+    (
+        "Add travel blocks before and after",
+        "Přidat přesun před událostí i po ní",
+    ),
     ("Each travel block", "Délka každého přesunu"),
     ("Travel to meeting", "Přesun na schůzku"),
     ("Travel from meeting", "Přesun ze schůzky"),
-    ("Creates busy appointments in your calendar. No attendees or room invitations.", "Vytvoří blokace času ve vašem kalendáři. Bez účastníků a rezervace místností."),
-    ("Not synced; availability has not been verified.", "Není synchronizováno; dostupnost času nebyla ověřena."),
+    (
+        "Creates busy appointments in your calendar. No attendees or room invitations.",
+        "Vytvoří blokace času ve vašem kalendáři. Bez účastníků a rezervace místností.",
+    ),
+    (
+        "Not synced; availability has not been verified.",
+        "Není synchronizováno; dostupnost času nebyla ověřena.",
+    ),
     ("Overlaps saved events", "Překrývá uložené události"),
     ("Create event", "Vytvořit událost"),
     ("Event creation", "Vytváření událostí"),
     ("Creating event", "Vytváření události"),
     ("Event created", "Událost vytvořena"),
     ("Event not created", "Událost nebyla vytvořena"),
-    ("Check event creation in Outlook", "Zkontrolujte vytvoření v Outlooku"),
-    ("All requested events were created and verified", "Všechny požadované události byly vytvořeny a ověřeny"),
-    ("Enter an event title (up to 1000 bytes)", "Zadejte název události (nejvýše 1000 bajtů)"),
-    ("The description is too long or contains unsupported characters", "Popis je příliš dlouhý nebo obsahuje nepodporované znaky"),
-    ("The event must end after it starts and last at most 24 hours", "Konec události musí být po začátku; nejdelší doba je 24 hodin"),
-    ("Choose an existing category", "Vyberte existující kategorii"),
-    ("Travel time must be 15 to 180 minutes in 15-minute steps", "Přesun musí trvat 15 až 180 minut v krocích po 15 minutách"),
-    ("Invalid event date or time", "Neplatné datum nebo čas události"),
-    ("This local time is missing or ambiguous because of daylight saving time", "Tento místní čas neexistuje nebo je nejednoznačný kvůli změně letního času"),
-    ("Event creation could not be queued; nothing was submitted", "Vytváření události se nepodařilo zařadit; nic nebylo odesláno"),
-    ("Calendar account or event creation approval changed", "Změnil se účet kalendáře nebo potvrzená událost"),
-    ("Wait for the current event creation to finish", "Počkejte na dokončení vytvářené události"),
-    ("Event creation history reached its safety limit", "Historie vytváření událostí dosáhla bezpečnostního limitu"),
-    ("Event creation approval was already consumed or could not be saved", "Potvrzení této události již bylo použito nebo se ho nepodařilo uložit"),
-    ("Calendar provider has no compatible event creation schema; nothing was submitted", "Poskytovatel kalendáře nemá kompatibilní schéma pro vytvoření události; nic nebylo odesláno"),
-    ("This calendar does not support Teams meetings; turn off Teams or ask your administrator", "Tento kalendář nepodporuje schůzky v Teams; vypněte Teams nebo kontaktujte správce"),
-    ("Some events were created; remaining events were not completed. Inspect Outlook before creating anything again.", "Některé události byly vytvořeny, zbývající nebyly dokončeny. Před dalším vytvářením zkontrolujte Outlook."),
-    ("Event creation could not be verified completely. Inspect Outlook; no write will be repeated automatically.", "Vytvoření události se nepodařilo úplně ověřit. Zkontrolujte Outlook; žádný zápis se nebude automaticky opakovat."),
+    (
+        "Check event creation in Outlook",
+        "Zkontrolujte vytvoření v Outlooku",
+    ),
+    (
+        "All requested events were created and verified",
+        "Všechny požadované události byly vytvořeny a ověřeny",
+    ),
+    (
+        "Enter an event title (up to 1000 bytes)",
+        "Zadejte název události (nejvýše 1000 bajtů)",
+    ),
+    (
+        "The description is too long or contains unsupported characters",
+        "Popis je příliš dlouhý nebo obsahuje nepodporované znaky",
+    ),
+    (
+        "The event must end after it starts and last at most 24 hours",
+        "Konec události musí být po začátku; nejdelší doba je 24 hodin",
+    ),
+    (
+        "Choose an existing category",
+        "Vyberte existující kategorii",
+    ),
+    (
+        "Travel time must be 15 to 180 minutes in 15-minute steps",
+        "Přesun musí trvat 15 až 180 minut v krocích po 15 minutách",
+    ),
+    (
+        "Invalid event date or time",
+        "Neplatné datum nebo čas události",
+    ),
+    (
+        "This local time is missing or ambiguous because of daylight saving time",
+        "Tento místní čas neexistuje nebo je nejednoznačný kvůli změně letního času",
+    ),
+    (
+        "Event creation could not be queued; nothing was submitted",
+        "Vytváření události se nepodařilo zařadit; nic nebylo odesláno",
+    ),
+    (
+        "Calendar account or event creation approval changed",
+        "Změnil se účet kalendáře nebo potvrzená událost",
+    ),
+    (
+        "Wait for the current event creation to finish",
+        "Počkejte na dokončení vytvářené události",
+    ),
+    (
+        "Event creation history reached its safety limit",
+        "Historie vytváření událostí dosáhla bezpečnostního limitu",
+    ),
+    (
+        "Event creation approval was already consumed or could not be saved",
+        "Potvrzení této události již bylo použito nebo se ho nepodařilo uložit",
+    ),
+    (
+        "Calendar provider has no compatible event creation schema; nothing was submitted",
+        "Poskytovatel kalendáře nemá kompatibilní schéma pro vytvoření události; nic nebylo odesláno",
+    ),
+    (
+        "This calendar does not support Teams meetings; turn off Teams or ask your administrator",
+        "Tento kalendář nepodporuje schůzky v Teams; vypněte Teams nebo kontaktujte správce",
+    ),
+    (
+        "Some events were created; remaining events were not completed. Inspect Outlook before creating anything again.",
+        "Některé události byly vytvořeny, zbývající nebyly dokončeny. Před dalším vytvářením zkontrolujte Outlook.",
+    ),
+    (
+        "Event creation could not be verified completely. Inspect Outlook; no write will be repeated automatically.",
+        "Vytvoření události se nepodařilo úplně ověřit. Zkontrolujte Outlook; žádný zápis se nebude automaticky opakovat.",
+    ),
     (
         "Automatic routing context exceeds its bounds; choose a mode explicitly",
         "Kontext automatického výběru překročil limit; vyberte režim ručně.",
@@ -214,7 +482,7 @@ pub const TEXTS: &[(&str, &str)] = &[
     ),
     (
         "Microsoft-Decision-1 needs a valid Azure CLI sign-in for the configured tenant and subscription; choose a mode explicitly",
-        "Microsoft-Decision-1 vyžaduje platné přihlášení Azure CLI pro nastavený tenant a předplatné; vyberte režim ručně.",
+        "Auto vyžaduje přihlášení Azure pro nastavený tenant a předplatné. Použijte přihlášení kódem nebo zvolte Rychle či Důkladně.",
     ),
     (
         "Microsoft-Decision-1 returned an invalid decision; choose a mode explicitly",
@@ -1738,6 +2006,10 @@ pub const TEXTS: &[(&str, &str)] = &[
 
 const PATTERNS: &[(&str, &str)] = &[
     (
+        "Automatic reconnect in about {} seconds.",
+        "Další automatický pokus přibližně za {0} s.",
+    ),
+    (
         "Microsoft-Decision-1 returned HTTP {}; choose a mode explicitly",
         "Microsoft-Decision-1 vrátil HTTP {0}; vyberte režim ručně.",
     ),
@@ -1912,6 +2184,11 @@ mod tests {
 
     #[test]
     fn recovery_connector_and_source_statuses_are_localized_without_changing_codes() {
+        assert_eq!(
+            Language::Cs
+                .text("WorkIQ connection interrupted.\nAutomatic reconnect in about 60 seconds."),
+            "Připojení WorkIQ bylo přerušeno.\nDalší automatický pokus přibližně za 60 s."
+        );
         assert_eq!(
             Language::Cs.text("Connector has no supported verification read"),
             "Konektor nenabízí podporovaný nástroj pro ověření přístupu."

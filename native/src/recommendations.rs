@@ -395,6 +395,24 @@ pub fn real_categories(event: &Event) -> Vec<String> {
         })
 }
 
+pub fn follow_categories(event: &Event, enabled: bool) -> Vec<String> {
+    let mut categories = real_categories(event);
+    categories.retain(|category| !category.eq_ignore_ascii_case("follow"));
+    if enabled {
+        categories.push("Follow".into());
+    }
+    categories
+}
+
+pub fn replacement_categories(event: &Event, category: Option<&str>) -> Vec<String> {
+    let mut categories = category.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    if real_categories(event).iter().any(|category| category.eq_ignore_ascii_case("follow"))
+        && !categories.iter().any(|category| category.eq_ignore_ascii_case("follow")) {
+        categories.push("Follow".into());
+    }
+    categories
+}
+
 pub fn category_replacement(category: &str, known: &[String]) -> Result<serde_json::Value, String> {
     if category.trim().is_empty()
         || category.len() > 256
@@ -410,6 +428,7 @@ pub fn category_replacement(category: &str, known: &[String]) -> Result<serde_js
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Change {
+    Follow(bool),
     Category(String),
     ClearCategory,
     Respond {
@@ -475,8 +494,25 @@ pub fn validate_manual_change(event: &Event, change: &Change) -> Result<(), Stri
         return Err("Refresh the calendar first; actions require one verified occurrence, not a whole series".into());
     }
     match change {
+        Change::Follow(enabled) => {
+            let organizer = event.extra.get("isOrganizer").and_then(serde_json::Value::as_bool);
+            if organizer == Some(true) {
+                return Err("Follow is for invitations, not meetings you organize".into());
+            }
+            if organizer != Some(false) || event.organizer.is_empty() {
+                return Err("Refresh the calendar first; Follow needs verified invitation details".into());
+            }
+            if !enabled && !event.following() {
+                return Err("This meeting is not followed".into());
+            }
+            if *enabled && real_categories(event).len() >= 32 && !event.following() {
+                return Err("Follow requires room for one more calendar category".into());
+            }
+            Ok(())
+        }
         Change::Category(category)
             if !category.trim().is_empty()
+                && !category.eq_ignore_ascii_case("follow")
                 && category.len() <= 256
                 && !category.chars().any(char::is_control) =>
         {

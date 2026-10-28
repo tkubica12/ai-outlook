@@ -49,7 +49,24 @@ pub struct Event {
 }
 
 impl Event {
+    pub fn following(&self) -> bool {
+        self.tags().iter().any(|tag| tag.eq_ignore_ascii_case("follow"))
+            || matches!(self.status.to_ascii_lowercase().as_str(), "follow" | "following")
+            || self.extra.get("isFollowing").and_then(serde_json::Value::as_bool) == Some(true)
+    }
+
+    pub fn accepted(&self) -> bool {
+        !self.following()
+            && !self.unconfirmed()
+            && (self.status.eq_ignore_ascii_case("accepted")
+                || self.status.eq_ignore_ascii_case("organizer")
+                || self.extra.get("isOrganizer").and_then(serde_json::Value::as_bool) == Some(true))
+    }
+
     pub fn unconfirmed(&self) -> bool {
+        if self.following() {
+            return true;
+        }
         if self
             .extra
             .get("isOrganizer")
@@ -77,6 +94,9 @@ impl Event {
     }
 
     pub fn response_label(&self) -> &'static str {
+        if self.following() {
+            return "Following";
+        }
         match self.status.to_ascii_lowercase().as_str() {
             "follow" | "following" => "Following",
             "declined" => "Declined",

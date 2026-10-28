@@ -403,11 +403,18 @@ fn meeting_date_label(event: &Event, language: tomlook::i18n::Language) -> Strin
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PreferencesSection {
+    Display,
+    Prompts,
+}
+
 pub struct Tomlook {
     worker: Option<Worker>,
     calendar: Arc<Calendar>,
     preferences: Preferences,
     anchor: NaiveDate,
+    mini_anchor: Option<NaiveDate>,
     date_selection: Option<DateSelection>,
     date_drag: Option<(NaiveDate, NaiveDate)>,
     timeline_period: Option<(NaiveDate, NaiveDate, i32)>,
@@ -417,6 +424,10 @@ pub struct Tomlook {
     query: String,
     category: String,
     settings: bool,
+    preferences_open: bool,
+    preferences_section: PreferencesSection,
+    prompt_draft: tomlook::prompts::Prompts,
+    prompt_kind: tomlook::prompts::Kind,
     messages_open: bool,
     recommendations_tab: bool,
     recommendation_cursor: usize,
@@ -464,6 +475,7 @@ pub struct Tomlook {
     ai_usage: Option<tomlook::telemetry::Summary>,
     ai_login_busy: bool,
     ai_login_status: Option<String>,
+    auto_status: tomlook::decision::Status,
     external_status: BTreeMap<tomlook::connectors::Kind, ExternalStatus>,
     brand_color: Option<Color32>,
     brand_language: Option<tomlook::i18n::Language>,
@@ -655,6 +667,7 @@ impl Tomlook {
             calendar: Arc::new(Calendar::default()),
             preferences: Preferences::default(),
             anchor: Local::now().date_naive(),
+            mini_anchor: None,
             date_selection: None,
             date_drag: None,
             timeline_period: None,
@@ -664,6 +677,10 @@ impl Tomlook {
             query: String::new(),
             category: String::new(),
             settings: false,
+            preferences_open: false,
+            preferences_section: PreferencesSection::Display,
+            prompt_draft: Default::default(),
+            prompt_kind: tomlook::prompts::Kind::Recap,
             messages_open: false,
             recommendations_tab: true,
             recommendation_cursor: 0,
@@ -710,6 +727,7 @@ impl Tomlook {
             ai_ready: false,
             ai_login_busy: false,
             ai_login_status: None,
+            auto_status: Default::default(),
             external_status: BTreeMap::new(),
             brand_color: None,
             brand_language: None,
@@ -782,7 +800,13 @@ impl Tomlook {
             } else if activity.error.is_none() && self.error == self.activity.error {
                 self.error = None;
             }
+            let recaps_changed = !Arc::ptr_eq(&self.activity.recaps, &activity.recaps);
             self.activity = activity;
+            if recaps_changed && let Some(index) = self.selected
+                && self.calendar.events[index].end <= Local::now().fixed_offset() {
+                self.detail_revision += 1;
+                self.command(Command::Detail { revision: self.detail_revision, id: self.calendar.events[index].id.clone() });
+            }
             if let Some(index) = self.selected
                 && let Some(job) = self
                     .activity
@@ -881,7 +905,7 @@ impl Tomlook {
                     if self.loading && self.github_client_id.is_empty() {
                         self.github_client_id = preferences.github_client_id.clone();
                     }
-                    self.preferences = preferences;
+                    self.preferences = *preferences;
                     self.loading = false;
                     if let Some(trace) = &mut self.startup
                         && !self.startup_built
@@ -941,6 +965,7 @@ impl Tomlook {
                 break;
             };
             match notice {
+                ai::Notice::Auto(status) => self.auto_status = status,
                 ai::Notice::External {
                     kind,
                     busy,
@@ -1292,6 +1317,8 @@ impl Tomlook {
                 self.insights_expanded = false;
             } else if self.messages_open {
                 self.messages_open = false;
+            } else if self.preferences_open {
+                self.preferences_open = false;
             } else if self.settings {
                 self.settings = false;
             } else if self.connection_panel.is_some() {
@@ -1444,6 +1471,7 @@ impl Tomlook {
     }
 
     fn shift_period(&mut self, direction: i32) {
+        self.mini_anchor = None;
         if let Some(selection) = self.date_selection {
             let shift = chrono::Duration::days(
                 ((selection.last - selection.first).num_days() + 1) * i64::from(direction),
@@ -1459,6 +1487,7 @@ impl Tomlook {
     }
 
     fn go_today(&mut self) {
+        self.mini_anchor = None;
         let today = Local::now().date_naive();
         if let Some(selection) = self.date_selection {
             self.date_selection = Some(DateSelection {
@@ -1513,67 +1542,18 @@ impl Tomlook {
             };
             ui.label(RichText::new(language.text(&(label))).size(17.0).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(language.text("Commands"))
-                    .on_hover_text(language.text("Ctrl+Shift+P"))
-                    .clicked()
-                {
+                if header_icon(ui, "Commands", HeaderIcon::Commands, language, false).clicked() {
                     self.open_palette();
                 }
-                ui.menu_button(language.text("Accent"), |ui| {
-                    for (index, (name, _, _)) in ACCENTS.iter().enumerate() {
-                        if ui
-                            .selectable_label(self.preferences.accent == index, language.text(name))
-                            .clicked()
-                        {
-                            self.preferences.accent = index;
-                            self.save_preferences();
-                            ui.close();
-                        }
-                    }
-                });
-                if ui
-                    .button(language.text(if self.preferences.dark {
-                        "Light"
-                    } else {
-                        "Dark"
-                    }))
-                    .clicked()
-                {
-                    self.preferences.dark = !self.preferences.dark;
-                    self.save_preferences();
+                if header_icon(ui, "Settings", HeaderIcon::Settings, language, false).clicked() {
+                    self.prompt_draft = self.preferences.prompts.clone();
+                    self.preferences_open = true;
                 }
-                if ui
-                    .button(language.other().code())
-                    .on_hover_text(language.text("Switch language"))
-                    .clicked()
-                {
-                    self.preferences.language = language.other();
-                    self.save_preferences();
-                }
-                if ui
-                    .button(if self.active_request.is_some() || self.chat.running() {
-                        format!(
-                            "{} · {}",
-                            language.text("Ask"),
-                            language.text("Thinking...")
-                        )
-                    } else if self.ask_unread {
-                        format!(
-                            "{} · {}",
-                            language.text("Ask"),
-                            language.text(if self.ai_error.is_some() {
-                                "Needs review"
-                            } else {
-                                "Answer ready"
-                            })
-                        )
-                    } else {
-                        language.text("Ask").into_owned()
-                    })
-                    .on_hover_text(language.text("Ctrl+Space"))
-                    .clicked()
-                {
+                if header_icon(ui, "Ask", HeaderIcon::Ask, language,
+                    self.active_request.is_some() || self.chat.running() || self.ask_unread)
+                    .on_hover_text(language.text(if self.active_request.is_some() || self.chat.running() {
+                        "Thinking..."
+                    } else if self.ask_unread { "Answer ready" } else { "Ctrl+Space" })).clicked() {
                     self.toggle_assistant(ui.ctx());
                 }
             });
@@ -1622,8 +1602,27 @@ impl Tomlook {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         let language = self.preferences.language;
         ui.add_space(8.0);
-        ui.label(RichText::new(language.month(self.anchor)).strong());
-        let dates = View::Month.days(self.anchor);
+        let mut month = self.mini_anchor.unwrap_or(self.anchor);
+        ui.horizontal(|ui| {
+            let previous = ui.small_button("<").on_hover_text(language.text("Previous month"));
+            previous.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, language.text("Previous month")));
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| data.insert_temp(Id::new("mini-previous-month"), previous.rect));
+            if previous.clicked() {
+                month = View::Month.shift(month, -1);
+                self.mini_anchor = Some(month);
+            }
+            ui.label(RichText::new(language.month(month)).strong().color(self.accent()));
+            let next = ui.small_button(">").on_hover_text(language.text("Next month"));
+            next.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, language.text("Next month")));
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| data.insert_temp(Id::new("mini-next-month"), next.rect));
+            if next.clicked() {
+                month = View::Month.shift(month, 1);
+                self.mini_anchor = Some(month);
+            }
+        });
+        let dates = View::Month.days(month);
         let pointer = ui.input(|input| input.pointer.interact_pos());
         let pressed_at = ui.input(|input| {
             input.events.iter().rev().find_map(|event| match event {
@@ -1690,7 +1689,7 @@ impl Tomlook {
                         let text = RichText::new(language.text(&(date.day().to_string()))).color(
                             if *date == Local::now().date_naive() {
                                 self.accent()
-                            } else if date.month() == self.anchor.month() {
+                            } else if date.month() == month.month() {
                                 ui.visuals().text_color()
                             } else {
                                 ui.visuals().weak_text_color()
@@ -1784,28 +1783,11 @@ impl Tomlook {
                 }
             });
         }
-        ui.add_space(24.0);
-        ui.weak(language.text("KEYBOARD"));
-        for hint in [
-            "Ctrl+F   Search",
-            "Ctrl+Shift+P   Commands",
-            "Ctrl+Space   Ask",
-            "Alt+Left / Right   Period",
-            "Up / Down   Meeting",
-            "Esc   Close",
-            "Tab / Shift+Tab   Focus",
-        ] {
-            ui.weak(language.text(hint));
-        }
-        ui.add_space(24.0);
-        if ui.button(language.text("Reload local cache")).clicked() {
-            self.command(Command::Reload);
-        }
     }
 
-    fn event_button(&mut self, ui: &mut egui::Ui, index: usize, size: Vec2) {
+    fn event_button(&mut self, ui: &mut egui::Ui, index: usize, date: NaiveDate, size: Vec2) {
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-        self.event_card(ui, index, rect);
+        ui.push_id(("meeting-day", date), |ui| self.event_card(ui, index, rect));
     }
 
     fn event_card(&mut self, ui: &mut egui::Ui, index: usize, rect: egui::Rect) {
@@ -1864,7 +1846,7 @@ impl Tomlook {
                         egui::Button::new(language.text(""))
                             .min_size(rect.size())
                             .fill(if ghost {
-                                Color32::TRANSPARENT
+                                if self.preferences.dark { Color32::from_gray(31) } else { Color32::from_gray(247) }
                             } else {
                                 ui.visuals().widgets.inactive.weak_bg_fill
                             })
@@ -1924,11 +1906,29 @@ impl Tomlook {
             }
         }
         if ui.is_rect_visible(rect) {
+            if ghost {
+                let painter = ui.painter().with_clip_rect(rect.shrink(1.0));
+                let color = if self.preferences.dark { Color32::from_gray(39) } else { Color32::from_gray(237) };
+                let mut x = rect.left() - rect.height();
+                while x < rect.right() {
+                    painter.line_segment([egui::pos2(x, rect.bottom()), egui::pos2(x + rect.height(), rect.top())],
+                        Stroke::new(1.0, color));
+                    x += 9.0;
+                }
+            }
+            let notes_ready = self.calendar_owner.as_deref().and_then(|account| self.activity.recaps.record(account, event))
+                .is_some_and(|record| record.payload.is_some());
+            let prepared = !notes_ready && event.accepted() && event.end > Local::now().fixed_offset()
+                && self.activity.queue.jobs.get(&event.id).is_some_and(|job| job.state == tomlook::scheduler::State::Completed);
+            if notes_ready || prepared {
+                let badge = egui::Rect::from_min_size(rect.right_top() + Vec2::new(-19.0, 3.0), Vec2::splat(15.0));
+                insight_badge(ui, badge, notes_ready, self.accent(), language);
+            }
             let content = rect.shrink2(Vec2::new(7.0_f32.min(rect.width() * 0.15), 4.0));
             let mut y = content.top();
             let wide_row = !ghost && content.width() >= 85.0 && content.height() < 31.0;
             let mut x = content.left();
-            let mut width = content.width();
+            let mut width = (content.width() - if notes_ready || prepared { 15.0 } else { 0.0 }).max(1.0);
             if wide_row {
                 let (label, space) = if content.width() >= 205.0 || event.all_day_like() {
                     (time.clone(), 83.0)
@@ -2092,6 +2092,7 @@ impl Tomlook {
             change,
             tomlook::recommendations::Change::Category(_)
                 | tomlook::recommendations::Change::ClearCategory
+                | tomlook::recommendations::Change::Follow(_)
         ) {
             self.meeting_action = None;
             self.command(Command::ConfirmMeetingAction {
@@ -2136,9 +2137,27 @@ impl Tomlook {
         }
         ui.separator();
         let ready = self.workiq_ready && self.ai.is_some() && self.calendar_owner.is_some();
-        let current_categories = tomlook::recommendations::real_categories(event);
+        let follow = Change::Follow(!event.following());
+        let follow_validation = validate_manual_change(event, &follow);
+        let follow_hint = follow_validation.as_ref().err().map(String::as_str)
+            .unwrap_or("Connect WorkIQ before confirming a calendar change");
+        let follow_response = ui.add_enabled(ready && follow_validation.is_ok(),
+            egui::Button::new(language.text(if event.following() { "Stop following" } else { "Follow" })))
+            .on_disabled_hover_text(language.text(follow_hint))
+            .on_hover_text(language.text(if event.following() {
+                "Removes Follow only. Availability stays unchanged; the organizer is not notified."
+            } else {
+                "Adds Follow, keeps other categories and marks this occurrence as free. Your invitation response is unchanged; the organizer is not notified."
+            }));
+        if follow_response.clicked() {
+            self.choose_meeting_action(event.clone(), follow);
+            ui.close();
+        }
+        let current_categories = tomlook::recommendations::real_categories(event).into_iter()
+            .filter(|category| !category.eq_ignore_ascii_case("follow")).collect::<Vec<_>>();
         ui.menu_button(language.text("Change category"), |ui| {
-            for category in tomlook::recommendations::known_categories(&self.calendar) {
+            for category in tomlook::recommendations::known_categories(&self.calendar).into_iter()
+                .filter(|category| !category.eq_ignore_ascii_case("follow")) {
                 let change = Change::Category(category.clone());
                 let selected = current_categories.len() == 1 && current_categories[0] == category;
                 let allowed = ready && !selected && validate_manual_change(event, &change).is_ok();
@@ -2185,7 +2204,7 @@ impl Tomlook {
             let change = Change::Respond {
                 response,
                 comment: String::new(),
-                send_response: true,
+                send_response: response != MeetingResponse::Decline,
             };
             if validate_manual_change(event, &change).is_ok()
                 && ui
@@ -2236,7 +2255,8 @@ impl Tomlook {
     fn event_creation_dialog(&mut self, context: &egui::Context) {
         let Some(mut draft) = self.event_draft.take() else { return };
         let language = self.preferences.language;
-        let categories = tomlook::recommendations::known_categories(&self.calendar);
+        let categories = tomlook::recommendations::known_categories(&self.calendar).into_iter()
+            .filter(|category| !category.eq_ignore_ascii_case("follow")).collect::<Vec<_>>();
         let mut open = true;
         let mut cancel = false;
         let mut confirm = false;
@@ -2276,36 +2296,28 @@ impl Tomlook {
                 });
                 ui.add(egui::Slider::new(&mut draft.end, 15..=1440).step_by(15.0).show_value(false)
                     .text(language.text("End")));
-                ui.weak(language.text("Local time; 15-minute steps. 24:00 is the next midnight."));
                 let label = ui.label(language.text("Description (optional)"));
                 ui.add(egui::TextEdit::multiline(&mut draft.description).desired_rows(2)
                     .desired_width(f32::INFINITY).char_limit(8000)).labelled_by(label.id);
                 ui.label(language.text("Category"));
-                ui.horizontal_wrapped(|ui| {
-                    if ui.selectable_label(draft.category.is_none(), language.text("None")).clicked() {
-                        draft.category = None;
-                    }
-                    for category in &categories {
-                        if ui.add(egui::Button::new(RichText::new(category)
-                            .color(category_color(category, self.preferences.dark)))
-                            .selected(draft.category.as_ref() == Some(category))).clicked() {
-                            draft.category = Some(category.clone());
+                egui::Grid::new("new-event-categories").num_columns(3).spacing([6.0, 6.0]).show(ui, |ui| {
+                    for (index, category) in std::iter::once(None).chain(categories.iter().map(Some)).enumerate() {
+                        let label = category.map_or_else(|| language.text("None").into_owned(), Clone::clone);
+                        let selected = draft.category.as_ref() == category;
+                        let fill = category.map(|category| category_color(category, self.preferences.dark).gamma_multiply(if self.preferences.dark { 0.3 } else { 0.15 }))
+                            .unwrap_or(ui.visuals().faint_bg_color);
+                        let button = egui::Button::new(label).fill(fill)
+                            .stroke(if selected { Stroke::new(2.0, self.accent()) } else { Stroke::NONE }).truncate();
+                        if ui.add_sized([142.0, 30.0], button).on_hover_text(category.map_or_else(|| language.text("None").into_owned(), Clone::clone)).clicked() {
+                            draft.category = category.cloned();
                         }
+                        if index % 3 == 2 { ui.end_row(); }
                     }
                 });
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 18.0), egui::Sense::hover());
-                    let color = ui.visuals().text_color();
-                    ui.painter().rect_stroke(egui::Rect::from_min_size(rect.min + Vec2::new(1.0, 8.0), Vec2::new(12.0, 9.0)),
-                        2, Stroke::new(1.2, color), egui::StrokeKind::Inside);
-                    ui.painter().line_segment([rect.min + Vec2::new(4.0, 8.0), rect.min + Vec2::new(4.0, 3.0)], Stroke::new(1.2, color));
-                    ui.painter().line_segment([rect.min + Vec2::new(4.0, 3.0), rect.min + Vec2::new(10.0, 3.0)], Stroke::new(1.2, color));
-                    ui.painter().line_segment([rect.min + Vec2::new(10.0, 3.0), rect.min + Vec2::new(10.0, 8.0)], Stroke::new(1.2, color));
                     if ui.checkbox(&mut draft.private, language.text("Private event")).changed() && draft.private
                         && let Some(personal) = tomlook::event_creation::personal_category(&categories) {
                             draft.category = Some(personal);
                     }
-                });
                 if draft.private {
                     ui.weak(language.text("Private in Outlook; delegates allowed to view private items may still see details."));
                     if tomlook::event_creation::personal_category(&categories).is_none() {
@@ -2326,7 +2338,6 @@ impl Tomlook {
                         }
                     }
                 }
-                ui.weak(language.text("Creates busy appointments in your calendar. No attendees or room invitations."));
                 let value = draft.value(language);
                 if let Ok(value) = &value {
                     let parts = value.parts("preview").into_iter().skip(usize::from(travel_only)).collect::<Vec<_>>();
@@ -2368,7 +2379,9 @@ impl Tomlook {
                 let ready = unchanged && self.workiq_ready && self.ai.is_some() && !self.preview
                     && !self.activity.event_creations.values().any(|record| record.state == tomlook::event_creation::State::Creating);
                 if !ready { ui.weak(language.text("Connect WorkIQ before confirming a calendar change")); }
-                if let Err(error) = &value { ui.colored_label(ui.visuals().error_fg_color, language.text(error)); }
+                if let Err(error) = &value && (travel_only || !draft.title.trim().is_empty()) {
+                    ui.colored_label(ui.visuals().error_fg_color, language.text(error));
+                }
                 ui.horizontal(|ui| {
                     confirm = ui.add_enabled(ready && value.is_ok(), egui::Button::new(language.text(if travel_only { "Create travel blocks" } else { "Create event" }))).clicked();
                     cancel = ui.button(language.text("Back")).clicked();
@@ -2393,7 +2406,7 @@ impl Tomlook {
 
     fn select_event_time(&mut self, ui: &mut egui::Ui, day: NaiveDate, rect: egui::Rect, cards: &[egui::Rect]) {
         if self.event_draft.is_some() || self.meeting_action.is_some() || self.meeting_menu.is_some()
-            || self.messages_open || self.settings || self.connection_panel.is_some() || self.palette {
+            || self.messages_open || self.settings || self.preferences_open || self.connection_panel.is_some() || self.palette {
             return;
         }
         let (focused, events) = ui.input(|input| (input.focused, input.events.clone()));
@@ -2498,6 +2511,13 @@ impl Tomlook {
                     }
                     Change::ClearCategory => {
                         ui.label(language.text("Remove category"));
+                    }
+                    Change::Follow(enabled) => {
+                        ui.label(language.text(if *enabled {
+                            "Adds Follow, keeps other categories and marks this occurrence as free. Your invitation response is unchanged; the organizer is not notified."
+                        } else {
+                            "Removes Follow only. Availability stays unchanged; the organizer is not notified."
+                        }));
                     }
                     Change::Respond { response, comment, send_response } => {
                         if *response == MeetingResponse::Cancel {
@@ -2605,7 +2625,7 @@ impl Tomlook {
                             })
                             .unwrap_or_default();
                         for index in indices.iter().take(3) {
-                            self.event_button(ui, *index, Vec2::new(width - 12.0, 23.0));
+                            self.event_button(ui, *index, *date, Vec2::new(width - 12.0, 23.0));
                         }
                         if indices.len() > 3
                             && ui
@@ -2709,6 +2729,7 @@ impl Tomlook {
                                                 self.event_button(
                                                     ui,
                                                     index,
+                                                    *date,
                                                     Vec2::new(day_width - 8.0, 23.0),
                                                 );
                                             }
@@ -2851,6 +2872,7 @@ impl Tomlook {
 
     fn details(&mut self, ui: &mut egui::Ui, event: Event) {
         let language = self.preferences.language;
+        let ended = event.end <= Local::now().fixed_offset();
         self.photos_context = Some(ui.ctx().clone());
         ui.horizontal(|ui| {
             ui.weak(language.text("MEETING"));
@@ -2867,10 +2889,11 @@ impl Tomlook {
         });
         ui.add_space(12.0);
         ui.heading(&event.title);
+        if ended { ui.strong(language.text("Meeting ended")); }
         if event.extra.get("sensitivity").and_then(serde_json::Value::as_str) == Some("private") {
             ui.weak(language.text("Private event"));
         }
-        if let Some(url) = event.extra.get("onlineMeeting")
+        if !ended && let Some(url) = event.extra.get("onlineMeeting")
             .and_then(|meeting| meeting["joinUrl"].as_str()).filter(|url| safe_url(url))
             && ui.button(language.text("Join Teams meeting")).clicked()
             && let Err(error) = tomlook::browser::open(url) {
@@ -2937,14 +2960,20 @@ impl Tomlook {
                 .or_default()
                 .push(person);
         }
-        for ((external, company), people) in companies.iter().take(4) {
+        if !event.organizer.is_empty() {
+            ui.label(format!("{}: {}", language.text("Organizer"),
+                event.organizer.split('<').next().unwrap_or(&event.organizer).trim())).on_hover_text(&event.organizer);
+        }
+        ui.horizontal_wrapped(|ui| {
+        for ((external, company), people) in companies.iter().take(8) {
             let domain = if *external {
                 company.as_str()
             } else {
                 "microsoft.com"
             };
             let icon = self.companies.get(domain);
-            ui.horizontal_wrapped(|ui| {
+            let tooltip = format!("{company}\n{}", people.iter().map(|person| person.as_str()).collect::<Vec<_>>().join("\n"));
+            ui.horizontal(|ui| {
                 if let Some(image) = icon.and_then(|icon| icon.image.as_ref()) {
                     egui::Frame::new()
                         .fill(Color32::WHITE)
@@ -2952,11 +2981,9 @@ impl Tomlook {
                         .inner_margin(3)
                         .show(ui, |ui| {
                             ui.add(egui::Image::new((image.id(), Vec2::splat(20.0))))
-                                .on_hover_text(
-                                    language.text(&(format!("Icon from {domain}'s own website"))),
-                                );
+                                .on_hover_text(&tooltip);
                         });
-                }
+                } else {
                 let label = ui.label(
                     RichText::new(language.text(company))
                         .small()
@@ -2967,29 +2994,9 @@ impl Tomlook {
                             self.accent()
                         }),
                 );
-                if let Some(error) = icon.and_then(|icon| icon.error.as_ref()) {
-                    label.on_hover_text(language.text(error));
-                }
-                for person in people.iter().take(6) {
-                    let name = person.split('<').next().unwrap_or(person).trim();
-                    let initials = name
-                        .split(|ch: char| ch.is_whitespace() || ch == '.')
-                        .filter(|part| !part.is_empty())
-                        .take(2)
-                        .filter_map(|part| part.chars().next())
-                        .collect::<String>()
-                        .to_uppercase();
-                    egui::Frame::new()
-                        .inner_margin(5)
-                        .corner_radius(12)
-                        .fill(ui.visuals().faint_bg_color)
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(language.text(&(initials))).strong())
-                                .on_hover_text(language.text(&(format!("{person}\n{company}"))));
-                        });
-                }
-                if people.len() > 6 {
-                    ui.weak(language.text(&(format!("+{}", people.len() - 6))));
+                label.on_hover_text(if let Some(error) = icon.and_then(|icon| icon.error.as_ref()) {
+                    format!("{tooltip}\n{}", language.text(error))
+                } else { tooltip });
                 }
             });
             if !self.companies_busy
@@ -3000,8 +3007,9 @@ impl Tomlook {
                 requested_companies.push(domain.to_owned());
             }
         }
-        if companies.len() > 4 {
-            ui.weak(language.text(&(format!("+{} companies in People", companies.len() - 4))));
+        });
+        if companies.len() > 8 {
+            ui.weak(language.text(&(format!("+{} companies in People", companies.len() - 8))));
         }
         if !requested_companies.is_empty()
             && self.ai_command(ai::Command::Companies(requested_companies))
@@ -3038,24 +3046,21 @@ impl Tomlook {
                                         egui::Image::new((image.id(), Vec2::splat(30.0)))
                                             .corner_radius(15),
                                     );
-                                } else {
-                                    let initials = attendee
-                                        .split_whitespace()
-                                        .take(2)
-                                        .filter_map(|name| name.chars().next())
-                                        .collect::<String>();
-                                    ui.add_sized(
-                                        [30.0, 30.0],
-                                        egui::Label::new(RichText::new(language.text(&(initials))).strong()),
-                                    );
                                 }
+                                let role = email.as_ref().and_then(|email| event.extra.get("tomlook_attendee_roles")?.get(email)?.as_str()).unwrap_or("unknown");
+                                let role_label = match role { "required" => "Required", "optional" => "Optional", "resource" => "Resource", _ => "Role unavailable" };
+                                let (marker, response) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
+                                if role == "required" { ui.painter().circle_filled(marker.center(), 3.0, self.accent()); }
+                                else { ui.painter().circle_stroke(marker.center(), 3.0, Stroke::new(1.0, ui.visuals().weak_text_color())); }
+                                response.on_hover_text(language.text(role_label));
                                 let name = attendee.split('<').next().unwrap_or(attendee).trim();
-                                let label = ui.label(language.text(name));
-                                if let Some(error) = photo.and_then(|photo| photo.error.as_ref()) {
-                                    label.on_hover_text(language.text(error));
-                                } else {
-                                    label.on_hover_text(language.text(attendee));
-                                }
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(name).on_hover_text(photo.and_then(|photo| photo.error.as_deref()).unwrap_or(attendee));
+                                        ui.weak(language.text(role_label));
+                                    });
+                                    if let Some(email) = &email { ui.label(RichText::new(email).small().weak()); }
+                                });
                             });
                             if self.workiq_ready
                                 && !self.photos_busy
@@ -3090,7 +3095,8 @@ impl Tomlook {
             self.switch_assistant_context(Some(event.clone()));
             self.focus_assistant = true;
         }
-        let running = self
+        let recap_record = self.calendar_owner.as_deref().and_then(|account| self.activity.recaps.record(account, &event)).cloned();
+        let running = recap_record.as_ref().is_some_and(|record| record.checking) || self
             .activity
             .queue
             .flights
@@ -3099,9 +3105,12 @@ impl Tomlook {
         if !self.preview
             && ui
                 .add_enabled(
-                    !running,
+                    !running && (!ended || tomlook::recaps::eligible(&event, Local::now().fixed_offset())
+                        && recap_record.as_ref().is_none_or(|record| record.payload.is_none())),
                     egui::Button::new(language.text(if running {
                         "Researching..."
+                    } else if ended {
+                        "Check transcript"
                     } else {
                         "Research now"
                     })),
@@ -3113,7 +3122,7 @@ impl Tomlook {
         ui.add_space(16.0);
         ui.separator();
         ui.horizontal(|ui| {
-            ui.strong(language.text("Insights"));
+            ui.strong(language.text(if ended { "Meeting notes" } else { "Insights" }));
             if self.briefing.is_some() && ui.button(language.text("Expand")).clicked() {
                 self.insights_expanded = true;
             }
@@ -3127,7 +3136,13 @@ impl Tomlook {
         } else if !self.ai_ready {
             ui.weak(language.text("AI is not connected yet; Research now queues this meeting."));
         }
-        if !self.preview
+        if ended {
+            if let Some(record) = &recap_record { ui.weak(language.text(&record.message)); }
+            else { ui.weak(language.text(if tomlook::recaps::eligible(&event, Local::now().fixed_offset()) {
+                "Waiting for a transcript (up to 7 days after the meeting)"
+            } else { "Automatic notes cover accepted or followed online meetings from the last 7 days." })); }
+        }
+        if !ended && !self.preview
             && let Some(job) = self.activity.queue.jobs.get(&event.id).cloned()
         {
             ui.label(format!(
@@ -3152,6 +3167,7 @@ impl Tomlook {
     fn render_insights(&self, ui: &mut egui::Ui, expanded: bool) {
         let language = self.preferences.language;
         if let Some(briefing) = &self.briefing {
+            let notes = briefing.get("tomlook_recap").and_then(serde_json::Value::as_bool) == Some(true);
             let narrative = language.insight(briefing);
             if briefing
                 .get("translation_only")
@@ -3187,8 +3203,8 @@ impl Tomlook {
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 for (field, label) in [
-                    ("preparation", "Next steps"),
-                    ("open_questions", "Questions"),
+                    ("preparation", if notes { "My tasks" } else { "Next steps" }),
+                    ("open_questions", if notes { "Mentions of me" } else { "Questions" }),
                     ("sources", "Sources"),
                 ] {
                     let count = briefing
@@ -3210,14 +3226,21 @@ impl Tomlook {
                 }
             });
             if !expanded {
+                if notes {
+                    for (field, label) in [("preparation", "My tasks"), ("open_questions", "Mentions of me")] {
+                        if let Some(items) = narrative.and_then(|value| value[field].as_array()).filter(|items| !items.is_empty()) {
+                            insight_section(ui, &language.text(label), items, self.accent());
+                        }
+                    }
+                }
                 return;
             }
             ui.add_space(12.0);
             let sections = [
-                ("preparation", "Prepare"),
-                ("talking_points", "Talking points"),
-                ("open_questions", "Open questions"),
-                ("risks", "Risks"),
+                ("preparation", if notes { "My tasks" } else { "Prepare" }),
+                ("talking_points", if notes { "Technical takeaways and materials" } else { "Talking points" }),
+                ("open_questions", if notes { "Mentions of me" } else { "Open questions" }),
+                ("risks", if notes { "Decisions and unresolved issues" } else { "Risks" }),
                 ("warnings", "Evidence gaps"),
                 ("gaps", "Evidence gaps"),
             ];
@@ -3252,6 +3275,7 @@ impl Tomlook {
                     } else {
                         ui.label(title);
                     }
+                    if notes { ui.weak(language.text("Original meeting source")); continue; }
                     match source
                         .get("retrieved_records")
                         .and_then(|value| value.as_array())
@@ -3344,9 +3368,11 @@ impl Tomlook {
                 }
             }
         } else {
-            ui.label(
-                language.text("No saved Insights yet. Research now prioritizes this meeting."),
-            );
+            let ended = self.selected.and_then(|index| self.calendar.events.get(index))
+                .is_some_and(|event| event.end <= Local::now().fixed_offset());
+            ui.label(language.text(if ended { "No AI meeting notes yet." } else {
+                "No saved Insights yet. Research now prioritizes this meeting."
+            }));
         }
     }
 
@@ -3865,6 +3891,7 @@ impl Tomlook {
             chat: self.chat.clone(),
             recoveries: self.research_recoveries.clone(),
             mode: self.ask_mode,
+            auto_status: self.auto_status.clone(),
             ..Default::default()
         }
     }
@@ -3937,6 +3964,12 @@ impl Tomlook {
                 }
             }
             ask::Action::Retry(id) => self.retry_chat_question(id),
+            ask::Action::ConfigureAuto => {
+                self.open_ai_connection();
+                context.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+                context.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
+                context.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+            }
             ask::Action::Hide => {
                 self.assistant = false;
                 self.focus_assistant = false;
@@ -4261,6 +4294,13 @@ impl Tomlook {
         }
     }
 
+    fn open_ai_connection(&mut self) {
+        self.connection_panel = Some(ConnectionPanel::Ai);
+        if !self.auto_status.busy() && self.ai_command(ai::Command::CheckAuto) {
+            self.auto_status = tomlook::decision::Status::new(tomlook::decision::Phase::Checking, "Checking Auto Azure sign-in...");
+        }
+    }
+
     fn connection_dialog(&mut self, context: &egui::Context) {
         let language = self.preferences.language;
         let Some(panel) = self.connection_panel else {
@@ -4285,6 +4325,7 @@ impl Tomlook {
         .default_width(440.0)
         .show(context, |ui| {
             if panel == ConnectionPanel::Ai {
+                ui.strong("Copilot");
                 ui.label(language.text(&self.connection));
                 if !self.ai_login_busy
                     && !self.ai_ready
@@ -4303,6 +4344,36 @@ impl Tomlook {
                     self.ai_login_busy = true;
                     self.ai_login_status = None;
                     self.connection = "AI browser sign-in queued...".into();
+                }
+                ui.add_space(10.0);
+                ui.separator();
+                ui.strong("Auto · Microsoft-Decision-1");
+                ui.label(language.text(if self.auto_status.message.is_empty() {
+                    self.auto_status.label()
+                } else { &self.auto_status.message }));
+                ui.weak(language.text("Quick and Thorough use Copilot without Auto's Azure sign-in."));
+                if let Some(code) = &self.auto_status.device_code {
+                    ui.horizontal(|ui| {
+                        ui.monospace(code);
+                        if ui.button(language.text("Copy code")).clicked() { ui.ctx().copy_text(code.clone()); }
+                    });
+                    ui.hyperlink_to(language.text("Open Microsoft device sign-in"), tomlook::decision::DEVICE_LOGIN_URL);
+                }
+                if self.auto_status.phase == tomlook::decision::Phase::SigningIn {
+                    if ui.button(language.text("Cancel Azure sign-in")).clicked() {
+                        self.ai_command(ai::Command::CancelAutoLogin);
+                    }
+                } else if !self.auto_status.busy() {
+                    ui.weak(language.text("Uses your Azure CLI profile; its default account may change during sign-in."));
+                    if self.auto_status.phase != tomlook::decision::Phase::Unconfigured
+                        && ui.button(language.text("Sign in to Azure (device code)")).clicked()
+                        && self.ai_command(ai::Command::SignInAuto) {
+                        self.auto_status = tomlook::decision::Status::new(tomlook::decision::Phase::SigningIn, "Starting Azure device-code sign-in...");
+                    }
+                    if ui.button(language.text("Check Auto connection")).clicked()
+                        && self.ai_command(ai::Command::CheckAuto) {
+                        self.auto_status = tomlook::decision::Status::new(tomlook::decision::Phase::Checking, "Checking Auto Azure sign-in...");
+                    }
                 }
             } else if panel == ConnectionPanel::External(tomlook::connectors::Kind::Github) {
                 self.github_connection(ui);
@@ -4399,7 +4470,7 @@ impl Tomlook {
                     self.hosted_workiq_status = "Removing saved WorkIQ sign-in...".into();
                 }
             }
-            if let Some(error) = &self.ai_error {
+            if let Some(error) = self.ai_error.as_ref().filter(|error| tomlook::decision::routing_error(error).is_none()) {
                 ui.label(RichText::new(language.text(error)).strong());
             }
         });
@@ -4465,7 +4536,7 @@ impl Tomlook {
                         Change::Respond {
                             response: MeetingResponse::Decline,
                             comment: String::new(),
-                            send_response: true,
+                            send_response: false,
                         },
                         Change::Respond {
                             response: MeetingResponse::Cancel,
@@ -4537,6 +4608,16 @@ impl Tomlook {
                         ui.spinner();
                     }
                 });
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(event) = event
+                        && ui.add(egui::Button::new(language.text("Open Insights")).frame(false)).clicked() {
+                        self.open_recommended_meeting(event);
+                    }
+                    if recommendation.state != State::Dispatching
+                        && ui.add(egui::Button::new(language.text("Skip recommendation")).frame(false)).clicked() {
+                        self.command(Command::DismissRecommendation(recommendation.id.clone()));
+                    }
+                });
                 ui.add_space(8.0);
                 if let Ok(change) = &change {
                     match change {
@@ -4570,6 +4651,7 @@ impl Tomlook {
                             });
                         }
                         Change::ClearCategory => { ui.strong(language.text("Remove category")); }
+                        Change::Follow(enabled) => { ui.strong(language.text(if *enabled { "Follow" } else { "Stop following" })); }
                         Change::Respond { response, .. } => { ui.strong(language.text(response.label())); }
                         Change::Delete => { ui.strong(language.text("Delete own appointment")); }
                     }
@@ -4652,38 +4734,34 @@ impl Tomlook {
                 }
                 if !recommendation.message.is_empty() {
                     ui.add_space(6.0);
+                    if recommendation.state == State::NotSent { ui.weak(language.text("Previous attempt; no calendar change was sent.")); }
                     ui.label(language.text(&recommendation.message));
                 }
                 ui.add_space(10.0);
                 ui.horizontal_wrapped(|ui| {
                     if recommendation.state == State::Review
                         && matches!(recommendation.suggestion.kind, RecommendationKind::Manual | RecommendationKind::Category)
-                        && ui.add_enabled(self.workiq_ready && self.ai.is_some(),
+                        && ui.add_enabled(self.ai.is_some(),
                             egui::Button::new(language.text("Check calendar result"))).clicked() {
+                        self.ai_command(ai::Command::RefreshCalendarAvailability);
                         self.command(Command::RecheckCalendarResult(recommendation.id.clone()));
                     }
-                    if recommendation.suggestion.kind != RecommendationKind::Manual
-                        && matches!(recommendation.state, State::Pending | State::NotSent)
+                    if matches!(recommendation.state, State::Pending | State::NotSent)
                         && let Ok(change) = &change {
-                        let label = if recommendation.suggestion.kind == RecommendationKind::Category {
+                        let label = if recommendation.suggestion.kind == RecommendationKind::Manual {
+                            "Retry calendar change"
+                        } else if recommendation.suggestion.kind == RecommendationKind::Category {
                             "Use category"
                         } else { "Add to calendar" };
-                        if ui.add_enabled(self.workiq_ready && self.ai.is_some(),
+                        if ui.add_enabled(self.ai.is_some(),
                             egui::Button::new(language.text(label))).clicked() {
+                            self.ai_command(ai::Command::RefreshCalendarAvailability);
                             self.command(Command::ConfirmRecommendation { id: recommendation.id.clone(), change: change.clone() });
                         }
                     }
                     if recommendation.suggestion.kind == RecommendationKind::FollowUp
                         && ui.button(language.text("Draft follow-up")).clicked() {
                         self.prepare_follow_up(recommendation);
-                    }
-                    if let Some(event) = event
-                        && ui.add(egui::Button::new(language.text("Open Insights")).frame(false)).clicked() {
-                        self.open_recommended_meeting(event);
-                    }
-                    if recommendation.state != State::Dispatching
-                        && ui.add(egui::Button::new(language.text("Skip recommendation")).frame(false)).clicked() {
-                        self.command(Command::DismissRecommendation(recommendation.id.clone()));
                     }
                 });
                 if reason.chars().count() > 320 || change.is_ok() || recommendation.source_url.is_some()
@@ -4713,8 +4791,105 @@ impl Tomlook {
             });
     }
 
+    fn preferences_dialog(&mut self, context: &egui::Context) {
+        if !self.preferences_open { return; }
+        let language = self.preferences.language;
+        let mut open = true;
+        egui::Window::new(language.text("Settings")).id(Id::new("preferences"))
+            .open(&mut open).default_size(Vec2::new(940.0, 620.0))
+            .min_size(Vec2::new(760.0, 480.0)).resizable(true).collapsible(false).show(context, |ui| {
+                egui::Panel::left("preferences-navigation").resizable(false).exact_size(184.0)
+                    .frame(egui::Frame::new().fill(ui.visuals().panel_fill)
+                        .inner_margin(egui::Margin::symmetric(12, 16)))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 8.0;
+                        for (section, label) in [
+                            (PreferencesSection::Display, "Display"),
+                            (PreferencesSection::Prompts, "AI prompts"),
+                        ] {
+                            if ui.add_sized([ui.available_width(), 36.0],
+                                egui::Button::new(language.text(label))
+                                    .selected(self.preferences_section == section)).clicked() {
+                                self.preferences_section = section;
+                            }
+                        }
+                        ui.separator();
+                        if ui.button(language.text("Insights activity")).clicked() { self.settings = true; }
+                    });
+                egui::CentralPanel::default().frame(egui::Frame::NONE
+                    .inner_margin(egui::Margin {left:24,right:24,top:18,bottom:20})).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt(("preferences-content", self.preferences_section))
+                        .auto_shrink([false, false]).show(ui, |ui| {
+                        match self.preferences_section {
+                            PreferencesSection::Display => {
+                                ui.heading(language.text("Display"));
+                                ui.add_space(16.0);
+                                ui.strong(language.text("Language"));
+                                ui.horizontal(|ui| {
+                                    for (value, label) in [
+                                        (tomlook::i18n::Language::En, "English"),
+                                        (tomlook::i18n::Language::Cs, "Čeština"),
+                                    ] {
+                                        if ui.selectable_value(&mut self.preferences.language, value, label).changed() {
+                                            self.save_preferences();
+                                        }
+                                    }
+                                });
+                                ui.add_space(20.0);
+                                ui.strong(language.text("Theme"));
+                                if ui.checkbox(&mut self.preferences.dark, language.text("Dark")).changed() {
+                                    self.save_preferences();
+                                }
+                                ui.add_space(20.0);
+                                ui.strong(language.text("Accent"));
+                                ui.horizontal_wrapped(|ui| {
+                                    for (index, (name, light, dark)) in ACCENTS.iter().enumerate() {
+                                        let [red, green, blue] = if self.preferences.dark { *dark } else { *light };
+                                        let color = Color32::from_rgb(red, green, blue);
+                                        if ui.add(egui::Button::new(RichText::new(language.text(name)).color(color))
+                                            .selected(self.preferences.accent == index)).clicked() {
+                                            self.preferences.accent = index;
+                                            self.save_preferences();
+                                        }
+                                    }
+                                });
+                            }
+                            PreferencesSection::Prompts => {
+                                ui.heading(language.text("AI prompts"));
+                                ui.weak(language.text("Personal guidance only; evidence, privacy and write-safety rules stay enforced."));
+                                ui.add_space(12.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    for kind in tomlook::prompts::Kind::ALL {
+                                        ui.selectable_value(&mut self.prompt_kind, kind, language.text(kind.label()));
+                                    }
+                                });
+                                ui.add(egui::TextEdit::multiline(self.prompt_draft.edit(self.prompt_kind))
+                                    .id(Id::new(("prompt-editor", self.prompt_kind.label())))
+                                    .desired_width(f32::INFINITY).desired_rows(16).char_limit(4000));
+                                let validation = self.prompt_draft.validate();
+                                if let Err(error) = &validation { ui.colored_label(ui.visuals().error_fg_color, language.text(error)); }
+                                ui.horizontal(|ui| {
+                                    if ui.add_enabled(validation.is_ok() && self.prompt_draft != self.preferences.prompts,
+                                        egui::Button::new(language.text("Save prompts"))).clicked() {
+                                        self.preferences.prompts = self.prompt_draft.clone();
+                                        self.save_preferences();
+                                    }
+                                    if ui.button(language.text("Restore default")).clicked() {
+                                        *self.prompt_draft.edit(self.prompt_kind) = self.prompt_kind.default_text().into();
+                                    }
+                                });
+                                ui.weak(language.text("Saved notes are not reprocessed when prompts change."));
+                            }
+                        }
+                    });
+                });
+            });
+        self.preferences_open = open;
+    }
+
     fn overlays(&mut self, context: &egui::Context) {
         let language = self.preferences.language;
+        self.preferences_dialog(context);
         self.meeting_action_dialog(context);
         self.event_creation_dialog(context);
         self.assistant_dialog(context);
@@ -5006,6 +5181,21 @@ impl Tomlook {
                     {
                         self.command(Command::PausePreparation(self.preferences.paused));
                     }
+                    ui.collapsing(language.text("Meeting notes"), |ui| {
+                        let records = activity.recaps.records.values()
+                            .filter(|record| self.calendar_owner.as_deref() == Some(record.account.as_str())).collect::<Vec<_>>();
+                        if records.is_empty() { ui.weak(language.text("No AI meeting notes yet.")); }
+                        egui::ScrollArea::vertical().id_salt("recap-activity").max_height(180.0)
+                            .show_rows(ui, 42.0, records.len(), |ui, rows| {
+                                for row in rows {
+                                    let record = records[row];
+                                    let title = calendar.event_index(&record.event_id).map(|index| calendar.events[index].title.as_str())
+                                        .unwrap_or(&record.event_id);
+                                    ui.add(egui::Label::new(RichText::new(title).strong()).truncate());
+                                    ui.add(egui::Label::new(language.text(&record.message)).truncate()).on_hover_text(language.text(&record.message));
+                                }
+                            });
+                    });
                     ui.collapsing(language.text("AI usage"), |ui| {
                         ui.horizontal(|ui| {
                             ui.label(language.text("Daily AI request limit"));
@@ -5380,7 +5570,11 @@ impl eframe::App for Tomlook {
                     .on_hover_text(language.text(&self.connection))
                     .clicked()
                 {
-                    self.connection_panel = Some(ConnectionPanel::Ai);
+                    self.open_ai_connection();
+                }
+                if status_text(ui, "status-auto", language.text(self.auto_status.label()))
+                    .on_hover_text(language.text(&self.auto_status.message)).clicked() {
+                    self.open_ai_connection();
                 }
                 let label = if self.hosted_workiq_busy {
                     "WorkIQ: working..."
@@ -5437,7 +5631,10 @@ impl eframe::App for Tomlook {
                         let now = chrono::Local::now().fixed_offset();
                         let recommendations = self.activity.recommendation_view.iter().filter_map(|entry| self.activity.recommendations.get(&entry.id)).filter(|recommendation|
                             recommendation.visible(&self.calendar, self.calendar_owner.as_deref(), now)).count();
-                        if (has_messages || recommendations > 0) && inbox_button(ui, language, has_messages, recommendations).clicked() { self.messages_open = true; }
+                        if (has_messages || recommendations > 0) && inbox_button(ui, language, has_messages, recommendations).clicked() {
+                            self.messages_open = true;
+                            if self.ai.is_some() { self.ai_command(ai::Command::RefreshCalendarAvailability); }
+                        }
                     });
                 }
             });
@@ -5512,6 +5709,60 @@ impl eframe::App for Tomlook {
             context.request_repaint();
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum HeaderIcon { Settings, Ask, Commands }
+
+fn header_icon(ui: &mut egui::Ui, label: &str, icon: HeaderIcon,
+    language: tomlook::i18n::Language, attention: bool) -> egui::Response {
+    let response = ui.push_id(label, |ui| ui.add(egui::Button::new("").frame(false)
+        .min_size(Vec2::splat(30.0)))).inner;
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), language.text(label)));
+    let rect = response.rect.shrink(5.0);
+    let center = rect.center();
+    let stroke = Stroke::new(1.5, ui.visuals().text_color());
+    let point = |x, y| rect.min + Vec2::new(x * rect.width(), y * rect.height());
+    match icon {
+        HeaderIcon::Settings => {
+            ui.painter().circle_stroke(center, 6.0, stroke);
+            ui.painter().circle_stroke(center, 2.2, stroke);
+            for index in 0..8 {
+                let angle = index as f32 * std::f32::consts::TAU / 8.0;
+                let direction = Vec2::new(angle.cos(), angle.sin());
+                ui.painter().line_segment([center + direction * 6.0, center + direction * 9.0], Stroke::new(2.5, stroke.color));
+            }
+        }
+        HeaderIcon::Ask => {
+            ui.painter().rect_stroke(egui::Rect::from_min_max(point(0.08, 0.1), point(0.92, 0.76)),
+                4, stroke, egui::StrokeKind::Inside);
+            ui.painter().line_segment([point(0.4, 0.76), point(0.2, 0.95)], stroke);
+            for x in [0.3, 0.5, 0.7] { ui.painter().circle_filled(point(x, 0.43), 1.0, stroke.color); }
+        }
+        HeaderIcon::Commands => {
+            ui.painter().rect_stroke(rect.shrink(1.0), 3, stroke, egui::StrokeKind::Inside);
+            ui.painter().line_segment([point(0.22, 0.3), point(0.42, 0.5)], stroke);
+            ui.painter().line_segment([point(0.42, 0.5), point(0.22, 0.7)], stroke);
+            ui.painter().line_segment([point(0.55, 0.7), point(0.8, 0.7)], stroke);
+        }
+    }
+    if attention { ui.painter().circle_filled(response.rect.right_top() + Vec2::new(-3.0, 4.0), 3.0, ui.visuals().selection.stroke.color); }
+    if response.has_focus() { ui.painter().rect_stroke(response.rect, 3, ui.visuals().selection.stroke, egui::StrokeKind::Inside); }
+    response.on_hover_text(language.text(label))
+}
+
+fn insight_badge(ui: &mut egui::Ui, rect: egui::Rect, notes: bool, color: Color32, language: tomlook::i18n::Language) {
+    let stroke = Stroke::new(1.2, color);
+    ui.painter().rect_stroke(rect.shrink2(Vec2::new(2.0, 0.0)), 2, stroke, egui::StrokeKind::Inside);
+    let p = |x, y| rect.min + Vec2::new(x, y);
+    if notes {
+        ui.painter().line_segment([p(4.0, 8.0), p(6.5, 10.5)], stroke);
+        ui.painter().line_segment([p(6.5, 10.5), p(11.0, 4.5)], stroke);
+    } else {
+        for y in [4.0, 7.0, 10.0] { ui.painter().line_segment([p(5.0, y), p(10.0, y)], stroke); }
+    }
+    ui.interact(rect, ui.id().with(("insight-badge", rect.min.x.to_bits(), rect.min.y.to_bits())), egui::Sense::hover())
+        .on_hover_text(language.text(if notes { "AI meeting notes ready" } else { "AI preparation ready" }));
 }
 
 fn status_text(
@@ -5660,6 +5911,243 @@ impl Tomlook {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn settings_content_has_clear_padding_from_navigation_in_both_sections_and_themes() {
+        for dark in [true, false] {
+            for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+                for section in [PreferencesSection::Display, PreferencesSection::Prompts] {
+                    let mut app = Tomlook::initial(None, None, None);
+                    app.preferences.dark = dark;
+                    app.preferences.language = language;
+                    app.preferences_open = true;
+                    app.preferences_section = section;
+                    let context = egui::Context::default();
+                    context.set_visuals(if dark {egui::Visuals::dark()} else {egui::Visuals::light()});
+                    let mut output = None;
+                    for _ in 0..3 {
+                        let mut frame = context.run_ui(egui::RawInput {
+                            screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1200.0, 900.0))),
+                            ..Default::default()
+                        }, |ui| app.preferences_dialog(ui.ctx()));
+                        frame.textures_delta.clear();
+                        output = Some(frame);
+                    }
+                    let output = output.unwrap();
+                    let divider = output.shapes.iter().find_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::LineSegment {points,..}
+                            if (points[0].x - points[1].x).abs() < 0.1
+                                && (points[0].y - points[1].y).abs() > 300.0 => Some(points[0].x),
+                        _ => None,
+                    }).expect("Settings navigation must have a vertical divider");
+                    let heading = language.text(match section {
+                        PreferencesSection::Display => "Display",
+                        PreferencesSection::Prompts => "AI prompts",
+                    });
+                    let content = output.shapes.iter().find_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text)
+                            if text.galley.job.text == heading && text.pos.x > divider => Some(text.pos),
+                        _ => None,
+                    }).expect("Settings content heading must be visible");
+                    assert!(content.x - divider >= 23.0,
+                        "{language:?} / {section:?} / dark={dark}: content is only {}px from the divider", content.x - divider);
+                    let window = context.memory(|memory| memory.area_rect(Id::new("preferences")).unwrap());
+                    assert!(window.right() - content.x > 450.0, "Padding must preserve usable content width");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn settings_have_left_navigation_and_language_is_only_in_display_preferences() {
+        for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+            let (mut app, _, mut ai_commands) = assistant_fixture();
+            let (sender, receiver) = mpsc::sync_channel(16);
+            app.worker = Some(Worker {
+                commands: sender, notices: Arc::new(Default::default()),
+                activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+                stop: Arc::new(Default::default()), done: None,
+            });
+            app.preferences.language = language;
+            app.preferences_open = true;
+            app.prompt_draft.recap.push_str(" Keep this unsaved edit.");
+            let draft = app.prompt_draft.clone();
+            let context = egui::Context::default();
+            let draw = |app: &mut Tomlook, events| {
+                let mut output = context.run_ui(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                    events, ..Default::default()
+                }, |ui| app.preferences_dialog(ui.ctx()));
+                output.textures_delta.clear();
+                output
+            };
+            let click = |app: &mut Tomlook, label: &str| {
+                draw(app, vec![]);
+                let output = draw(app, vec![]);
+                let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.job.text == label =>
+                        Some(text.pos + text.galley.size() * 0.5),
+                    _ => None,
+                }).unwrap_or_else(|| panic!("Missing settings control: {label}"));
+                for pressed in [true, false] {
+                    draw(app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                        pos,button:egui::PointerButton::Primary,pressed,modifiers:Modifiers::NONE,
+                    }]);
+                }
+            };
+            draw(&mut app, vec![]);
+            draw(&mut app, vec![]);
+            let rect = context.memory(|memory| memory.area_rect(Id::new("preferences")).unwrap());
+            assert!(rect.width() >= 900.0 && rect.height() >= 580.0, "{rect:?}");
+            click(&mut app, language.text("AI prompts").as_ref());
+            assert!(app.preferences_section == PreferencesSection::Prompts);
+            click(&mut app, language.text("Display").as_ref());
+            assert!(app.preferences_section == PreferencesSection::Display);
+            assert_eq!(app.prompt_draft, draft);
+            click(&mut app, if language == tomlook::i18n::Language::En { "Čeština" } else { "English" });
+            assert_eq!(app.preferences.language, language.other());
+            assert!(matches!(receiver.try_recv().unwrap(), Command::Preferences(preferences)
+                if preferences.language == language.other()));
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| app.header(ui));
+            assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::epaint::Shape::Text(text) if matches!(text.galley.job.text.as_str(), "EN" | "CZ"))));
+            output.textures_delta.clear();
+            assert!(receiver.try_recv().is_err());
+            assert!(ai_commands.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn follow_menu_submits_directly_and_decline_defaults_to_no_organizer_response() {
+        use tomlook::recommendations::{Change, MeetingResponse};
+        for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+            let (mut app, _, mut ai_commands) = assistant_fixture();
+            let (sender, receiver) = mpsc::sync_channel(16);
+            app.worker = Some(Worker {
+                commands: sender, notices: Arc::new(Default::default()),
+                activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+                stop: Arc::new(Default::default()), done: None,
+            });
+            app.preferences.language = language;
+            app.calendar_owner = Some("owner".into());
+            app.workiq_ready = true;
+            let mut event = tomlook::calendar::fixture(1).remove(0);
+            event.organizer = "organizer@example.test".into();
+            event.extra.insert("isOrganizer".into(), false.into());
+            event.extra.insert("type".into(), "occurrence".into());
+            let context = egui::Context::default();
+            let draw = |app: &mut Tomlook, events| {
+                let mut output = context.run_ui(egui::RawInput {events, ..Default::default()},
+                    |ui| app.meeting_actions(ui, 0));
+                output.textures_delta.clear();
+                output
+            };
+            let click = |app: &mut Tomlook, label: &str| {
+                draw(app, vec![]);
+                let output = draw(app, vec![]);
+                let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.job.text == label =>
+                        Some(text.pos + text.galley.size() * 0.5),
+                    _ => None,
+                }).unwrap_or_else(|| panic!("Missing meeting action: {label}"));
+                for pressed in [true, false] {
+                    draw(app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                        pos,button:egui::PointerButton::Primary,pressed,modifiers:Modifiers::NONE,
+                    }]);
+                }
+            };
+            for enabled in [true, false] {
+                event.extra.insert("categories".into(),
+                    if enabled { serde_json::json!(["Call"]) } else { serde_json::json!(["Call", "Follow"]) });
+                app.calendar = Arc::new(Calendar::build(vec![event.clone()], Default::default(), vec![]).unwrap());
+                click(&mut app, language.text(if enabled { "Follow" } else { "Stop following" }).as_ref());
+                assert!(app.meeting_action.is_none(), "Follow must not open a confirmation");
+                assert!(matches!(receiver.try_recv().unwrap(), Command::ConfirmMeetingAction {event: submitted,account,change}
+                    if submitted.id == event.id && account == "owner" && change == Change::Follow(enabled)));
+                assert!(receiver.try_recv().is_err());
+            }
+            click(&mut app, language.text("Decline invitation").as_ref());
+            assert!(matches!(app.meeting_action.as_ref().unwrap().change,
+                Change::Respond {response: MeetingResponse::Decline,send_response: false,..}));
+            assert!(receiver.try_recv().is_err(), "Decline still requires its existing confirmation");
+            app.meeting_action = None;
+            event.extra.insert("categories".into(), serde_json::json!(["Call"]));
+            for unavailable in ["organizer", "metadata", "connection"] {
+                let mut unavailable_event = event.clone();
+                if unavailable == "organizer" {
+                    unavailable_event.extra.insert("isOrganizer".into(), true.into());
+                } else if unavailable == "metadata" {
+                    unavailable_event.extra.remove("type");
+                }
+                app.workiq_ready = unavailable != "connection";
+                app.calendar = Arc::new(Calendar::build(vec![unavailable_event], Default::default(), vec![]).unwrap());
+                click(&mut app, language.text("Follow").as_ref());
+                assert!(app.meeting_action.is_none(), "Unavailable Follow must stay visible without submitting");
+                assert!(receiver.try_recv().is_err());
+            }
+            assert!(ai_commands.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn mini_month_arrows_browse_without_changing_main_view_or_starting_ai() {
+        let (mut app, _, mut commands) = assistant_fixture();
+        let context = egui::Context::default();
+        let anchor = NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+        for view in [View::Day, View::WorkWeek, View::Month] {
+            app.anchor = anchor;
+            app.mini_anchor = None;
+            app.preferences.view = view;
+            let draw = |app: &mut Tomlook, events| {
+                let mut output = context.run_ui(egui::RawInput {events, ..Default::default()}, |ui| app.sidebar(ui));
+                output.textures_delta.clear();
+            };
+            draw(&mut app, vec![]);
+            let pos = context.data(|data| data.get_temp::<egui::Rect>(Id::new("mini-next-month")).unwrap()).center();
+            for pressed in [true, false] {
+                draw(&mut app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                    pos,button:egui::PointerButton::Primary,pressed,modifiers:Modifiers::NONE,
+                }]);
+            }
+            assert_eq!(app.anchor, anchor);
+            assert_eq!(app.preferences.view, view);
+            assert_eq!(app.mini_anchor.unwrap().month(), 11);
+        }
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn tentative_hatching_is_neutral_in_both_themes_and_notes_show_personal_evidence() {
+        let mut app = Tomlook::initial(None, None, None);
+        let mut event = tomlook::calendar::fixture(1).remove(0);
+        event.status = "tentativelyAccepted".into();
+        app.calendar = Arc::new(Calendar::build(vec![event], Default::default(), vec![]).unwrap());
+        let context = egui::Context::default();
+        for dark in [true, false] {
+            app.preferences.dark = dark;
+            context.set_visuals(if dark {egui::Visuals::dark()} else {egui::Visuals::light()});
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                let rect = egui::Rect::from_min_size(ui.cursor().min, Vec2::new(300.0, 38.0));
+                app.event_card(ui, 0, rect);
+            });
+            let fill = Color32::from_gray(if dark {31} else {247});
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Rect(rect) if rect.fill == fill)));
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::LineSegment {points,stroke}
+                if stroke.width == 1.0 && points[0].x != points[1].x && points[0].y != points[1].y)));
+            output.textures_delta.clear();
+        }
+        app.briefing = Some(serde_json::json!({"tomlook_recap":true,"summary":"A completed meeting",
+            "preparation":["My assignment: deliver a demo"],"open_questions":["My mention: discussed the owner"],
+            "talking_points":[],"risks":[],"gaps":[],"sources":[]}));
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.render_insights(ui, false));
+        let mut text = String::new();
+        for shape in &output.shapes { append_shape_text(&shape.shape, &mut text); }
+        assert!(text.contains("My tasks"));
+        assert!(text.contains("Mentions of me"));
+        assert!(text.contains("deliver a demo"));
+        assert!(text.contains("discussed the owner"));
+        output.textures_delta.clear();
+    }
+
     #[test]
     fn right_click_owned_meeting_opens_paired_travel_confirmation_and_never_recreates_the_meeting() {
         for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
@@ -6380,7 +6868,8 @@ mod tests {
                 let draft = app.meeting_action.take().unwrap();
                 assert_eq!(draft.event.id, event.id);
                 assert!(
-                    matches!(draft.change, Change::Respond { response: selected, send_response: true, .. } if selected == response)
+                    matches!(draft.change, Change::Respond { response: selected, send_response, .. }
+                        if selected == response && send_response == (response != MeetingResponse::Decline))
                 );
                 assert!(!app.messages_open);
                 assert!(
@@ -6424,6 +6913,7 @@ mod tests {
             Some(Arc::new(tomlook::workiq::connection::Identity {
                 account: "me@home.example".into(),
                 mail: Some("alias@home.example".into()),
+                display_name: None,
             }));
         app.calendar =
             Arc::new(Calendar::build(vec![event.clone()], Default::default(), vec![]).unwrap());
@@ -8171,6 +8661,80 @@ mod tests {
     }
 
     #[test]
+    fn auto_authentication_has_separate_status_and_explicit_device_login_controls() {
+        use tomlook::decision::{Phase, Status};
+        for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+            let (mut app, notices, mut commands) = assistant_fixture();
+            app.preferences.language = language;
+            app.connection = "Connected".into();
+            let error = "Microsoft-Decision-1 needs a valid Azure CLI sign-in for the configured tenant and subscription; choose a mode explicitly";
+            app.ai_error = Some(error.into());
+            Arc::make_mut(&mut app.chat).admit(7, "Synthetic failed Auto question".into(), tomlook::chat::Mode::Auto).unwrap();
+            Arc::make_mut(&mut app.chat).finish(7, Err(error.into()));
+            notices.send(ai::Notice::Auto(Status::error(error.into()))).unwrap();
+            app.receive();
+            assert!(app.ai_ready, "Auto auth failure must not disconnect Copilot");
+            assert_eq!(app.connection, "Connected");
+            let context = egui::Context::default();
+            app.apply_ask_input(app.ask_view().input(ask::Action::ConfigureAuto), &context);
+            assert!(matches!(commands.try_recv().unwrap(), ai::Command::CheckAuto));
+            assert!(commands.try_recv().is_err(), "Opening the dialog must not start login or repeat a question");
+            notices.send(ai::Notice::Auto(Status::error(error.into()))).unwrap();
+            app.receive();
+            let draw = |app: &mut Tomlook, events| {
+                let mut output = context.run_ui(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1200.0, 1000.0))),
+                    events, ..Default::default()
+                }, |ui| app.connection_dialog(ui.ctx()));
+                output.textures_delta.clear();
+                output
+            };
+            let click = |app: &mut Tomlook, label: &str| {
+                draw(app, vec![]);
+                let output = draw(app, vec![]);
+                let position = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.job.text == label =>
+                        Some(text.pos + text.galley.size() * 0.5),
+                    _ => None,
+                }).unwrap_or_else(|| panic!("Missing Auto connection control: {label}"));
+                for pressed in [true, false] {
+                    draw(app, vec![egui::Event::PointerMoved(position), egui::Event::PointerButton {
+                        pos: position, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+                    }]);
+                }
+            };
+            draw(&mut app, vec![]);
+            let output = draw(&mut app, vec![]);
+            let mut text = String::new();
+            for shape in &output.shapes { append_shape_text(&shape.shape, &mut text); }
+            assert!(text.contains("Copilot") && text.contains("Microsoft-Decision-1"));
+            assert_eq!(text.matches(language.text(error).as_ref()).count(), 1, "Do not repeat the routing error as a Copilot failure: {text}");
+            click(&mut app, language.text("Sign in to Azure (device code)").as_ref());
+            assert!(matches!(commands.try_recv().unwrap(), ai::Command::SignInAuto));
+            assert!(commands.try_recv().is_err());
+            notices.send(ai::Notice::Auto(Status {
+                phase: Phase::SigningIn,
+                message: "Enter this code on Microsoft's device sign-in page.".into(),
+                device_code: Some("ABCD-EF12".into()),
+            })).unwrap();
+            app.receive();
+            let output = draw(&mut app, vec![]);
+            text.clear();
+            for shape in &output.shapes { append_shape_text(&shape.shape, &mut text); }
+            assert!(text.contains("ABCD-EF12"));
+            assert!(text.contains(language.text("Open Microsoft device sign-in").as_ref()));
+            assert!(output.platform_output.commands.is_empty(), "Rendering a code must not open a browser or copy it automatically");
+            click(&mut app, language.text("Cancel Azure sign-in").as_ref());
+            assert!(matches!(commands.try_recv().unwrap(), ai::Command::CancelAutoLogin));
+            notices.send(ai::Notice::Auto(Status::signed_in())).unwrap();
+            app.receive();
+            assert!(app.ai_ready && app.auto_status.phase == Phase::SignedIn);
+            assert_eq!(app.chat.turns[0].error.as_deref(), Some(error));
+            assert!(commands.try_recv().is_err(), "Successful login must not repeat a failed question");
+        }
+    }
+
+    #[test]
     fn concurrent_chat_results_keep_their_turn_and_complete_history() {
         let (mut app, notices, mut commands) = assistant_fixture();
         app.ask_mode = tomlook::chat::Mode::Deep;
@@ -9568,6 +10132,74 @@ mod tests {
                 if status == "notResponded" {
                     assert!(text.contains("Nepotvrzeno"));
                     assert!(!text.contains("00:00"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_day_of_multiday_all_day_meetings_opens_the_same_event_details() {
+        for view in [View::WorkWeek, View::Week, View::Month] {
+            for status in ["accepted", "notResponded"] {
+                let mut app = Tomlook::initial(None, None, None);
+                let mut events = tomlook::calendar::fixture(2);
+                for (index, event) in events.iter_mut().enumerate() {
+                    event.start = chrono::DateTime::parse_from_rfc3339("2026-11-02T00:00:00Z").unwrap()
+                        + chrono::Duration::days(index as i64 * 2);
+                    event.end = event.start + chrono::Duration::days(2);
+                    event.is_all_day = true;
+                    event.status = status.into();
+                    event.title = format!("Span {index}");
+                }
+                app.calendar = Arc::new(Calendar::build(events, Default::default(), Vec::new()).unwrap());
+                app.anchor = "2026-11-02".parse().unwrap();
+                app.preferences.view = view;
+                app.preferences.hide_unconfirmed = false;
+                let (commands, input) = mpsc::sync_channel(16);
+                app.worker = Some(Worker {
+                    commands,
+                    notices: Arc::new(Default::default()),
+                    activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+                    stop: Arc::new(Default::default()),
+                    done: None,
+                });
+                let context = egui::Context::default();
+                let draw = |app: &mut Tomlook, events| {
+                    let mut output = context.run_ui(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1500.0, 1000.0))),
+                        events,
+                        ..Default::default()
+                    }, |ui| {
+                        if view == View::Month { app.month(ui); } else { app.timeline(ui); }
+                    });
+                    output.textures_delta.clear();
+                    output
+                };
+                draw(&mut app, vec![]);
+                let output = draw(&mut app, vec![]);
+                for index in 0..2 {
+                    let title = format!("Span {index}");
+                    let positions = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text) if text.galley.job.text.ends_with(&title) =>
+                            Some(text.pos + Vec2::new(2.0, 5.0)),
+                        _ => None,
+                    }).collect::<Vec<_>>();
+                    assert_eq!(positions.len(), 2, "{view:?}, {status}: {title} must appear on both days");
+                    for (day, position) in positions.into_iter().enumerate() {
+                        app.selected = None;
+                        for pressed in [true, false] {
+                            draw(&mut app, vec![
+                                egui::Event::PointerMoved(position),
+                                egui::Event::PointerButton {
+                                    pos: position, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+                                },
+                            ]);
+                        }
+                        assert_eq!(app.selected, Some(index), "{view:?}, {status}: {title}, day {day}");
+                        assert!(matches!(input.try_recv().unwrap(), Command::Detail { id, .. } if id == app.calendar.events[index].id));
+                        assert!(input.try_recv().is_err(), "One click must request details exactly once");
+                        draw(&mut app, vec![egui::Event::PointerGone]);
+                    }
                 }
             }
         }

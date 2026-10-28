@@ -99,7 +99,7 @@ pub enum Notice {
     },
     Loaded {
         calendar: Arc<Calendar>,
-        preferences: Preferences,
+        preferences: Box<Preferences>,
         calendar_owner: Option<String>,
     },
     Detail {
@@ -270,6 +270,7 @@ pub struct Activity {
     pub recommendation_view: Arc<Vec<crate::recommendations::InboxEntry>>,
     pub identity: Option<Arc<crate::workiq::connection::Identity>>,
     pub event_creations: Arc<std::collections::BTreeMap<String, crate::event_creation::Record>>,
+    pub recaps: Arc<crate::recaps::Ledger>,
 }
 
 pub struct Shutdown {
@@ -325,7 +326,7 @@ fn dispatch_calendar_change(
         let record = inbox
             .get_mut(&id)
             .ok_or("Confirmed calendar approval disappeared")?;
-        record.state = State::Review;
+        record.state = State::NotSent;
         record.message = "Calendar change was not queued; nothing was submitted".into();
         store.save_recommendations(inbox)?;
     }
@@ -742,9 +743,25 @@ impl Worker {
                     }
                 };
                 let calendar_owner = if options.demo.is_some() { None } else { store.calendar_owner()? };
-                let (mut calendar, mut preferences) = { notify(Notice::Loaded { calendar: calendar.clone(), preferences: preferences.clone(), calendar_owner }); (calendar, preferences) };
+                let (mut calendar, mut preferences) = { notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner }); (calendar, preferences) };
                 let mut queue = store.queue()?;
+                let mut recaps = store.recaps()?;
+                store.save_recaps(&recaps)?;
+                let (recap_sender, mut recap_results) = tokio::sync::mpsc::channel::<crate::recaps::Outcome>(2);
+                let mut recap_flight: Option<(u64, String, bool)> = None;
+                let mut recap_started = None;
+                let mut recap_requested: Option<String> = None;
+                let mut last_was_recap = false;
+                let mut recaps_revision = 0_u64;
+                let mut published_recaps_revision = u64::MAX;
                 let mut inbox = store.recommendations()?;
+                let stale_events: std::collections::BTreeSet<_> = inbox.values_mut().filter(|record|
+                    record.state == crate::recommendations::State::NotSent
+                        && record.message == crate::workiq::connection::calendar_write::MEETING_CHANGED)
+                    .map(|record| {
+                        record.state = crate::recommendations::State::Expired;
+                        record.event_id.clone()
+                    }).collect();
                 let mut event_creations = store.event_creations()?;
                 for record in event_creations.values() { store.save_event_creation(record)?; }
                 let (creation_sender, mut creation_results) = tokio::sync::mpsc::channel::<crate::event_creation::CreationResult>(2);
@@ -770,7 +787,8 @@ impl Worker {
                 let mut retry_after = std::time::Instant::now();
                 let mut sync_days = store.calendar_sync_days()?;
                 let missing_types: std::collections::BTreeSet<_> = calendar.events.iter()
-                    .filter(|event| !event.extra.contains_key("type"))
+                    .filter(|event| !event.extra.contains_key("type") || !event.extra.contains_key("iCalUId")
+                        || stale_events.contains(&event.id))
                     .flat_map(|event| {
                         let (first, last) = event.calendar_dates();
                         (0..=(last - first).num_days()).map(move |day| first + chrono::Duration::days(day))
@@ -788,9 +806,9 @@ impl Worker {
                     if let Some(profile) = sdk.as_ref().and_then(|sdk| sdk.analysis_revision.get()) {
                         use sha2::{Digest, Sha256};
                         let binding = if connector_revision.is_empty() {
-                            serde_json::to_vec(&(profile, store.calendar_owner()?, preferences.sources()))
+                            serde_json::to_vec(&(profile, store.calendar_owner()?, preferences.sources(), &preferences.prompts.preparation, &preferences.prompts.context))
                         } else {
-                            serde_json::to_vec(&(profile, store.calendar_owner()?, preferences.sources(), &connector_revision))
+                            serde_json::to_vec(&(profile, store.calendar_owner()?, preferences.sources(), &connector_revision, &preferences.prompts.preparation, &preferences.prompts.context))
                         }
                             .map_err(|_| "Encode context identity failed")?;
                         let revision = format!("{:x}", Sha256::digest(binding));
@@ -806,6 +824,16 @@ impl Worker {
                         }
                     }
                     let now = chrono::Local::now().fixed_offset();
+                    let current_owner = store.calendar_owner()?;
+                    if let Some((id, key, _)) = &recap_flight
+                        && let Some(sdk) = &sdk
+                        && (recap_started.is_some_and(|started: std::time::Instant| started.elapsed() > Duration::from_secs(1800))
+                            || recaps.records.get(key).is_none_or(|record| {
+                                current_owner.as_deref() != Some(record.account.as_str())
+                                    || calendar.event_index(&record.event_id).is_none_or(|index| !crate::recaps::eligible(&calendar.events[index], now))
+                            })) {
+                        let _ = sdk.commands.try_send(ai::Command::Cancel(*id | (1 << 63)));
+                    }
                     let automatic = preferences.prepare_enabled && !preferences.paused;
                     let sync_window = crate::calendar_sync::Window::new(now.date_naive())?;
                     let sync_ready = !exiting && options.demo.is_none()
@@ -852,6 +880,9 @@ impl Worker {
                     } else { Vec::new() };
                     if !exiting && (preferences.paused || !preferences.prepare_enabled)
                         && let Some(Sdk { commands, .. }) = &sdk {
+                            if let Some((id, _, false)) = &recap_flight {
+                                let _ = commands.try_send(ai::Command::Cancel(*id | (1 << 63)));
+                            }
                             for (id, flight) in &queue.flights {
                                 if queue.jobs.get(&flight.event_id).is_some_and(|job| job.manual || job.review.is_some()) { continue; }
                                 if commands.try_send(ai::Command::Cancel(*id | (1 << 63))).is_err() {
@@ -984,6 +1015,29 @@ impl Worker {
                         queue.interrupt("AI executor stopped before an outcome was recorded; inspect saved evidence before explicit retry");
                         failure = queue.failure.clone();
                     }
+                    while let Ok(outcome) = recap_results.try_recv() {
+                        if recap_flight.as_ref().is_some_and(|(id, key, _)| *id == outcome.id && *key == outcome.key) {
+                            recap_flight = None;
+                            recap_started = None;
+                            let event = calendar.event_index(&recaps.records[&outcome.key].event_id)
+                                .map(|index| &calendar.events[index]);
+                            let current = store.calendar_owner()?.as_deref() == Some(outcome.account.as_str())
+                                && event.is_some_and(|event| crate::recaps::eligible(event, now)
+                                    && crate::scheduler::fingerprint(event) == outcome.fingerprint);
+                            if current && let Some(day) = outcome.quota_day { queue.budget_exhausted_day = Some(day); }
+                            recaps.finish(&outcome.key, if current { outcome.result } else {
+                                Err("Meeting or account changed during recap; no result was published".into())
+                            }, now);
+                            store.save_recaps(&recaps)?;
+                            recaps_revision += 1;
+                        }
+                    }
+                    if sdk_terminated && let Some((_, key, _)) = recap_flight.take() {
+                        recap_started = None;
+                        recaps.finish(&key, Err("AI executor stopped before meeting notes completed".into()), now);
+                        store.save_recaps(&recaps)?;
+                        recaps_revision += 1;
+                    }
                     while let Ok(result) = creation_results.try_recv() {
                         if let Some(record) = event_creations.get_mut(&result.id)
                             && record.state == crate::event_creation::State::Creating {
@@ -997,7 +1051,7 @@ impl Worker {
                                     calendar = Arc::new(store.save_calendar_event(&event, &record.account)?);
                                 }
                                 dirty = true;
-                                notify(Notice::Loaded { calendar: calendar.clone(), preferences: preferences.clone(), calendar_owner: Some(record.account.clone()) });
+                                notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: Some(record.account.clone()) });
                             }
                             inbox_revision += 1;
                         }
@@ -1020,7 +1074,7 @@ impl Worker {
                                     if store.calendar_owner()?.as_deref() == Some(recommendation.account.as_str()) {
                                         calendar = Arc::new(store.save_calendar_event(&event, &recommendation.account)?);
                                         dirty = true;
-                                        notify(Notice::Loaded { calendar: calendar.clone(), preferences: preferences.clone(), calendar_owner: Some(recommendation.account.clone()) });
+                                        notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: Some(recommendation.account.clone()) });
                                     }
                                 }
                                 crate::workiq::connection::calendar_write::Outcome::Removed(id) => {
@@ -1031,11 +1085,23 @@ impl Worker {
                                     }
                                     calendar = Arc::new(store.remove_calendar_event(&id, &recommendation.account)?);
                                     dirty = true;
-                                    notify(Notice::Loaded { calendar: calendar.clone(), preferences: preferences.clone(), calendar_owner: Some(recommendation.account.clone()) });
+                                    notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: Some(recommendation.account.clone()) });
                                 }
                                 crate::workiq::connection::calendar_write::Outcome::NotSent(message) => {
                                     recommendation.state = crate::recommendations::State::NotSent;
                                     recommendation.message = message;
+                                }
+                                crate::workiq::connection::calendar_write::Outcome::Stale(event) => {
+                                    if event.id != recommendation.event_id {
+                                        return Err("Changed meeting identity did not match its approval".into());
+                                    }
+                                    recommendation.state = crate::recommendations::State::Expired;
+                                    recommendation.message = crate::workiq::connection::calendar_write::MEETING_CHANGED.into();
+                                    if store.calendar_owner()?.as_deref() == Some(recommendation.account.as_str()) {
+                                        calendar = Arc::new(store.save_calendar_event(&event, &recommendation.account)?);
+                                        dirty = true;
+                                        notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: Some(recommendation.account.clone()) });
+                                    }
                                 }
                                 crate::workiq::connection::calendar_write::Outcome::Review(message) => {
                                     recommendation.state = crate::recommendations::State::Review;
@@ -1053,19 +1119,62 @@ impl Worker {
                             inbox_revision += 1;
                         }
                     }
-                    let owner = store.calendar_owner()?;
+                    let owner = current_owner;
                     for recommendation in inbox.values_mut().filter(|recommendation| matches!(recommendation.state, crate::recommendations::State::Pending | crate::recommendations::State::NotSent)) {
                         if recommendation.current(&calendar, owner.as_deref(), now).is_none() {
                             recommendation.state = crate::recommendations::State::Expired;
                             inbox_revision += 1;
                         }
                     }
-                    if !exiting && options.demo.is_none() && failure.is_none() && queue.failure.is_none()
+                    let requested_recap = recap_requested.as_ref().and_then(|id| calendar.event_index(id))
+                        .map(|index| &calendar.events[index])
+                        .filter(|event| crate::recaps::eligible(event, now));
+                    if requested_recap.is_none() { recap_requested = None; }
+                    let recap_event = if let Some(event) = requested_recap {
+                        Some(event)
+                    } else if automatic {
+                        owner.as_deref().and_then(|account| recaps.due(account, &calendar.events, now))
+                    } else { None };
+                    if !exiting && options.demo.is_none() && recap_flight.is_none() && queue.flights.is_empty()
+                        && (requested_recap.is_some() || !last_was_recap || !queue.can_dispatch_for(automatic))
+                        && !queue.jobs.values().any(|job| job.manual && job.state == State::Queued)
+                        && queue.budget_exhausted_day != Some(now.date_naive())
+                        && let (Some(event), Some(account), Some(sdk)) = (recap_event, owner.as_deref(), sdk.as_ref())
+                        && sdk.ready.load(Ordering::Acquire) && sdk.workiq_ready.load(Ordering::Acquire)
+                        && !sdk.terminated.load(Ordering::Acquire) && sdk.occupied.load(Ordering::Acquire) < 2
+                    {
+                        let event = event.clone();
+                        let key = crate::recaps::key(account, &event);
+                        if recaps.record(account, &event).is_none_or(|record| record.payload.is_none()) {
+                            let id = queue.sequence.checked_add(1).ok_or("Meeting notes identity exhausted")?;
+                            queue.sequence = queue.sequence.checked_add(64).filter(|id| *id < (1 << 63))
+                                .ok_or("Meeting notes identity exhausted")?;
+                            store.save_queue(&queue)?;
+                            let key = recaps.begin(account, &event, now);
+                            store.save_recaps(&recaps)?;
+                            match sdk.commands.try_send(ai::Command::Recap(Box::new(crate::recaps::Request {
+                                id, key: key.clone(), account: account.into(), event, prompts: preferences.prompts.clone(),
+                                reply: recap_sender.clone(), wake: wake.clone(),
+                            }))) {
+                                Ok(()) => { recap_flight = Some((id, key, requested_recap.is_some())); recap_started = Some(std::time::Instant::now()); last_was_recap = true; }
+                                Err(_) => {
+                                    recaps.finish(&key, Err("Meeting notes could not be queued; no analysis was submitted".into()), now);
+                                    store.save_recaps(&recaps)?;
+                                }
+                            }
+                            recaps_revision += 1;
+                        } else if let Some(record) = recaps.records.get(&key) {
+                            debug_assert!(record.payload.is_some());
+                        }
+                        recap_requested = None;
+                    }
+                    if !exiting && options.demo.is_none() && recap_flight.is_none() && failure.is_none() && queue.failure.is_none()
                         && queue.budget_exhausted_day != Some(now.date_naive())
                         && std::time::Instant::now() >= retry_after
                         && sdk.as_ref().is_some_and(|sdk| sdk.ready.load(Ordering::Acquire) && sdk.workiq_ready.load(Ordering::Acquire) && sdk.analysis_revision.get().is_some() && !sdk.terminated.load(Ordering::Acquire) && sdk.occupied.load(Ordering::Acquire) < 2)
                         && let Some(Sdk { commands, .. }) = &sdk
                             && let Some((id, flight)) = queue.dispatch_for(automatic) {
+                                last_was_recap = false;
                                 match store.save_queue(&queue) {
                                     Ok(()) => {
                                         if let Some(event) = calendar.events.iter().find(|event| event.id == flight.event_id) {
@@ -1119,7 +1228,7 @@ impl Worker {
                         published_owner = owner;
                         published_minute = Some(now.timestamp() / 60);
                     }
-                    if view_changed || queue_changed || previous.identity != identity || previous.enabled != preferences.prepare_enabled || previous.paused != preferences.paused || previous.error != failure || previous.sync != sync || inbox_revision != published_inbox_revision {
+                    if view_changed || queue_changed || previous.identity != identity || previous.enabled != preferences.prepare_enabled || previous.paused != preferences.paused || previous.error != failure || previous.sync != sync || inbox_revision != published_inbox_revision || recaps_revision != published_recaps_revision {
                         if inbox_revision != published_inbox_revision { store.save_recommendations(&inbox)?; }
                         let index = if queue_changed {
                             Arc::new(ActivityIndex::new(&queue))
@@ -1127,11 +1236,13 @@ impl Worker {
                             previous.index.clone()
                         };
                         revision += 1;
-                        let next = Activity { revision, queue: queue.clone(), index, enabled: preferences.prepare_enabled, paused: preferences.paused, error: failure.clone(), sync, recommendations: Arc::new(inbox.clone()), recommendation_view: recommendation_view.clone(), identity: identity.clone(), event_creations: Arc::new(event_creations.clone()),
+                        let recap_snapshot = if recaps_revision != published_recaps_revision { Arc::new(recaps.clone()) } else { previous.recaps.clone() };
+                        let next = Activity { revision, queue: queue.clone(), index, enabled: preferences.prepare_enabled, paused: preferences.paused, error: failure.clone(), sync, recommendations: Arc::new(inbox.clone()), recommendation_view: recommendation_view.clone(), identity: identity.clone(), event_creations: Arc::new(event_creations.clone()), recaps: recap_snapshot,
                             queued: queue.jobs.values().filter(|job| job.state == crate::scheduler::State::Queued).count(),
                             deferred: queue.jobs.values().filter(|job| job.state == crate::scheduler::State::Deferred).count() };
                         *state.lock().map_err(|_| "Preparation state is unavailable")? = Arc::new(next);
                         published_inbox_revision = inbox_revision;
+                        published_recaps_revision = recaps_revision;
                         context.request_repaint();
                     }
                     let command = loop {
@@ -1158,6 +1269,10 @@ impl Worker {
                             calendar.events.iter().find(|event| event.id == id)
                                 .ok_or_else(|| "Synthetic meeting is no longer available".to_owned())
                                 .and_then(crate::showcase::insights).map(Some)
+                        } else if let Some(event) = calendar.event_index(&id).map(|index| &calendar.events[index])
+                            && event.end <= chrono::Local::now().fixed_offset() {
+                            Ok(store.calendar_owner()?.as_deref().and_then(|account| recaps.record(account, event))
+                                .and_then(|record| record.payload.clone()))
                         } else { store.briefing(&id).and_then(|payload| {
                             payload.map(|json| serde_json::from_str(&json))
                                 .transpose().map_err(|error| format!("Saved briefing is invalid: {error}"))
@@ -1242,7 +1357,7 @@ impl Worker {
                         }
                         Command::RecheckCalendarResult(id) => (|| {
                             if exiting { return Err("Tomlook is stopping; no calendar write was submitted".into()); }
-                            let sdk = sdk.as_ref().filter(|sdk| !sdk.terminated.load(Ordering::Acquire) && sdk.workiq_ready.load(Ordering::Acquire))
+                            let sdk = sdk.as_ref().filter(|sdk| !sdk.terminated.load(Ordering::Acquire))
                                 .ok_or("Connect WorkIQ before confirming a calendar change")?;
                             recheck_calendar_result(&id, &mut store, &mut inbox, &mut inbox_revision,
                                 sdk, &calendar_result_sender, &wake)
@@ -1265,7 +1380,7 @@ impl Worker {
                             if let crate::recommendations::Change::Category(category) = &change {
                                 crate::recommendations::category_replacement(category, &known_categories(&calendar))?;
                             }
-                            let sdk = sdk.as_ref().filter(|sdk| !sdk.terminated.load(Ordering::Acquire) && sdk.workiq_ready.load(Ordering::Acquire))
+                            let sdk = sdk.as_ref().filter(|sdk| !sdk.terminated.load(Ordering::Acquire))
                                 .ok_or("Connect WorkIQ before confirming a calendar change")?;
                             let recommendation = crate::recommendations::Recommendation::from_manual(&event, &account, change.clone(), now)?;
                             let id = recommendation.id.clone();
@@ -1317,7 +1432,7 @@ impl Worker {
                             let event = recommendation.current(&calendar, owner.as_deref(), now).ok_or("Recommendation expired after a calendar change")?.clone();
                             let expected_change = crate::recommendations::proposed_change(recommendation, &calendar, owner.as_deref(), now, preferences.language)?;
                             if change != expected_change { return Err("The proposed interval or action changed; review the current recommendation before confirming".into()); }
-                            let sdk = sdk.as_ref().filter(|sdk| !sdk.terminated.load(Ordering::Acquire) && sdk.workiq_ready.load(Ordering::Acquire))
+                            let sdk = sdk.as_ref().filter(|sdk| !sdk.terminated.load(Ordering::Acquire))
                                 .ok_or("Connect WorkIQ before confirming a calendar change")?;
                             let recommendation = recommendation.clone();
                             let operation = crate::recommendations::Operation { recommendation, event, change };
@@ -1331,14 +1446,18 @@ impl Worker {
                             next.prepare_enabled = preferences.prepare_enabled;
                             next.paused = preferences.paused;
                             next.sources().validate()?;
+                            next.prompts.validate()?;
                             store.save_preferences(&next)?;
                             if let Some(sdk) = &sdk {
                                 sdk.commands.try_send(ai::Command::DailyAiLimit(next.daily_ai_limit))
                                     .map_err(|_| "AI budget could not reach the executor")?;
                                 sdk.commands.try_send(ai::Command::ContextSources(next.sources()))
                                     .map_err(|_| "Context folders could not reach AI")?;
+                                sdk.commands.try_send(ai::Command::Prompts(Box::new(next.prompts.clone())))
+                                    .map_err(|_| "Prompt preferences could not reach AI")?;
                             }
                             if next.daily_ai_limit != preferences.daily_ai_limit { queue.budget_exhausted_day = None; }
+                            dirty |= next.prompts != preferences.prompts;
                             preferences = next; Ok(())
                         })(),
                         Command::EnablePreparation(enabled) => { preferences.prepare_enabled = enabled; auto_ai_requested = false; store.save_preferences(&preferences) },
@@ -1354,7 +1473,7 @@ impl Worker {
                                 calendar = next;
                                 dirty = true;
                                 preferences = next_preferences;
-                                notify(Notice::Loaded { calendar: calendar.clone(), preferences: preferences.clone(), calendar_owner: if options.demo.is_some() { None } else { calendar_owner } });
+                                notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: if options.demo.is_some() { None } else { calendar_owner } });
                             }),
                             Err(error) => Err(error),
                         },
@@ -1367,7 +1486,7 @@ impl Worker {
                                         calendar = Arc::new(saved);
                                         sync_days = store.calendar_sync_days()?;
                                         dirty = true;
-                                        notify(Notice::Loaded { calendar: calendar.clone(), preferences: preferences.clone(), calendar_owner: Some(account) });
+                                        notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: Some(account) });
                                         Ok(())
                                     }
                                     Err(error) => Err(error),
@@ -1407,7 +1526,7 @@ impl Worker {
                                         sync_error = None;
                                         sync_retry_after = std::time::Instant::now();
                                         dirty = true;
-                                        notify(Notice::Loaded { calendar: calendar.clone(), preferences: preferences.clone(), calendar_owner: Some(account) });
+                                        notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: Some(account) });
                                     }
                                     Err(error) => {
                                         sync_failures = sync_failures.saturating_add(1);
@@ -1425,7 +1544,20 @@ impl Worker {
                             if options.demo.is_some() || sdk.is_none() {
                                 Err("Insights need the live AI worker; previews never submit requests.".into())
                             } else if let Some(event) = calendar.events.iter().find(|event| event.id == id) {
+                                if event.end <= now {
+                                    if !crate::recaps::eligible(event, now) {
+                                        notify(Notice::Error("Meeting notes require an accepted or followed online meeting that ended within the last 7 days".into()));
+                                    } else if recaps.record(store.calendar_owner()?.as_deref().unwrap_or(""), event)
+                                        .is_none_or(|record| record.payload.is_none()) {
+                                        recap_requested = Some(id);
+                                    }
+                                    continue 'worker;
+                                }
                                 queue.request_now(event, calendar.coverage.contains(&event.start.with_timezone(&chrono::Local).date_naive())).and_then(|()| {
+                                    if let Some((id, _, _)) = &recap_flight {
+                                        sdk.as_ref().ok_or("AI is unavailable")?.commands.try_send(ai::Command::Cancel(*id | (1 << 63)))
+                                            .map_err(|_| "Meeting notes could not yield; no new preparation was sent")?;
+                                    }
                                     if let Some(request) = queue.yield_for_manual() {
                                         sdk.as_ref().ok_or("AI is unavailable")?.commands.try_send(ai::Command::Cancel(request | (1 << 63)))
                                             .map_err(|_| "Background preparation could not yield; no new request was sent")?;
@@ -1467,6 +1599,7 @@ impl Worker {
                             commands.try_send(ai::Command::DailyAiLimit(preferences.daily_ai_limit)).map_err(|_| "AI budget could not reach the executor")?;
                             let result = commands.try_send(ai::Command::AttachWake(wake.clone())).map_err(|e| format!("Attach preparation wake channel: {e}"));
                             commands.try_send(ai::Command::ContextSources(preferences.sources())).map_err(|_| "Context sources could not reach AI")?;
+                            commands.try_send(ai::Command::Prompts(Box::new(preferences.prompts.clone()))).map_err(|_| "Prompt preferences could not reach AI")?;
                             if options.demo.is_none() {
                                 if !ready.load(Ordering::Acquire) {
                                     commands.try_send(ai::Command::Connect).map_err(|_| "Startup AI connection could not be queued")?;
@@ -1508,6 +1641,123 @@ impl Worker {
 mod tests {
     use super::*;
     use chrono::Local;
+
+    #[test]
+    fn changed_recommendations_expire_refresh_the_meeting_and_allow_fresh_preparation() {
+        use crate::recommendations::{Change, Recommendation, State as RecommendationState};
+        use crate::workiq::connection::calendar_write::Outcome;
+        let root = tempfile::tempdir().unwrap();
+        let now = Local::now().fixed_offset();
+        let mut event = crate::calendar::fixture(1).remove(0);
+        event.start = now + chrono::Duration::days(1);
+        event.end = event.start + chrono::Duration::hours(1);
+        event.status = "accepted".into();
+        event.organizer = "organizer@example.test".into();
+        event.extra.insert("type".into(), "singleInstance".into());
+        event.extra.insert("isOrganizer".into(), false.into());
+        let calendar = Calendar::build(vec![event.clone()],
+            [event.start.with_timezone(&Local).date_naive()].into(), vec![]).unwrap();
+        let mut store = Store::open(root.path()).unwrap();
+        store.save_workiq_calendar(&calendar, "owner").unwrap();
+        store.save_preferences(&Preferences {paused:true, ..Default::default()}).unwrap();
+        let change = Change::Follow(true);
+        let mut recommendation = Recommendation::from_manual(&event, "owner", change.clone(), now).unwrap();
+        recommendation.state = RecommendationState::NotSent;
+        recommendation.message = "Calendar writes are unavailable or busy; nothing was submitted".into();
+        store.save_recommendations(&[(recommendation.id.clone(), recommendation.clone())].into()).unwrap();
+        let mut worker = Worker::start(Options {state:root.path().into(),legacy_root:root.path().join("absent"),demo:None},
+            egui::Context::default()).unwrap();
+        let (sender, mut commands) = tokio::sync::mpsc::channel(32);
+        let workiq_ready = Arc::new(AtomicBool::new(false));
+        worker.commands.send(Command::AttachAi {
+            commands:sender,ready:Arc::new(AtomicBool::new(true)),occupied:Arc::new(AtomicUsize::new(0)),
+            terminated:Arc::new(AtomicBool::new(false)),analysis_revision:Arc::new(std::sync::OnceLock::from("a".repeat(64))),
+            workiq_ready:workiq_ready.clone(),
+        }).unwrap();
+        worker.commands.send(Command::ConfirmRecommendation {id:recommendation.id.clone(),change:change.clone()}).unwrap();
+        let mut changed = event.clone();
+        changed.title.push_str(" changed in Outlook");
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(ai::Command::CalendarChange {operation,verify_only,reply,wake}) = commands.try_recv() {
+                assert!(!verify_only);
+                assert_eq!(operation.change, change);
+                reply.blocking_send(ai::CalendarResult {
+                    id:recommendation.id.clone(),outcome:Outcome::Stale(Box::new(changed.clone())),
+                }).unwrap();
+                wake.send(Command::Wake).unwrap();
+                break;
+            }
+            assert!(std::time::Instant::now() < until, "A stale UI readiness flag must not block a live retry");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let activity = worker.activity.lock().unwrap().clone();
+            if activity.recommendations.get(&recommendation.id)
+                .is_some_and(|record| record.state == RecommendationState::Expired) {
+                assert!(activity.recommendation_view.iter().all(|entry| entry.id != recommendation.id));
+                break;
+            }
+            assert!(std::time::Instant::now() < until);
+            thread::sleep(Duration::from_millis(2));
+        }
+        worker.commands.send(Command::ConfirmRecommendation {id:recommendation.id.clone(),change}).unwrap();
+        workiq_ready.store(true, Ordering::Release);
+        worker.commands.send(Command::TogglePause).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match commands.try_recv() {
+                Ok(ai::Command::Prepare(request)) => {
+                    assert_eq!(request.event.title, changed.title);
+                    let mut prepared = request.event.clone();
+                    for field in ["tomlook_category_meanings", "tomlook_known_categories",
+                        "tomlook_calendar_context", "tomlook_material_contacts"] {
+                        prepared.extra.remove(field);
+                    }
+                    assert_eq!(serde_json::to_value(prepared).unwrap(), serde_json::to_value(&changed).unwrap());
+                    request.reply.blocking_send(ai::Prepared {id:request.id,
+                        result:ai::PreparationResult::Cancelled("Test completed".into())}).unwrap();
+                    request.wake.send(Command::Wake).unwrap();
+                    break;
+                }
+                Ok(ai::Command::CalendarChange {..}) => panic!("An expired recommendation must never be replayed"),
+                _ => {}
+            }
+            assert!(std::time::Instant::now() < until, "The changed accepted meeting must return to preparation");
+            thread::sleep(Duration::from_millis(2));
+        }
+        worker.commands.send(Command::Exit).unwrap();
+        worker.done.take().unwrap().recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert_eq!(store.recommendations().unwrap()[&recommendation.id].state, RecommendationState::Expired);
+        assert_eq!(store.calendar().unwrap().events[0].title, changed.title);
+    }
+
+    #[test]
+    fn startup_removes_legacy_changed_meeting_failures_but_preserves_uncertain_writes() {
+        use crate::recommendations::{Change, Recommendation, State as RecommendationState};
+        let root = tempfile::tempdir().unwrap();
+        let event = crate::calendar::fixture(1).remove(0);
+        let mut event = event;
+        event.extra.insert("type".into(), "singleInstance".into());
+        let mut stale = Recommendation::from_manual(&event, "owner", Change::Category("Office".into()),
+            Local::now().fixed_offset()).unwrap();
+        stale.state = RecommendationState::NotSent;
+        stale.message = crate::workiq::connection::calendar_write::MEETING_CHANGED.into();
+        let mut uncertain = Recommendation::from_manual(&event, "owner", Change::ClearCategory,
+            Local::now().fixed_offset()).unwrap();
+        uncertain.state = RecommendationState::Review;
+        uncertain.message = crate::workiq::connection::calendar_write::MEETING_CHANGED.into();
+        let store = Store::open(root.path()).unwrap();
+        store.save_recommendations(&[(stale.id.clone(),stale.clone()),(uncertain.id.clone(),uncertain.clone())].into()).unwrap();
+        let mut worker = Worker::start(Options {state:root.path().into(),legacy_root:root.path().join("absent"),demo:None},
+            egui::Context::default()).unwrap();
+        worker.commands.send(Command::Exit).unwrap();
+        worker.done.take().unwrap().recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        let saved = store.recommendations().unwrap();
+        assert_eq!(saved[&stale.id].state, RecommendationState::Expired);
+        assert_eq!(saved[&uncertain.id], uncertain);
+    }
 
     #[test]
     fn reviews_publish_only_requested_kinds_to_the_persistent_bell_without_writes() {

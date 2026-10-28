@@ -37,9 +37,9 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The latest native Windows release is **[v0.5.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.5.0)**.
-Read the [release notes](docs/releases/v0.5.0.md) for changes since v0.4.0.
-Download **[Tomlook-v0.5.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.5.0/Tomlook-v0.5.0-win-x64.zip)**
+The latest native Windows release is **[v0.6.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.6.0)**.
+Read the [release notes](docs/releases/v0.6.0.md) for changes since v0.5.0.
+Download **[Tomlook-v0.6.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.6.0/Tomlook-v0.6.0-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable, unsigned,
 and does not install anything.
@@ -101,7 +101,13 @@ release notes are kept in `docs\releases\`.
 Run native checks from `native\` with `cargo test --locked --offline` and
 `cargo clippy --locked --offline --all-targets -- -D warnings`.
 
-**EN/CZ** switches directly beside theme/accent. Controls, calendar dates,
+The gear opens a larger **Settings** window with left-hand navigation:
+**Display** contains language, theme and accent; **AI prompts** contains five
+editable guidance prompts with per-prompt default restoration.
+Save prompt edits explicitly; source boundaries, structured output and write
+approval rules are not editable. Already completed notes are never regenerated
+because a prompt changed. Ask and Commands use accessible vector icons.
+Controls, calendar dates,
 commands and tray labels share a tested catalog. AI answers follow the selected
 language; new meeting Insights save English and Czech from one shared research.
 Original meeting names, quotes, source excerpts and technical provider diagnostics
@@ -112,17 +118,33 @@ Changed meetings and manually requested research get fresh bilingual research.
 
 Category keys are filled color markers. Preset views also update mini-calendar
 highlighting; the small chevron beside a week selects its five working days.
-Unconfirmed meetings are quiet, stripe-free ghosts by default; **Hide unconfirmed**
+The mini-calendar's month arrows browse independently of the main view.
+Unconfirmed meetings use a faint neutral hatch without a category stripe;
+accepted meetings keep their full cards and colored stripes. **Hide unconfirmed**
 filters all calendar views and keyboard navigation. Organizer/response metadata is
-used, never a title prefix or merely a free availability slot. When the provider
-does not expose Follow, Tomlook cannot reliably distinguish it from no response.
+used, never a title prefix or merely a free availability slot.
+Right-click **Follow** immediately adds the reserved `Follow` category and sets availability
+to free in one verified update, preserving other categories and the invitation
+response. This is a Tomlook simulation, not Outlook's native Follow response:
+the organizer receives no invitation response or recording reminder.
+**Stop following** removes the category only; availability remains unchanged.
+Normal category changes preserve Follow.
+The menu calls the action **Follow** in English and **Sledovat** in Czech.
+When unavailable, it stays visible and its tooltip explains why (for example,
+you organize the meeting).
+Declining an invitation defaults to not notifying the organizer; the confirmation
+still lets you opt into a response. An outdated recommendation is removed when
+its meeting has changed, and the refreshed meeting can be analyzed again.
+The compact participant overview shows the organizer and company logos with
+hover lists; expanded People includes names, email and required/optional roles.
 Expanded Insights use section cards, action headings and source counts rather
 than one continuous text block.
 
 Create an appointment by clicking an empty timeline slot or dragging its start
 and end (either direction), or use **New event** in any view. The compact EN/CZ
 editor has 15-minute time sliders, title, optional description, direct category
-buttons, a **Private** lock and optional **Teams**. Enabling Private selects an
+uniform background-colored buttons, aligned **Private**, **Teams** and travel
+checkboxes. Enabling Private selects an
 existing `osobní`/`personal` category; all created items inherit Outlook private
 sensitivity, including travel reserves. Delegates explicitly permitted to read
 private items may still see details. **Add travel blocks before and after**
@@ -146,7 +168,10 @@ check prevents writes against changed meetings or occupied intervals, including
 already existing travel blocks.
 
 The neutral status-bar bell opens a larger recommendation list with one selected
-detail, clear action, meeting and rationale. Skip is remembered across research,
+detail, clear action, meeting and rationale. Open Insights and Skip are at the
+top of the card. Opening the bell refreshes live WorkIQ readiness; a saved
+not-sent error does not disable a new explicit retry. Uncertain outcomes still
+offer read-back only, never automatic replay. Skip is remembered across research,
 metadata changes and restarts. `office` means the home/employer office; customer or partner
 premises use `mimo office`. Offsite visits can suggest separately approved travel
 reserves immediately before and after the meeting. Confirmed travel is
@@ -184,8 +209,11 @@ asynchronously. A durable native scheduler and Windows tray retain preparation
 jobs. Once WorkIQ connects, an independent worker synchronizes one month back
 and six months ahead, with durable per-day freshness and retry/backoff. It
 continues in the tray; visible periods have priority over subsequent batches.
-Automatic AI preparation covers the six-month future horizon, nearest first,
-with bounded retries that do not let one failed meeting block the others.
+Automatic AI preparation covers only accepted or organizer-owned meetings in
+the six-month future horizon, nearest first; unanswered, tentative, declined
+and followed invitations do not enter that automatic queue. Bounded retries
+do not let one failed meeting block the others.
+An interrupted read-only request no longer globally blocks unrelated meetings.
 WorkIQ access tokens remain memory-only. With approved Windows-user-scoped
 DPAPI login storage, both connections restore quietly at startup and request
 authentication only when needed. **Research now** prioritizes the selected
@@ -193,6 +221,30 @@ meeting; opening it does not start AI. Automatic Insights are enabled by default
 but require matching connected identities and verified calendar coverage.
 Click the status-bar activity count to inspect waiting work or pause automatic
 research; **Research now** remains available while automatic work is paused.
+
+Completed accepted or followed Teams meetings are checked for transcripts in a
+rolling **seven-day** window, every 30 minutes per meeting while active, with
+backoff on errors. A missing transcript makes no model call. Once available,
+the original transcript and bounded occurrence chat are scanned for signed-in
+profile name/email mentions, explicit assignments, technical takeaways, decisions
+and shared links. Notes are saved bilingually, separately from preparation, with
+an atomic processed marker; successfully processed occurrences are never polled
+again, including after restart or prompt edits. Long sources are scanned in
+chunks without dropping earlier extracted evidence. Explicit safety limits
+reject oversized transcripts rather than publish a truncated transcript recap;
+unavailable or bounded chat coverage is disclosed.
+Calendar cards use a lined-document icon for ready preparation and a checked
+document for ready notes; the latter replaces preparation. Ended meeting details
+show notes, with personal tasks and mentions visible without expanding.
+**Check transcript** requests a fresh check within the same seven-day window,
+not a regeneration of completed notes.
+
+Transcript and chat access depend on the WorkIQ connector's Graph permissions
+and tenant policy (including delegated `OnlineMeetingTranscript.Read.All`).
+Follow grants no new access and does not start recording or transcription.
+Missing permissions are shown as errors, not treated as an absent transcript.
+One background slot alternates upcoming preparation and post-meeting checks;
+foreground questions remain available. Automatic pause also pauses note checks.
 Commands includes **Exit Tomlook**; meeting details provide explicit retry.
 Closing/minimizing hides the calendar when its tray is
 available, rather than stopping it. Restore through

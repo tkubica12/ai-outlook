@@ -119,7 +119,8 @@ pub(crate) fn fingerprint_for(event: &Event, analysis_revision: &str) -> String 
 }
 
 pub fn eligible(event: &Event, now: DateTime<FixedOffset>) -> bool {
-    event.end > now
+    event.accepted()
+        && event.end > now
         && now
             .date_naive()
             .checked_add_months(chrono::Months::new(6))
@@ -208,8 +209,11 @@ impl Queue {
             );
             self.failure = None;
         }
-        if !self.flights.is_empty() {
-            self.failure.get_or_insert_with(|| "Interrupted provider operation; inspect saved evidence and explicitly retry before resuming preparation".into());
+        // Research is read-only. An interrupted request must not halt unrelated meetings.
+        if self.failure.as_deref() == Some("Interrupted provider operation; inspect saved evidence and explicitly retry before resuming preparation")
+            || self.failure.as_deref() == Some("AI executor stopped before an outcome was recorded; inspect saved evidence before explicit retry")
+        {
+            self.failure = None;
         }
         for flight in self.flights.values() {
             if let Some(job) = self.jobs.get_mut(&flight.event_id) {
@@ -220,6 +224,14 @@ impl Queue {
             }
         }
         self.flights.clear();
+        for job in self.jobs.values_mut().filter(|job| job.state == State::Interrupted && !job.manual) {
+            if job.retries < 3 {
+                job.retries += 1;
+                job.state = State::Deferred;
+                job.retry_at = Some(Local::now().fixed_offset() + Duration::seconds(60));
+                job.message = "Read-only research interrupted; other meetings can continue".into();
+            }
+        }
         Ok(())
     }
 
@@ -243,10 +255,15 @@ impl Queue {
             .iter()
             .map(|event| (event.id.as_str(), event))
             .collect::<BTreeMap<_, _>>();
+        let flying = self.flights.values().map(|flight| flight.event_id.clone()).collect::<BTreeSet<_>>();
+        self.jobs.retain(|id, job| job.manual || job.state == State::Completed
+            || flying.contains(id) || events.get(id.as_str()).is_some_and(|event| eligible(event, now)));
         for job in self.jobs.values_mut() {
             let event = events.get(job.event_id.as_str());
             if event.is_none_or(|event| !job.manual && !eligible(event, now)) {
-                job.state = State::Cancelled;
+                if job.state != State::Completed {
+                    job.state = State::Cancelled;
+                }
                 job.review = None;
                 job.message =
                     "Meeting removed, cancelled, elapsed or outside preparation horizon".into();
@@ -338,7 +355,7 @@ impl Queue {
             }
             job.verified = verified;
             job.on_demand = event.unconfirmed();
-            if job.state == State::Cancelled {
+            if job.state == State::Cancelled && (job.manual || eligible(event, now)) {
                 job.state = State::Deferred;
             }
             if !verified && matches!(job.state, State::Queued | State::Deferred | State::Running) {

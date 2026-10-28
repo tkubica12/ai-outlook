@@ -19,6 +19,7 @@ fn receive(commands: &mut tokio::sync::mpsc::Receiver<ai::Command>) -> ai::Comma
     let deadline = Instant::now() + Timeout::from_secs(5);
     loop {
         match commands.try_recv() {
+            Ok(ai::Command::Prompts(prompts)) => prompts.validate().unwrap(),
             Ok(command) => return command,
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                 assert!(

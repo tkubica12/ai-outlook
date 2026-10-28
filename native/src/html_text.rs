@@ -1,4 +1,37 @@
 pub fn extract(html: &str) -> String {
+    extract_internal(html, false)
+}
+
+pub fn extract_with_links(html: &str) -> String {
+    extract_internal(html, true)
+}
+
+fn href(attributes: &str) -> Option<&str> {
+    let mut remaining = attributes;
+    while !remaining.trim().is_empty() {
+        remaining = remaining.trim_start();
+        let end = remaining.find(|ch: char| ch.is_whitespace() || ch == '=').unwrap_or(remaining.len());
+        if end == 0 { return None; }
+        let name = &remaining[..end];
+        remaining = remaining[end..].trim_start();
+        let Some(value) = remaining.strip_prefix('=') else { continue; };
+        remaining = value.trim_start();
+        let value = if let Some(quote @ ('"' | '\'')) = remaining.chars().next() {
+            let (value, rest) = remaining[1..].split_once(quote)?;
+            remaining = rest;
+            value
+        } else {
+            let end = remaining.find(char::is_whitespace).unwrap_or(remaining.len());
+            let value = &remaining[..end];
+            remaining = &remaining[end..];
+            value
+        };
+        if name.eq_ignore_ascii_case("href") { return Some(value); }
+    }
+    None
+}
+
+fn extract_internal(html: &str, preserve_links: bool) -> String {
     let lower = html.to_ascii_lowercase();
     let mut result = String::new();
     let mut position = 0;
@@ -32,6 +65,16 @@ pub fn extract(html: &str) -> String {
                 .next()
                 .unwrap_or("")
                 .trim_end_matches('/');
+            if preserve_links && name == "a" && !tag.trim_start().starts_with('/')
+                && let Some(attributes) = rest[1..end].trim_start().get(1..)
+                && let Some(link) = href(attributes) {
+                let link = extract(link);
+                if crate::calendar::safe_url(&link) {
+                    result.push(' ');
+                    result.push_str(&link);
+                    result.push(' ');
+                }
+            }
             position += end + 1;
             if matches!(name, "script" | "style" | "svg" | "head")
                 && !tag.trim_start().starts_with('/')
@@ -126,6 +169,17 @@ pub fn extract(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meeting_chat_preserves_safe_original_material_links_without_scripts() {
+        let html = "<p>Use <a class='material' HREF='https://example.com/deck?a=1&amp;b=2'>the deck</a> and <a href='javascript:alert(1)'>ignore</a></p><script>https://hidden.example</script>";
+        let text = extract_with_links(html);
+        assert!(text.contains("https://example.com/deck?a=1&b=2"));
+        assert!(text.contains("the deck"));
+        assert!(!text.contains("javascript:"));
+        assert!(!text.contains("hidden.example"));
+        assert!(!extract(html).contains("https://"));
+    }
 
     #[test]
     fn standalone_slides_keep_semantic_text_not_bootstrap_or_styling() {

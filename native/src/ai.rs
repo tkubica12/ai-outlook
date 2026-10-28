@@ -55,9 +55,13 @@ struct Sources {
     index: Option<Arc<crate::source_index::Index>>,
     connectors: Option<Arc<crate::connectors::Registry>>,
     telemetry: Option<Arc<crate::telemetry::Service>>,
+    prompts: Arc<crate::prompts::Prompts>,
 }
 
 pub enum Command {
+    Prompts(Box<crate::prompts::Prompts>),
+    Recap(Box<crate::recaps::Request>),
+    RefreshCalendarAvailability,
     CreateEvents {
         record: Box<crate::event_creation::Record>,
         reply: async_mpsc::Sender<crate::event_creation::CreationResult>,
@@ -78,6 +82,9 @@ pub enum Command {
     Connect,
     SignInAi,
     CancelAiLogin,
+    CheckAuto,
+    SignInAuto,
+    CancelAutoLogin,
     ProbeWorkiq,
     ConnectWorkiq(String),
     RestoreWorkiq(String),
@@ -176,6 +183,7 @@ fn flush_connector_revision(
 }
 
 pub enum Notice {
+    Auto(crate::decision::Status),
     Usage(crate::telemetry::Summary),
     Diagnostic(String),
     External {
@@ -245,6 +253,7 @@ pub struct Shutdown {
 
 #[derive(Default)]
 struct Pending {
+    auto: Option<Notice>,
     usage: Option<Notice>,
     diagnostic: Option<Notice>,
     external: BTreeMap<crate::connectors::Kind, Notice>,
@@ -265,6 +274,7 @@ impl Pending {
     fn take(&mut self) -> Option<Notice> {
         self.connection
             .take()
+            .or_else(|| self.auto.take())
             .or_else(|| self.external.pop_first().map(|(_, notice)| notice))
             .or_else(|| self.ai_login.take())
             .or_else(|| self.workiq.take())
@@ -295,6 +305,7 @@ impl Notices {
             .lock()
             .map_err(|_| "AI notifications are unavailable")?;
         match notice {
+            Notice::Auto(_) => pending.auto = Some(notice),
             Notice::Usage(_) => pending.usage = Some(notice),
             Notice::Diagnostic(_) => pending.diagnostic = Some(notice),
             Notice::External { kind, .. } => {
@@ -377,6 +388,16 @@ impl Notices {
 }
 
 enum Completion {
+    Auto {
+        generation: u64,
+        status: crate::decision::Status,
+    },
+    Recap {
+        request: Box<crate::recaps::Request>,
+        result: Result<Option<serde_json::Value>, RequestError>,
+        connector_revision: String,
+        admitted: bool,
+    },
     ChatRecovered {
         account: String,
         result: Result<Vec<crate::chat::Checkpoint>, String>,
@@ -477,6 +498,23 @@ async fn hosted_check<T>(
     }
 }
 
+async fn connect_ai(root: &std::path::Path) -> Result<Arc<Harness>, String> {
+    let config = Config::load(root)?.for_native_app();
+    let harness = Harness::start(root, config).await?;
+    let result = match harness.health().await {
+        Ok(health) if health.authenticated => return Ok(Arc::new(harness)),
+        Ok(health) => format!(
+            "Isolated Copilot identity is not accepted: {}. Run Tomlook's isolated sign-in and set use_stored_login, or configure an explicit TOMLOOK_* credential; personal tokens and gh login are never imported.",
+            health.rejected.unwrap_or_else(|| "not signed in".into())
+        ),
+        Err(error) => error,
+    };
+    match harness.stop().await {
+        Ok(()) => Err(result),
+        Err(stop) => Err(format!("{result}; {stop}")),
+    }
+}
+
 impl Engine {
     pub fn start(root: PathBuf, demo: bool, context: egui::Context) -> Result<Self, String> {
         let (commands, mut input) = async_mpsc::channel(64);
@@ -526,6 +564,8 @@ impl Engine {
             runtime.block_on(async {
                 let mut harness: Option<Arc<Harness>> = None;
                 let mut starting = false;
+                let mut desired_ai = false;
+                let mut ai_retry = crate::retry::Retry::default();
                 let mut probing_workiq = false;
                 let mut hosted_cancel: Option<watch::Sender<bool>> = None;
                 let mut workiq: Option<Arc<crate::workiq::connection::Connection>> = None;
@@ -533,6 +573,7 @@ impl Engine {
                 let mut visible_refresh: Option<crate::workiq::connection::Range> = None;
                 let mut background_refresh: Option<(u64, crate::workiq::connection::Range)> = None;
                 let mut source_config = crate::source_index::Config::default();
+                let mut prompts = Arc::new(crate::prompts::Prompts::default());
                 let mut source_index: Option<Arc<crate::source_index::Index>> = None;
                 let mut source_generation = 0_u64;
                 let mut sources_busy = false;
@@ -541,6 +582,10 @@ impl Engine {
                 let mut photos_queue: Vec<String> = Vec::new();
                 let mut companies_busy = false;
                 let mut ai_login_cancel: Option<watch::Sender<bool>> = None;
+                let mut auto_login_cancel: Option<watch::Sender<bool>> = None;
+                let mut auto_busy = !demo;
+                let mut auto_generation = 0;
+                let (auto_progress, mut auto_updates) = async_mpsc::channel::<(u64, String)>(4);
                 let mut connectors = Arc::new(crate::connectors::Registry::default());
                 let mut connector_cancels = BTreeMap::<crate::connectors::Kind, watch::Sender<bool>>::new();
                 let mut connector_generations = BTreeMap::<crate::connectors::Kind, u64>::new();
@@ -555,6 +600,7 @@ impl Engine {
                 let mut cancellations = BTreeMap::<u64, (watch::Sender<bool>, bool)>::new();
                 let chat_lanes = Arc::new(crate::chat::Lanes::default());
                 let mut chat_accounts=BTreeMap::<u64,String>::new();
+                let mut auto_requests = std::collections::BTreeSet::new();
                 let mut stopping = false;
                 let mut shutdown_requested = false;
                 let mut calendar_mutating = false;
@@ -562,6 +608,9 @@ impl Engine {
                 let mut usage_busy = false;
                 let mut diagnostic_warned = false;
                 if !demo {
+                    notify(Notice::Auto(crate::decision::Status::new(crate::decision::Phase::Checking, "Checking Auto Azure sign-in...")));
+                    let auto_root = root.clone();
+                    tasks.spawn(async move { Completion::Auto { generation: 0, status: crate::decision::check(&auto_root).await } });
                     for kind in [crate::connectors::Kind::Webiq, crate::connectors::Kind::Github] {
                         notify(Notice::External { kind, busy: true, ready: false, message: "Checking saved sign-in...".into(), client_id: None });
                         let (cancel, cancelled) = watch::channel(false);
@@ -592,6 +641,14 @@ impl Engine {
                         notify(Notice::Diagnostic("AI diagnostics or usage could not be saved completely; inspect the application log before relying on totals.".into()));
                     }
                     if !stopping && !demo {
+                        if desired_ai && !starting && harness.is_none() && ai_retry.due(Instant::now()) {
+                            ai_retry.started();
+                            starting = true;
+                            telemetry.record("copilot", "saved_connection_retry_started", None, 0);
+                            notify(Notice::Connection { ready: false, message: "Retrying isolated AI connection...".into() });
+                            let root = root.clone();
+                            tasks.spawn(async move { Completion::Connection(connect_ai(&root).await) });
+                        }
                         for kind in [crate::connectors::Kind::Webiq, crate::connectors::Kind::Github] {
                         let retry_due = connector_retries.get(&kind).is_some_and(|retry| retry.due(Instant::now()));
                         let renewal_due = kind == crate::connectors::Kind::Github
@@ -600,6 +657,7 @@ impl Engine {
                         if (retry_due || renewal_due) && !connector_disabled.contains(&kind)
                             && !connector_cancels.contains_key(&kind) && !connector_forgetting.contains(&kind)
                         {
+                            if let Some(retry) = connector_retries.get_mut(&kind) { retry.started(); }
                             let generation = connector_generations.entry(kind).or_default();
                             *generation += 1;
                             let generation = *generation;
@@ -617,11 +675,18 @@ impl Engine {
                         if workiq.as_ref().is_some_and(|connection| !connection.is_active())
                             && hosted_cancel.is_none() && let Some(connection) = workiq.take() {
                             workiq_connected.store(false, Ordering::Release);
-                            workiq_retry.schedule(Instant::now(), "WorkIQ transport failed");
+                            workiq_generation += 1;
+                            photos_queue.clear();
+                            let delay = if desired_workiq.is_some() {
+                                workiq_retry.schedule(Instant::now(), "WorkIQ transport failed")
+                            } else { None };
+                            notify(Notice::HostedWorkiq { busy: false, ready: false,
+                                message: crate::retry::failure_message("WorkIQ connection interrupted.".into(), delay) });
                             tasks.spawn(async move { Completion::WorkiqClosed { generation: None, result: connection.close().await } });
                         }
                         if hosted_cancel.is_none() && workiq.is_none() && workiq_retry.due(Instant::now())
                             && let Some(account) = desired_workiq.clone() {
+                            workiq_retry.started();
                             workiq_generation += 1;
                             let generation = workiq_generation;
                             let (cancel, cancelled) = watch::channel(false);
@@ -707,6 +772,7 @@ impl Engine {
                     }
                     if *stopped.borrow() { shutdown_requested = true; stopping = true; }
                     if stopping {
+                        if let Some(cancel) = &auto_login_cancel { let _ = cancel.send(true); }
                         if let Some(index) = &source_index { index.stopped.store(true, Ordering::Release); }
                         connected.store(false, Ordering::Release);
                         for (cancel, _) in cancellations.values() { cancel_request(cancel); }
@@ -725,11 +791,23 @@ impl Engine {
                         notify(Notice::Stopped);
                         break;
                     }
+                    let heartbeat = Instant::now() + Duration::from_secs(30);
+                    let retry_deadline = connector_retries.values().filter_map(crate::retry::Retry::deadline)
+                        .chain(workiq_retry.deadline()).chain(ai_retry.deadline()).min()
+                        .unwrap_or(heartbeat).min(heartbeat);
                     tokio::select! {
                         biased;
                         _ = stopped.changed(), if !stopping => { shutdown_requested = true; stopping = true; }
-                        _ = tokio::time::sleep(Duration::from_secs(30)), if !stopping => {}
+                        _ = tokio::time::sleep_until(retry_deadline.into()), if !stopping => {}
                         _ = tokio::time::sleep(Duration::from_millis(50)), if !stopping && wake.is_some() && connector_revision_pending.is_some() => {}
+                        Some((generation, code)) = auto_updates.recv() => {
+                            if generation == auto_generation && !stopping
+                                && auto_login_cancel.as_ref().is_some_and(|cancel| !*cancel.borrow()) {
+                                let mut status = crate::decision::Status::new(crate::decision::Phase::SigningIn, "Enter this code on Microsoft's device sign-in page.");
+                                status.device_code = Some(code);
+                                notify(Notice::Auto(status));
+                            }
+                        }
                         Some((kind, generation, message)) = external_updates.recv() => {
                             if connector_generations.get(&kind) == Some(&generation)
                                 && connector_cancels.get(&kind).is_some_and(|cancel| !*cancel.borrow())
@@ -741,6 +819,84 @@ impl Engine {
                         _ = tokio::time::sleep_until(next_source_refresh), if !stopping && !demo && !sources_busy && source_index.as_ref().is_some_and(|index| index.has_local_sources()) => {}
                         command = input.recv(), if !stopping => {
                             match command {
+                                Some(Command::CheckAuto | Command::SignInAuto) if demo => {
+                                    notify(Notice::Auto(crate::decision::Status::new(crate::decision::Phase::Unconfigured, "Offline demo never opens Azure sign-in.")));
+                                }
+                                Some(Command::CheckAuto) if !auto_busy => {
+                                    auto_busy = true;
+                                    auto_generation += 1;
+                                    let generation = auto_generation;
+                                    let root = root.clone();
+                                    notify(Notice::Auto(crate::decision::Status::new(crate::decision::Phase::Checking, "Checking Auto Azure sign-in...")));
+                                    tasks.spawn(async move { Completion::Auto { generation, status: crate::decision::check(&root).await } });
+                                }
+                                Some(Command::SignInAuto) if !auto_busy => {
+                                    auto_busy = true;
+                                    auto_generation += 1;
+                                    let generation = auto_generation;
+                                    let (cancel, cancelled) = watch::channel(false);
+                                    auto_login_cancel = Some(cancel);
+                                    let root = root.clone();
+                                    let shutdown = stopped.clone();
+                                    let progress = auto_progress.clone();
+                                    let harness = harness.clone();
+                                    notify(Notice::Auto(crate::decision::Status::new(crate::decision::Phase::SigningIn, "Starting Azure device-code sign-in...")));
+                                    tasks.spawn(async move {
+                                        let result = async {
+                                            let router = crate::decision::Router::load(&root).await?;
+                                            router.sign_in(cancelled, shutdown, |code| {
+                                                if let Err(error) = progress.try_send((generation, code)) {
+                                                    eprintln!("Tomlook: Azure sign-in code could not reach the interface: {error}");
+                                                }
+                                            }).await?;
+                                            if let Some(harness) = harness { harness.clear_router_auth().await; }
+                                            Ok::<(), String>(())
+                                        }.await;
+                                        Completion::Auto { generation, status: match result {
+                                            Ok(()) => crate::decision::Status::signed_in(),
+                                            Err(error) => crate::decision::Status::error(error),
+                                        } }
+                                    });
+                                }
+                                Some(Command::CheckAuto | Command::SignInAuto) => {}
+                                Some(Command::CancelAutoLogin) => {
+                                    if let Some(cancel) = &auto_login_cancel { let _ = cancel.send(true); }
+                                }
+                                Some(Command::Prompts(next)) => {
+                                    match next.validate() {
+                                        Ok(()) => prompts = Arc::from(next),
+                                        Err(error) => { notify(Notice::Diagnostic(error)); }
+                                    }
+                                }
+                                Some(Command::RefreshCalendarAvailability) => {
+                                    let ready = !demo && !stopping && workiq.as_ref().is_some_and(|connection| connection.is_active());
+                                    workiq_connected.store(ready, Ordering::Release);
+                                    notify(Notice::HostedWorkiq { busy: hosted_cancel.is_some(), ready,
+                                        message: if ready { "Connected" } else { "Connect WorkIQ before confirming a calendar change" }.into() });
+                                }
+                                Some(Command::Recap(request)) => {
+                                    let id = request.id | (1 << 63);
+                                    let connection = workiq.clone().filter(|connection| !demo && connection.is_active()
+                                        && connection.account == request.account);
+                                    if let (Some(harness), Some(connection)) = (harness.clone().filter(|_| !stopping
+                                        && cancellations.len() < 2 && !cancellations.contains_key(&id)
+                                        && !cancellations.values().any(|(_, background)| *background)), connection) {
+                                        let (cancel, cancelled) = watch::channel(false);
+                                        cancellations.insert(id, (cancel, true));
+                                        let connector_revision = connectors.context_revision();
+                                        let registry = connectors.clone();
+                                        let progress = streaming.clone();
+                                        let telemetry = telemetry.clone();
+                                        tasks.spawn(async move {
+                                            let result = process_recap(harness, &request, connection, registry, telemetry, progress, cancelled).await;
+                                            Completion::Recap { request, result, connector_revision, admitted: true }
+                                        });
+                                    } else {
+                                        tasks.spawn(async move {
+                                            Completion::Recap { request, result: Err("Meeting notes are waiting for available AI and WorkIQ capacity".into()), connector_revision: String::new(), admitted: false }
+                                        });
+                                    }
+                                }
                                 Some(Command::CreateEvents { record, reply, wake }) => {
                                     let connection = workiq.clone().filter(|connection| !demo && !calendar_mutating
                                         && connection.is_active() && connection.account == record.account);
@@ -803,6 +959,7 @@ impl Engine {
                                             crate::workiq::connection::calendar_write::Outcome::Applied(_) |
                                             crate::workiq::connection::calendar_write::Outcome::Removed(_) => "write_readback_verified",
                                             crate::workiq::connection::calendar_write::Outcome::NotSent(_) => "write_not_submitted_or_rejected",
+                                            crate::workiq::connection::calendar_write::Outcome::Stale(_) => "write_not_submitted_meeting_changed",
                                             crate::workiq::connection::calendar_write::Outcome::Review(_) => "write_outcome_requires_review",
                                         }, None, 0);
                                         if let crate::workiq::connection::calendar_write::Outcome::NotSent(message) = &outcome
@@ -920,6 +1077,8 @@ impl Engine {
                                     notify(Notice::AiLogin { busy: ai_login_cancel.is_some(), message: "AI is already connected or connecting.".into() });
                                 }
                                 Some(Command::SignInAi) => {
+                                    desired_ai = true;
+                                    ai_retry.clear();
                                     starting = true;
                                     let (cancel, cancelled) = watch::channel(false);
                                     ai_login_cancel = Some(cancel);
@@ -956,6 +1115,8 @@ impl Engine {
                                     });
                                 }
                                 Some(Command::CancelAiLogin) => {
+                                    desired_ai = false;
+                                    ai_retry.clear();
                                     if let Some(cancel) = &ai_login_cancel { let _ = cancel.send(true); }
                                 }
                                 Some(Command::ConnectWorkiq(_) | Command::RestoreWorkiq(_)) if demo => {
@@ -1082,27 +1243,13 @@ impl Engine {
                                     notify(Notice::Connection { ready: harness.is_some(), message: if starting { "Connecting isolated SDK..." } else { "Isolated SDK is already connected" }.into() });
                                 }
                                 Some(Command::Connect) => {
+                                    desired_ai = true;
+                                    ai_retry.clear();
                                     starting = true;
                                     notify(Notice::Connection { ready: false, message: "Connecting isolated SDK on its own worker...".into() });
                                     let root = root.clone();
                                     tasks.spawn(async move {
-                                        let result = async {
-                                            let config = Config::load(&root)?.for_native_app();
-                                            let harness = Harness::start(&root, config).await?;
-                                            let health = harness.health().await;
-                                            match health {
-                                                Ok(health) if health.authenticated => Ok(Arc::new(harness)),
-                                                Ok(health) => {
-                                                    harness.stop().await?;
-                                                    Err(format!("Isolated Copilot identity is not accepted: {}. Run Tomlook's isolated sign-in and set use_stored_login, or configure an explicit TOMLOOK_* credential; personal tokens and gh login are never imported.", health.rejected.unwrap_or_else(|| "not signed in".into())))
-                                                }
-                                                Err(error) => {
-                                                    let stopped = harness.stop().await;
-                                                    Err(match stopped { Ok(()) => error, Err(stop) => format!("{error}; {stop}") })
-                                                }
-                                            }
-                                        }.await;
-                                        Completion::Connection(result)
+                                        Completion::Connection(connect_ai(&root).await)
                                     });
                                 }
                                 Some(Command::Ask(question)) => {
@@ -1119,9 +1266,10 @@ impl Engine {
                                         let connectors = connectors.clone();
                                         let connector_revision = connectors.context_revision();
                                         let telemetry = telemetry.clone();
+                                        let prompts = prompts.clone();
                                         tasks.spawn(async move {
                                             let id = question.id;
-                                            let result = ask(harness, *question, cancelled, progress, true, Sources { translation: false, workiq: workiq_connection, index, connectors: Some(connectors), telemetry: Some(telemetry) }).await.map_err(RequestError::message);
+                                            let result = ask(harness, *question, cancelled, progress, true, Sources { translation: false, workiq: workiq_connection, index, connectors: Some(connectors), telemetry: Some(telemetry), prompts }).await.map_err(RequestError::message);
                                             Completion::Answer { id, connector_revision, result }
                                         });
                                     } else {
@@ -1155,8 +1303,9 @@ impl Engine {
                                         } else if let Some(harness) = harness.clone() {
                                             let (cancel, cancelled) = watch::channel(false);
                                             cancellations.insert(id, (cancel, false));
+                                            if request.mode == crate::chat::Mode::Auto { auto_requests.insert(id); }
                                             if let Some(account)=request.question.account.clone() { chat_accounts.insert(id,account); }
-                                            let sources = Sources { translation: false, workiq: workiq.clone(), index: source_index.clone(), connectors: Some(connectors.clone()), telemetry: Some(telemetry.clone()) };
+                                            let sources = Sources { translation: false, workiq: workiq.clone(), index: source_index.clone(), connectors: Some(connectors.clone()), telemetry: Some(telemetry.clone()), prompts: prompts.clone() };
                                             let connector_revision = connectors.context_revision();
                                             let root = root.clone();
                                             let output = output.clone();
@@ -1204,6 +1353,7 @@ impl Engine {
                                         let connectors = connectors.clone();
                                         let connector_revision = connectors.context_revision();
                                         let telemetry = telemetry.clone();
+                                        let prompts = prompts.clone();
                                         tasks.spawn(async move {
                                             let result = async {
                                             let question = Question {
@@ -1213,7 +1363,7 @@ impl Engine {
                                                 },
                                                 meeting: Some(request.event.clone()), account: request.account.clone(), public_topic: None, suggest_drafts: false, language: crate::i18n::Language::En,
                                             };
-                                            ask(harness, question, cancelled, progress, false, Sources { translation: request.previous.is_some(), workiq: connection, index, connectors: Some(connectors), telemetry: Some(telemetry) }).await
+                                            ask(harness, question, cancelled, progress, false, Sources { translation: request.previous.is_some(), workiq: connection, index, connectors: Some(connectors), telemetry: Some(telemetry), prompts }).await
                                             }.await;
                                             let quota_day = match &result { Err(RequestError::Quota(day)) => Some(*day), _ => None };
                                             Completion::Prepared { request, connector_revision, result: result.map_err(RequestError::message), quota_day }
@@ -1230,6 +1380,13 @@ impl Engine {
                         }
                         completion = tasks.join_next(), if !tasks.is_empty() => {
                             match completion {
+                                Some(Ok(Completion::Auto { generation, status })) => {
+                                    if generation == auto_generation {
+                                        auto_busy = false;
+                                        auto_login_cancel = None;
+                                        if !stopping { notify(Notice::Auto(status)); }
+                                    }
+                                }
                                 Some(Ok(Completion::CalendarDelivered { admitted, result })) => {
                                     if admitted { calendar_mutating = false; }
                                     if let Err(error) = result {
@@ -1269,14 +1426,16 @@ impl Engine {
                                             }
                                             Err(error) => {
                                                 telemetry.failure(kind.server(), &error, None);
+                                                let mut delay = None;
                                                 if !cancelled && !connector_disabled.contains(&kind) {
-                                                    if let Some(delay) = connector_retries.entry(kind).or_default().schedule(Instant::now(), &error) {
+                                                    delay = connector_retries.entry(kind).or_default().schedule(Instant::now(), &error);
+                                                    if let Some(delay) = delay {
                                                         telemetry.record(kind.server(), "retry_scheduled_seconds", None, delay.as_secs());
                                                     } else {
                                                         connector_disabled.insert(kind);
                                                     }
                                                 }
-                                                notify(Notice::External { kind, busy: false, ready: connectors.records.get(&kind).is_some_and(|saved| saved.available()), message: error, client_id: connectors.records.get(&kind).and_then(|saved| saved.client_id.clone()).or(client_id) });
+                                                notify(Notice::External { kind, busy: false, ready: connectors.records.get(&kind).is_some_and(|saved| saved.available()), message: crate::retry::failure_message(error, delay), client_id: connectors.records.get(&kind).and_then(|saved| saved.client_id.clone()).or(client_id) });
                                             }
                                         }
                                     }
@@ -1311,9 +1470,10 @@ impl Engine {
                                     notify(Notice::Photos(if generation == workiq_generation { result } else { Vec::new() }));
                                 }
                                 Some(Ok(Completion::HostedWorkiq { generation, result })) => {
-                                    if generation == workiq_generation { hosted_cancel = None; }
+                                    let current = generation == workiq_generation;
+                                    let cancelled = current && hosted_cancel.take().is_some_and(|cancel| *cancel.borrow());
                                     match result {
-                                        Ok(connection) if generation == workiq_generation && !stopping => {
+                                        Ok(connection) if current && !stopping && !cancelled && desired_workiq.is_some() => {
                                             workiq_retry.clear();
                                             telemetry.record("workiq", "verified", None, 0);
                                             workiq_connected.store(true, Ordering::Release);
@@ -1327,15 +1487,19 @@ impl Engine {
                                         }
                                         Ok(connection) => {
                                             tasks.spawn(async move { Completion::WorkiqClosed { generation: None, result: connection.close().await } });
-                                            notify(Notice::HostedWorkiq { busy: false, ready: false, message: "WorkIQ connection cancelled; no new reads are admitted.".into() });
+                                            if current && !stopping {
+                                                notify(Notice::HostedWorkiq { busy: false, ready: false, message: "WorkIQ connection cancelled; no new reads are admitted.".into() });
+                                            }
                                         }
                                         Err(error) if generation == workiq_generation => {
                                             telemetry.failure("workiq", &error, None);
-                                            if desired_workiq.is_some() && !stopping
-                                                && let Some(delay) = workiq_retry.schedule(Instant::now(), &error) {
+                                            let delay = if desired_workiq.is_some() && !stopping && !cancelled {
+                                                workiq_retry.schedule(Instant::now(), &error)
+                                            } else { None };
+                                            if let Some(delay) = delay {
                                                 telemetry.record("workiq", "retry_scheduled_seconds", None, delay.as_secs());
                                             }
-                                            notify(Notice::HostedWorkiq { busy: false, ready: false, message: error });
+                                            notify(Notice::HostedWorkiq { busy: false, ready: false, message: crate::retry::failure_message(error, delay) });
                                         }
                                         Err(error) => telemetry.failure("workiq", &error, None),
                                     }
@@ -1364,10 +1528,6 @@ impl Engine {
                                             Err(error) => format!("Calendar refresh failed: {error}. Previous cache preserved."),
                                         } });
                                         workiq_connected.store(connection.is_active(), Ordering::Release);
-                                        if !connection.is_active() && let Some(connection) = workiq.take() {
-                                            workiq_retry.schedule(Instant::now(), "WorkIQ transport failed");
-                                            tasks.spawn(async move { Completion::WorkiqClosed { generation: None, result: connection.close().await } });
-                                        }
                                     } else {
                                         notify(Notice::HostedWorkiq { busy: false, ready: false, message: "WorkIQ refresh cancelled after disconnect; no calendar was published.".into() });
                                     }
@@ -1395,6 +1555,7 @@ impl Engine {
                                     }
                                     match result {
                                         Ok(connected_harness) => {
+                                            ai_retry.clear();
                                             if profile.get().is_some_and(|current| current != &connected_harness.analysis_revision)
                                                 || profile.get().is_none() && profile.set(connected_harness.analysis_revision.clone()).is_err() {
                                                 notify(Notice::Connection { ready: false, message: "Active AI configuration identity cannot be replaced; restart Tomlook".into() });
@@ -1404,11 +1565,47 @@ impl Engine {
                                             if !stopping { connected.store(true, Ordering::Release); }
                                             notify(Notice::Connection { ready: !stopping, message: if stopping { "Stopping..." } else { "Connected" }.into() });
                                         }
-                                        Err(error) => { notify(Notice::Connection { ready: false, message: error }); }
+                                        Err(error) => {
+                                            connected.store(false, Ordering::Release);
+                                            telemetry.failure("copilot", &error, None);
+                                            let delay = if desired_ai && !stopping {
+                                                ai_retry.schedule(Instant::now(), &error)
+                                            } else { None };
+                                            if let Some(delay) = delay {
+                                                telemetry.record("copilot", "retry_scheduled_seconds", None, delay.as_secs());
+                                            }
+                                            notify(Notice::Connection { ready: false, message: crate::retry::failure_message(error, delay) });
+                                        }
                                     }
                                     if let Some(wake) = &wake { let _ = wake.try_send(crate::worker::Command::Wake); }
                                 }
+                                Some(Ok(Completion::Recap { request, result, connector_revision, admitted })) => {
+                                    let quota_day = match &result { Err(RequestError::Quota(day)) => Some(*day), _ => None };
+                                    let result = result.map_err(RequestError::message);
+                                    let result = if admitted { finish_request(request.id | (1 << 63), &mut cancellations,
+                                        &connector_revision, &connectors.context_revision(),
+                                        stopping || workiq.as_ref().is_none_or(|connection| connection.account != request.account || !connection.is_active()), result) } else { result };
+                                    active.store(cancellations.len(), Ordering::Release);
+                                    let outcome = crate::recaps::Outcome { id: request.id, key: request.key.clone(),
+                                        account: request.account.clone(), fingerprint: crate::scheduler::fingerprint(&request.event), quota_day, result };
+                                    if tokio::time::timeout(Duration::from_secs(10), request.reply.send(outcome)).await
+                                        .is_ok_and(|result| result.is_ok()) {
+                                        let _ = request.wake.try_send(crate::worker::Command::Wake);
+                                    } else {
+                                        notify(Notice::Diagnostic("Meeting notes outcome could not reach storage; no result was marked complete".into()));
+                                    }
+                                }
                                 Some(Ok(Completion::Answer { id, connector_revision, result })) => {
+                                    if auto_requests.remove(&id) && !auto_busy && !stopping {
+                                        match &result {
+                                            Ok(_) => { notify(Notice::Auto(crate::decision::Status::signed_in())); }
+                                            Err(error) => {
+                                                if let Some(status) = crate::decision::routing_error(error) {
+                                                    notify(Notice::Auto(status));
+                                                }
+                                            }
+                                        }
+                                    }
                                     if let Some(account)=chat_accounts.remove(&id) {
                                         let journal=crate::chat::Journal::new(&root);
                                         tasks.spawn(async move {
@@ -1420,23 +1617,8 @@ impl Engine {
                                     next_usage = Instant::now();
                                     let result = finish_request(id, &mut cancellations, &connector_revision, &connectors.context_revision(), stopping, result);
                                     active.store(cancellations.len(), Ordering::Release);
-                                    if workiq.as_ref().is_some_and(|connection| !connection.is_active())
-                                        && let Some(connection) = workiq.take() {
-                                            workiq_retry.schedule(Instant::now(), "WorkIQ transport failed");
-                                        workiq_connected.store(false, Ordering::Release);
-                                        workiq_generation += 1;
-                                        photos_queue.clear();
-                                        notify(Notice::HostedWorkiq { busy: hosted_cancel.is_some(), ready: false, message: "WorkIQ disconnected; sign in again".into() });
-                                        tasks.spawn(async move { Completion::WorkiqClosed { generation: None, result: connection.close().await } });
-                                    }
                                     if let Some(wake) = &wake { let _ = wake.try_send(crate::worker::Command::Wake); }
                                     notify(Notice::Answer { id, result });
-                                    if workiq.as_ref().is_some_and(|connection| !connection.is_active())
-                                        && let Some(connection) = workiq.take() {
-                                            notify(Notice::HostedWorkiq { busy: hosted_cancel.is_some(), ready: false, message: "WorkIQ connection expired or failed during the answer; sign in again.".into() });
-                                            workiq_connected.store(false, Ordering::Release);
-                                            tasks.spawn(async move { Completion::WorkiqClosed { generation: None, result: connection.close().await } });
-                                        }
                                 }
                                 Some(Ok(Completion::ChatRecovered { account, result })) => {
                                     notify(Notice::ChatRecovered { account, result });
@@ -1456,10 +1638,6 @@ impl Engine {
                                         stopping = true;
                                     }
                                     let _ = request.wake.try_send(crate::worker::Command::Wake);
-                                    if workiq.as_ref().is_some_and(|connection| !connection.is_active()) {
-                                        workiq_connected.store(false, Ordering::Release);
-                                        notify(Notice::HostedWorkiq { busy: false, ready: false, message: "WorkIQ disconnected; sign in again".into() });
-                                    }
                                 }
                                 Some(Err(error)) => {
                                     telemetry.failure("executor", &format!("AI worker failed: {error}"), None);
@@ -1523,14 +1701,14 @@ fn cancel_request(cancel: &watch::Sender<bool>) {
     cancel.send_replace(true);
 }
 
-fn finish_request(
+fn finish_request<T>(
     id: u64,
     cancellations: &mut BTreeMap<u64, (watch::Sender<bool>, bool)>,
     captured_revision: &str,
     current_revision: &str,
     stopping: bool,
-    result: Result<Answer, String>,
-) -> Result<Answer, String> {
+    result: Result<T, String>,
+) -> Result<T, String> {
     let cancellation = cancellations.remove(&id);
     let reason = if stopping {
         Some("AI is stopping; the previous result was discarded")
@@ -1983,8 +2161,26 @@ async fn ask_chat(
             "indexed_materials_configured":sources.index.as_ref().is_some_and(|index| index.has_local_sources()),
             "cloud_materials_configured":sources.index.as_ref().is_some_and(|index| !index.cloud_folder().is_empty())})
     );
+    if redactor.contains(sources.prompts.text(crate::prompts::Kind::Quick))
+        || redactor.contains(sources.prompts.text(crate::prompts::Kind::Thorough))
+        || redactor.contains(&sources.prompts.context)
+    {
+        return Err("Prompt preferences contain an app credential; nothing was submitted".into());
+    }
+    prompt.push_str(&format!(
+        "\nUSER_STYLE_PREFERENCES: {}\nRESEARCH_PREFERENCES: {}",
+        sources.prompts.text(if mode == Mode::Fast {
+            crate::prompts::Kind::Quick
+        } else {
+            crate::prompts::Kind::Thorough
+        }),
+        sources.prompts.context
+    ));
     if let Some(saved) = &resumed {
         prompt.push_str(&format!("\nExplicit continuation of interrupted research. These saved findings are historical, not a resumed provider call; recheck freshness as needed. Continue the original task without blindly repeating completed reads. Untrusted checkpoint: {}",serde_json::json!({"partial_answer":saved.answer,"evidence":saved.evidence})));
+    }
+    if prompt.len() > 64_000 {
+        return Err("Chat input and prompt preferences exceed the bounded input limit; nothing was submitted".into());
     }
     let options = crate::copilot::ChatSession {
         mode,
@@ -2181,6 +2377,95 @@ async fn collect_chat(
     }
 }
 
+async fn process_recap(
+    harness: Arc<Harness>,
+    request: &crate::recaps::Request,
+    connection: Arc<crate::workiq::connection::Connection>,
+    connectors: Arc<crate::connectors::Registry>,
+    telemetry: Arc<crate::telemetry::Service>,
+    progress: Arc<Mutex<Progress>>,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<Option<serde_json::Value>, RequestError> {
+    let materials = tokio::select! {
+        biased;
+        _ = cancel.changed() => return Err("Meeting notes cancelled before source retrieval completed".into()),
+        result = tokio::time::timeout(Duration::from_secs(300), connection.recap_materials(&request.event)) =>
+            result.map_err(|_| "Meeting transcript and chat discovery timed out")??,
+    };
+    let Some(materials) = materials else {
+        return Ok(None);
+    };
+    let text = format!(
+        "ORIGINAL TRANSCRIPTS:\n{}\nORIGINAL MEETING CHAT:\n{}",
+        materials.transcript, materials.chat
+    );
+    let parts = crate::recaps::chunks(&text).collect::<Vec<_>>();
+    if parts.len() > 63 {
+        return Err("Meeting exceeds its complete-scan chunk limit".into());
+    }
+    let mut previous = None;
+    for (index, chunk) in parts.iter().enumerate() {
+        if *cancel.borrow() {
+            return Err("Meeting notes cancelled; no incomplete notes were published".into());
+        }
+        let prompt = crate::recaps::prompt(
+            request,
+            &connection.identity,
+            chunk,
+            previous.as_ref(),
+            &materials.gaps,
+            index + 1 == parts.len(),
+        )?;
+        let mut event = request.event.clone();
+        event.extra.insert("tomlook_recap".into(), true.into());
+        let answer = ask(
+            harness.clone(),
+            Question {
+                id: (request.id + index as u64) | (1 << 63),
+                question: prompt,
+                meeting: Some(event),
+                account: Some(request.account.clone()),
+                public_topic: None,
+                suggest_drafts: false,
+                language: crate::i18n::Language::En,
+            },
+            cancel.clone(),
+            progress.clone(),
+            false,
+            Sources {
+                translation: true,
+                workiq: Some(connection.clone()),
+                index: None,
+                connectors: Some(connectors.clone()),
+                telemetry: Some(telemetry.clone()),
+                prompts: Arc::new(request.prompts.clone()),
+            },
+        )
+        .await?;
+        if answer.text.len() > 22_000 {
+            return Err("Meeting notes exceed their complete-scan output limit".into());
+        }
+        let value = crate::worker::validate_prepared(&answer.text, &request.key)?;
+        previous = Some(crate::recaps::merge(previous, value)?);
+    }
+    let mut payload = previous.ok_or("Meeting transcript contained no usable source text")?;
+    payload["sources"] = materials.sources.into();
+    payload["tomlook_recap"] = true.into();
+    payload["completed_at"] = chrono::Utc::now().to_rfc3339().into();
+    payload["evidence_status"] = "AI notes from the original transcript and available meeting chat; verify assignments against sources".into();
+    for gap in materials.gaps {
+        payload["gaps"]
+            .as_array_mut()
+            .ok_or("Meeting notes gaps are invalid")?
+            .push(gap.clone().into());
+        payload["cs"]["gaps"]
+            .as_array_mut()
+            .ok_or("Czech meeting notes gaps are invalid")?
+            .push(gap.into());
+    }
+    Ok(Some(payload))
+}
+
 async fn ask(
     harness: Arc<Harness>,
     question: Question,
@@ -2195,6 +2480,7 @@ async fn ask(
         index,
         connectors,
         telemetry,
+        prompts,
     } = sources;
     check_meeting_account(
         &question,
@@ -2215,6 +2501,22 @@ async fn ask(
     } else {
         question_prompt(&question, &redactor)?
     };
+    if !translation {
+        let guidance = prompts.text(if question.question == PREPARATION_PROMPT {
+            crate::prompts::Kind::Preparation
+        } else {
+            crate::prompts::Kind::Quick
+        });
+        if redactor.contains(guidance) || redactor.contains(&prompts.context) {
+            return Err(
+                "Prompt preferences contain an app credential; nothing was submitted".into(),
+            );
+        }
+        prompt.push_str(&format!(
+            "\nUSER_PREFERENCES: {guidance}\nRESEARCH_PREFERENCES: {}",
+            prompts.context
+        ));
+    }
     if *cancel.borrow() {
         return Err("Cancelled before SDK session creation; no question was sent".into());
     }
@@ -2260,7 +2562,11 @@ async fn ask(
     let (session, recorder, prefetched) = if translation {
         let (session, recorder) = tokio::select! {
             _ = cancel.changed() => return Err("Cancelled before translation was sent".into()),
-            result = tokio::time::timeout(Duration::from_secs(30), harness.translation_session()) =>
+            result = tokio::time::timeout(Duration::from_secs(30), async {
+                if question.meeting.as_ref().is_some_and(|event| event.extra.get("tomlook_recap") == Some(&serde_json::Value::Bool(true))) {
+                    harness.notes_session().await
+                } else { harness.translation_session().await }
+            }) =>
                 result.map_err(|_| "Creating translation session timed out".to_owned())??,
         };
         (
@@ -2546,6 +2852,7 @@ mod live_source_tests {
                         index: Some(index.clone()),
                         connectors: None,
                         telemetry: None,
+                        prompts: Arc::new(crate::prompts::Prompts::default()),
                     },
                 )
                 .await
@@ -2883,7 +3190,7 @@ mod prompt_tests {
         for cancelled in [false, true] {
             let (cancel, _receiver) = watch::channel(cancelled);
             let mut cancellations = BTreeMap::from([(8, (cancel, true))]);
-            let error = finish_request(
+            let error = finish_request::<Answer>(
                 8,
                 &mut cancellations,
                 "",

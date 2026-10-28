@@ -122,15 +122,27 @@ Previous/next and Alt+Left/Right advance by the custom range's length; preset
 views clear it. A new timeline opens at 08:00 while earlier meetings remain
 available by scrolling. Manual scrolling is preserved within the same period.
 
+The mini-calendar month/year has independent previous/next arrows, without
+changing the main Day/Week/Month view until a date or week is selected.
 Preset selection highlights every displayed day in the mini-calendar (only the
 actual month in Month view). The chevron before each row selects Monday-Friday
 with one click; its full-height hitbox and the sidebar width leave room for
 every date beside the scrollbar. Its accessible name identifies the week. Category markers are
 filled small squares. Unconfirmed responses have no category stripe, location
-or summary: only muted time, response and truncated title. The direct
+or summary: muted time, response and truncated title on a subtle neutral hatch
+(dark gray in dark mode, near-white in light mode). The direct
 **Hide unconfirmed** filter also removes their overlap lanes and keyboard targets.
 Graph `isOrganizer` keeps owned appointments normal. Follow is used only when
-explicitly supplied; `showAs=free` and meeting title prefixes do not establish it.
+explicitly supplied or marked with the reserved `Follow` category;
+`showAs=free` and meeting title prefixes do not establish it.
+
+The header gear opens appearance and editable AI guidance for preparation,
+post-meeting notes, quick answers, thorough research and workplace research.
+Each prompt has a default and a restore action; saving validates bounded UTF-8
+text. Safety contracts, read-only tools and calendar approvals are immutable.
+Prompt guidance changes rebind future preparation, not completed meeting notes.
+Ask and Commands have vector icons with accessible names and tooltips.
+The sidebar no longer duplicates keyboard help or exposes a cache-reload button.
 
 ## Language and structured Insights
 
@@ -184,18 +196,76 @@ prove a particular tenant has granted those capabilities.
 
 Right-click a meeting or press **Shift+F10** on the selected meeting to open
 the same native actions. The detail pane also has a **Meeting actions** button.
-Category changes replace all previous categories with one existing category;
-clearing removes them all. Selecting or clearing a category submits that exact
+Category changes replace previous ordinary categories with one existing category;
+clearing removes ordinary categories. Both preserve the reserved Follow marker.
+Selecting or clearing a category submits that exact
 change immediately, without a confirmation dialog or opening Messages.
 The current single category is marked and cannot be selected again.
 Attendees can accept, tentatively accept or decline,
-with an optional comment and an explicit send-response choice. Organizers cancel
+with an optional comment and an explicit send-response choice. Decline defaults
+to no organizer response; accept and tentative keep their response enabled.
+Organizers cancel
 meetings with attendees (notifying everyone); deletion is offered only for owned
 appointments without attendees. Invitation responses, cancellation and deletion
 use one compact confirmation: meeting, date/time, single-occurrence scope when
 relevant, and optional comment/send-response controls or cancellation notification.
 Confirming closes it without opening another window. Escape, closing the dialog
 and merely opening the menu never submit a change.
+
+Selecting **Follow** submits the single-occurrence change without a confirmation
+dialog: one `update_entity`
+patch preserves ordinary categories, adds `Follow`, and sets `showAs=free`.
+The original invitation response stays unchanged; no response or notification
+is sent to the organizer. This is not Graph support for Outlook's native Follow
+response. **Stop following** removes only the marker and does not restore an
+assumed busy state. Follow is excluded from automatic pre-meeting preparation.
+The right-click action is labeled **Follow** in English and **Sledovat** in Czech. It remains
+visible when disabled, with the specific role, metadata or connection reason
+on hover; meetings you organize are not eligible invitations.
+If the live meeting differs from a recommendation, no write is sent. The old
+recommendation expires, its current meeting is cached, and normal preparation
+can evaluate it again. Legacy not-sent records with this exact failure expire
+on startup and force a calendar refresh; uncertain writes still require review.
+
+### Post-meeting notes
+
+The storage worker owns the `meeting-recaps-v1` ledger: account/occurrence
+identity, next check, explicit error/coverage state, and final bilingual payload.
+Success and its permanent processed marker are one atomic settings update.
+The seven-day eligibility window uses the event end, excludes cancelled meetings,
+and includes only accepted/owned or explicitly followed online meetings.
+Missing transcripts are checked every 30 minutes without a model call; provider
+errors back off. Completed records are not polled again. Event-ID fallback
+survives later iCalUId enrichment, while distinct recurring occurrences retain
+distinct identities. The ledger is separate from historical preparation.
+
+Original Graph transcripts are resolved through the exact meeting join URL and
+bound to the occurrence by transcript end timestamps (within the scheduled event,
+allowing a 30-minute overrun). Delayed transcript creation is permitted inside the
+seven-day window. Meeting chat is restricted to 15 minutes before the start
+through at most one day after the end; reused recurring chat cannot import other
+weeks. Pagination, encoded resource paths and original links are checked
+natively, not exposed as expanded model tool authority. Transcript access,
+meeting lookup and chat all remain subject to WorkIQ and tenant consent;
+`OnlineMeetingTranscript.Read.All` alone does not grant unrelated chat access.
+Tenant policy may deny transcription artifacts even when calendars work.
+
+The AI notes session has no tools or MCP servers. Verified profile display name
+and email identify the user; no developer/user name is hardcoded. UTF-8 source
+chunks are scanned completely and bilingual evidence arrays are merged by the
+application, preserving earlier mentions/tasks/materials rather than repeatedly
+summarizing them away. Each chunk has a distinct durable accounting ID.
+Sources are limited to 512,000 bytes each for transcript/chat and 8 pages per
+list. Oversized transcripts are rejected instead of silently truncated; chat
+limitations are displayed. Notes emphasize my tasks, mentions of me, technical
+takeaways/materials and decisions, and do not generate calendar writes.
+
+Upcoming preparation and recap discovery share one alternating background lane,
+leaving foreground questions available. Pausing automatic Insights pauses both;
+manual Check transcript remains available inside the window. Restart recovers
+interrupted reads without treating a partial result as complete. Known interrupted
+preparation failures no longer block unrelated meetings or fill the automatic
+activity list with unaccepted invitations.
 
 Only a verified single event, occurrence or exception is writable; series
 masters and old cache entries without event type remain read-only until refreshed.
@@ -244,7 +314,9 @@ ownership is labeled as such. No outreach is submitted.
 `src\i18n.rs` owns English keys, natural Czech labels and argument-preserving
 message templates. New UI literals must enter that catalog; coverage, uniqueness,
 dates, templates and persisted preferences have regression checks.
-EN/CZ is a direct header control, not a settings dialog. Calendar view changes
+Language is selected under **Settings > Display**, together with theme and
+accent. The larger resizable settings window has left-hand Display / AI prompts
+navigation and keeps unsaved prompt edits when switching sections. Calendar view changes
 and language switching never submit research. Switching language preserves the
 current question and answer, including a running request. Future questions use
 the selected language.
@@ -883,7 +955,7 @@ opens saved detail only; inspecting a failure does not retry or submit AI.
 Activity ordering and filter indexes are built by the storage worker and reused
 when the queue is unchanged. Calendar identity lookup is built with the calendar
 snapshot; painting the activity panel does not scan or sort either full corpus.
-The redundant Settings button is gone. Appearance remains in the header;
+The header gear opens Settings for language, appearance and editable AI prompts;
 pause, automatic Insights and collapsed source controls live in Insights activity.
 
 People appear as company groups with two-letter initials and full name/email/
@@ -1003,13 +1075,23 @@ The native credential adapter retains compatibility with previously saved
 personal tokens; the simplified dialog uses GitHub App Device flow only.
 
 Startup quietly revalidates saved connections without opening a browser.
+WorkIQ, WebIQ and GitHub retry recoverable network, throttling and expired-session
+failures after 30, 60, 120, 240 and 480 seconds, then at most once every 15 minutes.
+The connection status shows the next retry delay. Successful verification resets
+the delay; cancelling or disconnecting/forgetting stops automatic recovery.
+Retries use only the saved login and never start a fresh interactive sign-in.
+Rejected or missing credentials, consent/permission failures, untrusted
+certificates and deterministic protocol/configuration errors require user action.
+Transient initial isolated AI connection failures use the same backoff without
+automatically starting AI sign-in. Connection recovery never replays calendar
+writes or failed questions.
 GitHub device-flow credentials retain both access and refresh tokens in the
 DPAPI vault. The async executor renews them about five minutes before access
 expiry, and on restoration after expiry. Device flow needs no client secret
 for renewal. Rotation commits the encrypted replacement pair before cancellable
 MCP verification, so a verification failure does not lose the new refresh token.
-Transient renewal failures retain saved credentials and retry no sooner than
-five minutes later. Revocation or refresh-token expiry still requires sign-in.
+Transient renewal failures retain saved credentials and use the same retry
+backoff. Revocation or refresh-token expiry still requires sign-in.
 Old vault records remain readable but did not retain refresh tokens: their owner
 must sign in once with this version to enable renewal.
 Personal-token expiry/revocation is enforced by GitHub and detected on saved-login
@@ -1151,7 +1233,23 @@ Only credential-free HTTPS Azure Foundry resource endpoints are accepted;
 redirects are disabled. No API key or bearer token is stored in this file.
 The router lazily obtains a Cognitive Services Entra token from the explicitly
 configured existing Azure CLI sign-in and retains it in memory until renewal.
-It never signs in, creates a deployment or changes grants on the user's behalf.
+The status bar and AI connection dialog show Copilot and Auto authentication
+separately. Auto checks its saved Azure CLI login at startup and when its
+connection dialog opens. A verified Azure login does not assert deployment
+access: that is checked by the actual routing request, whose failure updates
+Auto status without marking Copilot disconnected.
+
+**Sign in to Azure (device code)** is an explicit action in that dialog.
+It runs the configured CLI with `login --tenant ... --use-device-code`, shows
+only the short user code and a fixed Microsoft sign-in link, and supports cancel,
+expiry and retry. The browser does not open automatically. Broker login and
+the subscription selector are disabled for that process only; no persistent
+CLI configuration is changed. The CLI's existing user profile/cache is used,
+so signing in can change its default account. Tomlook does not run
+`az account set`; subsequent token reads always specify and verify the configured
+tenant and subscription. A completed login never resubmits the failed question.
+Quick and Thorough remain usable without this additional Azure sign-in.
+Tomlook never creates a deployment or changes grants on the user's behalf.
 On Windows MSI installations it runs the CLI's bundled isolated Python module
 directly, avoiding an intermediate shell or orphaned CLI child on cancellation.
 Token acquisition and inference each have an eight-second bound; requests are

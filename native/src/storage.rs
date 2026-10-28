@@ -26,6 +26,7 @@ pub struct Preferences {
     pub context_folders: Vec<PathBuf>,
     pub repository_collections: Vec<PathBuf>,
     pub cloud_context_folder: String,
+    pub prompts: crate::prompts::Prompts,
 }
 
 impl Default for Preferences {
@@ -44,6 +45,7 @@ impl Default for Preferences {
             context_folders: Vec::new(),
             repository_collections: Vec::new(),
             cloud_context_folder: String::new(),
+            prompts: crate::prompts::Prompts::default(),
         }
     }
 }
@@ -64,6 +66,31 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn recaps(&self) -> Result<crate::recaps::Ledger> {
+        let raw: Option<String> = self.connection.query_row(
+            "SELECT payload FROM settings WHERE key='meeting-recaps-v1'", [], |row| row.get(0))
+            .optional().map_err(|_| "Read meeting recap ledger failed")?;
+        let mut ledger: crate::recaps::Ledger = match raw {
+            Some(raw) if raw.len() <= 32 * 1024 * 1024 => serde_json::from_str(&raw)
+                .map_err(|_| "Saved meeting recap ledger is invalid")?,
+            Some(_) => return Err("Meeting recap ledger exceeds its safety limit".into()),
+            None => Default::default(),
+        };
+        ledger.recover(chrono::Local::now().fixed_offset())?;
+        Ok(ledger)
+    }
+
+    pub fn save_recaps(&self, ledger: &crate::recaps::Ledger) -> Result<()> {
+        let raw = serde_json::to_string(ledger).map_err(|_| "Encode meeting recap ledger failed")?;
+        if raw.len() > 32 * 1024 * 1024 || ledger.records.len() > 10_000 {
+            return Err("Meeting recap ledger exceeds its safety limit; saved notes were not discarded".into());
+        }
+        self.connection.execute(
+            "INSERT INTO settings VALUES('meeting-recaps-v1',?1) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+            [raw]).map_err(|_| "Save meeting recap ledger failed")?;
+        Ok(())
+    }
+
     pub fn event_creations(&self) -> Result<std::collections::BTreeMap<String, crate::event_creation::Record>> {
         let mut query = self.connection.prepare(
             "SELECT payload FROM settings WHERE key LIKE 'event-creation-%' ORDER BY rowid DESC LIMIT 513"
@@ -476,6 +503,7 @@ impl Store {
     }
 
     pub fn save_preferences(&self, preferences: &Preferences) -> Result<()> {
+        preferences.prompts.validate()?;
         let json = serde_json::to_string(preferences).map_err(|e| e.to_string())?;
         self.connection
             .execute(

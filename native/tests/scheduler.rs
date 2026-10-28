@@ -81,7 +81,7 @@ fn connector_identity_changes_rebind_worker_jobs_and_empty_identity_restores_bas
     let owner: Option<String> = None;
     let base = format!(
         "{:x}",
-        Sha256::digest(serde_json::to_vec(&(&profile, &owner, preferences.sources())).unwrap())
+        Sha256::digest(serde_json::to_vec(&(&profile, &owner, preferences.sources(), &preferences.prompts.preparation, &preferences.prompts.context)).unwrap())
     );
     let first = wait_for(&base);
     let connector = "b".repeat(64);
@@ -92,7 +92,7 @@ fn connector_identity_changes_rebind_worker_jobs_and_empty_identity_restores_bas
     let changed = format!(
         "{:x}",
         Sha256::digest(
-            serde_json::to_vec(&(&profile, &owner, preferences.sources(), &connector)).unwrap()
+            serde_json::to_vec(&(&profile, &owner, preferences.sources(), &connector, &preferences.prompts.preparation, &preferences.prompts.context)).unwrap()
         )
     );
     let second = wait_for(&changed);
@@ -489,7 +489,8 @@ fn manual_insights_can_queue_offline_and_survive_restart_while_automatic_work_is
 }
 
 fn clock() -> DateTime<chrono::FixedOffset> {
-    DateTime::parse_from_rfc3339("2026-10-08T10:00:00Z").unwrap()
+    static CLOCK: std::sync::OnceLock<DateTime<chrono::FixedOffset>> = std::sync::OnceLock::new();
+    *CLOCK.get_or_init(|| Local::now().fixed_offset() + Duration::hours(1))
 }
 fn fixture(count: usize) -> Calendar {
     let now = clock();
@@ -498,7 +499,7 @@ fn fixture(count: usize) -> Calendar {
         event.id = format!("fixture-{index}");
         event.start = now + Duration::minutes(index as i64 + 1);
         event.end = event.start + Duration::minutes(30);
-        event.status = "confirmed".into();
+        event.status = "accepted".into();
         event.is_all_day = false;
     }
     let coverage = events
@@ -506,6 +507,27 @@ fn fixture(count: usize) -> Calendar {
         .map(|event| event.start.with_timezone(&Local).date_naive())
         .collect();
     Calendar::build(events, coverage, Vec::new()).unwrap()
+}
+
+#[test]
+fn automatic_queue_contains_only_accepted_or_owned_meetings_and_recovers_independent_reads() {
+    let mut calendar = fixture(8);
+    let mut queue = Queue::default();
+    queue.reconcile(&calendar, clock());
+    let (id, _) = queue.dispatch().unwrap();
+    queue.failure = Some("Interrupted provider operation; inspect saved evidence and explicitly retry before resuming preparation".into());
+    queue.recover().unwrap();
+    assert!(queue.failure.is_none());
+    assert_eq!(queue.jobs["fixture-0"].retries, 1);
+    assert!(queue.flights.is_empty());
+    for (event, status) in calendar.events.iter_mut().skip(1).zip([
+        "tentativelyAccepted", "notResponded", "declined", "none", "confirmed", "organizer", "accepted",
+    ]) { event.status = status.into(); }
+    calendar.events[7].extra.insert("categories".into(), serde_json::json!(["Follow"]));
+    queue.reconcile(&calendar, clock());
+    assert_eq!(queue.jobs.keys().map(String::as_str).collect::<Vec<_>>(), ["fixture-0", "fixture-6"]);
+    assert!(queue.current(id).is_none());
+    assert!(queue.dispatch().is_some(), "An interrupted read must not stop other accepted meetings");
 }
 
 #[test]
@@ -799,7 +821,7 @@ fn configuration_revisions_invalidate_completion_and_flights_without_replaying_u
     interrupted.recover().unwrap();
     interrupted.set_analysis_revision(&"b".repeat(64)).unwrap();
     interrupted.reconcile(&calendar, clock());
-    assert_eq!(interrupted.jobs["fixture-2"].state, State::Interrupted);
+    assert_eq!(interrupted.jobs["fixture-2"].state, State::Queued);
     assert!(interrupted.failure.is_some());
     let previous = queue.jobs["fixture-0"].fingerprint.clone();
     assert!(queue.set_analysis_revision(&"a".repeat(64)).unwrap());
@@ -836,12 +858,13 @@ fn configuration_revisions_invalidate_completion_and_flights_without_replaying_u
 }
 
 #[test]
-fn restart_requires_explicit_retry_and_saved_completion_is_atomic() {
+fn manual_restart_requires_explicit_retry_and_saved_completion_is_atomic() {
     let root = tempfile::tempdir().unwrap();
     let mut store = Store::open(root.path()).unwrap();
     let calendar = fixture(1);
     let mut queue = Queue::default();
     queue.reconcile(&calendar, clock());
+    queue.request_now(&calendar.events[0], true).unwrap();
     let (_, flight) = queue.dispatch().unwrap();
     store.save_queue(&queue).unwrap();
     let mut recovered = store.queue().unwrap();
@@ -989,6 +1012,7 @@ fn worker_persists_expected_manual_cancellation_without_global_failure_or_result
                 ai::Command::AttachWake(_)
                 | ai::Command::DailyAiLimit(_)
                 | ai::Command::ContextSources(_)
+                | ai::Command::Prompts(_)
                 | ai::Command::SyncWorkiq { .. },
             ) => {}
             _ => panic!("Manual request not admitted"),
@@ -1095,6 +1119,7 @@ fn storage_waits_for_configuration_and_finishes_without_completion_notice_drain(
         commands.blocking_recv(),
         Some(ai::Command::ContextSources(_))
     ));
+    assert!(matches!(commands.blocking_recv(), Some(ai::Command::Prompts(_))));
     worker
         .commands
         .send(Command::Detail {
@@ -1448,6 +1473,7 @@ fn hidden_notice_backpressure_and_exit_do_not_lose_a_ready_completion() {
         commands.blocking_recv(),
         Some(ai::Command::ContextSources(_))
     ));
+    assert!(matches!(commands.blocking_recv(), Some(ai::Command::Prompts(_))));
     let request = loop {
         match commands.blocking_recv() {
             Some(ai::Command::SyncWorkiq { .. }) => {}
@@ -1550,6 +1576,7 @@ fn saturated_worker_waits_for_cancellation_and_persists_only_the_current_manual_
                     ai::Command::AttachWake(_)
                     | ai::Command::DailyAiLimit(_)
                     | ai::Command::ContextSources(_)
+                    | ai::Command::Prompts(_)
                     | ai::Command::SyncWorkiq { .. },
                 ) => {}
                 Ok(command) => break command,

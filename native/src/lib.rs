@@ -20,6 +20,8 @@ pub mod i18n;
 pub mod instance;
 pub mod markdown;
 pub mod proposals;
+pub mod prompts;
+pub mod recaps;
 pub mod recommendations;
 pub mod retry;
 pub mod scheduler;

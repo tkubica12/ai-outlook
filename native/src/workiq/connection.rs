@@ -20,10 +20,12 @@ use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 pub mod calendar_write;
 #[path = "cloud.rs"]
 pub mod cloud;
+#[path = "meeting_notes.rs"]
+mod meeting_notes;
 
 pub const SDK_TOOL: &str = "tomlook_workiq_fetch";
 pub const CONTEXT_TOOL: &str = "tomlook_workiq_context";
-const EVENT_FIELDS: &str = "id,subject,start,end,categories,attendees,organizer,location,responseStatus,showAs,isAllDay,isOrganizer,webLink,isCancelled,type,sensitivity,isOnlineMeeting,onlineMeetingProvider,onlineMeeting";
+const EVENT_FIELDS: &str = "id,iCalUId,subject,start,end,categories,attendees,organizer,location,responseStatus,showAs,isAllDay,isOrganizer,webLink,isCancelled,type,sensitivity,isOnlineMeeting,onlineMeetingProvider,onlineMeeting";
 pub(crate) const CONTEXT_TIMEOUT: &str = "WorkIQ context read timed out";
 pub(super) const READ_TOO_LARGE: &str =
     "WorkIQ read exceeded its 1 MiB data limit; narrow the query";
@@ -91,10 +93,15 @@ impl Range {
 pub struct Identity {
     pub account: String,
     pub mail: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 impl Identity {
     pub fn validate(&self) -> Result<(), String> {
+        if self.display_name.as_ref().is_some_and(|name| name.len() > 1000 || name.chars().any(char::is_control)) {
+            return Err("WorkIQ identity contains an invalid display name".into());
+        }
         if crate::calendar::person_email(&self.account).as_ref() != Some(&self.account)
             || self
                 .mail
@@ -209,7 +216,7 @@ impl Connection {
                 return Err("WorkIQ has no supported read-only fetch tool".into());
             }
             let identity = peer
-                .call_tool(fetch_request("/me?$select=userPrincipalName,mail")?)
+                .call_tool(fetch_request("/me?$select=userPrincipalName,mail,displayName")?)
                 .await
                 .map_err(|_| "WorkIQ account verification failed; provider details withheld")?;
             hosted::verify_account(&identity, account)?;
@@ -225,6 +232,7 @@ impl Connection {
             let identity = Identity {
                 account: account.to_ascii_lowercase(),
                 mail,
+                display_name: data.get("displayName").and_then(Value::as_str).map(str::to_owned),
             };
             identity.validate()?;
             Ok((
@@ -730,6 +738,8 @@ struct Address {
 struct Person {
     #[serde(rename = "emailAddress", default)]
     email_address: Address,
+    #[serde(rename = "type", default)]
+    kind: String,
 }
 #[derive(Default, Deserialize)]
 struct Location {
@@ -788,7 +798,7 @@ fn graph_time(value: GraphTime) -> Result<DateTime<FixedOffset>, String> {
 fn parse_event(value: Value) -> Result<Event, String> {
     let creation_metadata = [
         "sensitivity", "isOnlineMeeting", "onlineMeetingProvider", "onlineMeeting",
-        "transactionId", "body",
+        "transactionId", "body", "iCalUId",
     ].into_iter().filter_map(|key| value.get(key).map(|value| (key.to_owned(), value.clone())))
         .collect::<BTreeMap<_, _>>();
     let event: GraphEvent =
@@ -802,6 +812,7 @@ fn parse_event(value: Value) -> Result<Event, String> {
             .any(|category| category.len() > 1000)
         || event.attendees.iter().any(|person| {
             person.email_address.name.len() > 1000 || person.email_address.address.len() > 1000
+                || !matches!(person.kind.as_str(), "" | "required" | "optional" | "resource")
         })
         || event.organizer.email_address.name.len() > 1000
         || event.organizer.email_address.address.len() > 1000
@@ -832,6 +843,13 @@ fn parse_event(value: Value) -> Result<Event, String> {
         ("showAs".into(), json!(event.show_as)),
         ("categories".into(), json!(event.categories)),
     ]);
+    let roles = event.attendees.iter().take(500).filter(|person| !person.kind.is_empty()).filter_map(|person| {
+        crate::calendar::person_email(&person.email_address.address)
+            .map(|email| (email, person.kind.clone()))
+    }).collect::<BTreeMap<_, _>>();
+    if !roles.is_empty() {
+        extra.insert("tomlook_attendee_roles".into(), json!(roles));
+    }
     extra.extend(creation_metadata);
     if let Some(event_type) = event.event_type {
         extra.insert("type".into(), json!(event_type));

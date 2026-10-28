@@ -8,7 +8,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    sync::Mutex,
+    sync::{Mutex, watch},
 };
 
 pub const CONFIGURE: &str =
@@ -16,6 +16,143 @@ pub const CONFIGURE: &str =
 const AUTH: &str = "Microsoft-Decision-1 needs a valid Azure CLI sign-in for the configured tenant and subscription; choose a mode explicitly";
 const INVALID: &str = "Microsoft-Decision-1 returned an invalid decision; choose a mode explicitly";
 const TIMED_OUT: &str = "Microsoft-Decision-1 routing timed out; choose a mode explicitly";
+const LOGIN_FAILED: &str = "Azure device-code sign-in failed or was blocked by tenant policy. Check the configured tenant and try again.";
+const LOGIN_CANCELLED: &str = "Azure device-code sign-in cancelled. No question was retried.";
+const CLI_FAILED: &str =
+    "Configured Azure CLI could not start. Check its installation and decision-router.json.";
+const AUTH_TIMEOUT: &str = "Azure sign-in check timed out. Check connectivity and retry.";
+pub const DEVICE_LOGIN_URL: &str = "https://microsoft.com/devicelogin";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Phase {
+    #[default]
+    Unknown,
+    Checking,
+    SignedIn,
+    SignInRequired,
+    Unconfigured,
+    Failed,
+    SigningIn,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Status {
+    pub phase: Phase,
+    pub message: String,
+    pub device_code: Option<String>,
+}
+
+impl Status {
+    pub fn new(phase: Phase, message: impl Into<String>) -> Self {
+        Self {
+            phase,
+            message: message.into(),
+            device_code: None,
+        }
+    }
+
+    pub fn signed_in() -> Self {
+        Self::new(
+            Phase::SignedIn,
+            "Azure sign-in verified. Deployment access is checked when Auto runs.",
+        )
+    }
+
+    pub fn error(error: String) -> Self {
+        let phase = if error == CONFIGURE {
+            Phase::Unconfigured
+        } else if error == AUTH
+            || error == LOGIN_CANCELLED
+            || error == LOGIN_FAILED
+            || error.starts_with("Azure device-code sign-in timed out")
+        {
+            Phase::SignInRequired
+        } else {
+            Phase::Failed
+        };
+        Self::new(phase, error)
+    }
+
+    pub fn busy(&self) -> bool {
+        matches!(self.phase, Phase::Checking | Phase::SigningIn)
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self.phase {
+            Phase::Unknown => "Auto: not checked",
+            Phase::Checking => "Auto: checking...",
+            Phase::SignedIn => "Auto: Azure signed in",
+            Phase::SignInRequired => "Auto: sign-in required",
+            Phase::Unconfigured => "Auto: not configured",
+            Phase::Failed => "Auto: unavailable",
+            Phase::SigningIn => "Auto: signing in...",
+        }
+    }
+}
+
+pub fn routing_error(error: &str) -> Option<Status> {
+    if error.starts_with("Microsoft-Decision-1")
+        || error == CONFIGURE
+        || error == "Create Microsoft-Decision-1 connection failed"
+        || error == CLI_FAILED
+        || error == AUTH_TIMEOUT
+        || error == "Automatic routing context exceeds its bounds; choose a mode explicitly"
+    {
+        if error.starts_with("Microsoft-Decision-1 returned HTTP 401;") {
+            Some(Status::new(Phase::SignInRequired, error))
+        } else {
+            Some(Status::error(error.into()))
+        }
+    } else {
+        None
+    }
+}
+
+fn device_code(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    if !text.split_whitespace().any(|word| {
+        matches!(
+            word,
+            "https://microsoft.com/devicelogin" | "https://aka.ms/devicelogin"
+        )
+    }) {
+        return None;
+    }
+    let code = text
+        .split_once("enter the code ")?
+        .1
+        .split_once(char::is_whitespace)?
+        .0;
+    (code.len() >= 6
+        && code.len() <= 16
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-'))
+    .then(|| code.to_owned())
+}
+
+async fn login_output(
+    mut reader: impl AsyncRead + Unpin,
+    progress: &impl Fn(String),
+) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 1024];
+    let mut reported = false;
+    loop {
+        let count = reader.read(&mut chunk).await.map_err(|_| LOGIN_FAILED)?;
+        if count == 0 {
+            return Ok(());
+        }
+        if bytes.len() + count > 16_384 {
+            return Err(LOGIN_FAILED.into());
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        if !reported && let Some(code) = device_code(&bytes) {
+            reported = true;
+            progress(code);
+        }
+    }
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -248,24 +385,7 @@ impl Router {
         })
     }
 
-    async fn access_token(&self) -> Result<String, String> {
-        let mut token = self.token.lock().await;
-        if let Some(cached) = token.as_ref()
-            && cached.expires > chrono::Utc::now().timestamp() + 60
-        {
-            return Ok(cached.value.clone());
-        }
-        let args = [
-            "account",
-            "get-access-token",
-            "--resource",
-            "https://cognitiveservices.azure.com",
-            "--subscription",
-            &self.config.subscription,
-            "--output",
-            "json",
-            "--only-show-errors",
-        ];
+    fn cli_command(&self, args: &[&str]) -> Result<tokio::process::Command, String> {
         #[cfg(windows)]
         let mut command = if self
             .config
@@ -279,10 +399,10 @@ impl Router {
                 .azure_cli
                 .parent()
                 .and_then(Path::parent)
-                .ok_or(AUTH)?
+                .ok_or(CLI_FAILED)?
                 .join("python.exe");
             if !python.is_file() {
-                return Err(AUTH.into());
+                return Err(CLI_FAILED.into());
             }
             let mut command = tokio::process::Command::new(python);
             command
@@ -309,9 +429,89 @@ impl Router {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "no")
-            .env("AZURE_CORE_COLLECT_TELEMETRY", "0");
+            .env("AZURE_CORE_COLLECT_TELEMETRY", "0")
+            .env("AZURE_CORE_NO_COLOR", "true");
+        Ok(command)
+    }
+
+    fn login_command(&self) -> Result<tokio::process::Command, String> {
+        let mut command = self.cli_command(&[
+            "login",
+            "--tenant",
+            &self.config.tenant,
+            "--use-device-code",
+            "--output",
+            "none",
+            "--only-show-errors",
+        ])?;
+        command
+            .env("AZURE_CORE_LOGIN_EXPERIENCE_V2", "off")
+            .env("AZURE_CORE_ENABLE_BROKER_ON_WINDOWS", "false");
+        Ok(command)
+    }
+
+    pub async fn clear_token(&self) {
+        *self.token.lock().await = None;
+    }
+
+    pub async fn check_auth(&self) -> Result<(), String> {
+        self.clear_token().await;
+        self.access_token().await.map(|_| ())
+    }
+
+    pub async fn sign_in(
+        &self,
+        mut cancelled: watch::Receiver<bool>,
+        mut shutdown: watch::Receiver<bool>,
+        progress: impl Fn(String),
+    ) -> Result<(), String> {
+        if *cancelled.borrow() || *shutdown.borrow() {
+            return Err(LOGIN_CANCELLED.into());
+        }
+        let operation = async {
+            let mut child = self.login_command()?.spawn().map_err(|_| LOGIN_FAILED)?;
+            let stdout = child.stdout.take().ok_or(LOGIN_FAILED)?;
+            let stderr = child.stderr.take().ok_or(LOGIN_FAILED)?;
+            let wait = async { child.wait().await.map_err(|_| LOGIN_FAILED.to_owned()) };
+            let (_, _, status) = tokio::try_join!(
+                login_output(stdout, &progress),
+                login_output(stderr, &progress),
+                wait,
+            )?;
+            if !status.success() {
+                return Err(LOGIN_FAILED.into());
+            }
+            self.check_auth().await
+        };
+        tokio::select! {
+            biased;
+            _ = cancelled.changed() => Err(LOGIN_CANCELLED.into()),
+            _ = shutdown.changed() => Err(LOGIN_CANCELLED.into()),
+            result = tokio::time::timeout(Duration::from_secs(960), operation) =>
+                result.map_err(|_| "Azure device-code sign-in timed out. Start sign-in again for a new code.".to_owned())?,
+        }
+    }
+
+    async fn access_token(&self) -> Result<String, String> {
+        let mut token = self.token.lock().await;
+        if let Some(cached) = token.as_ref()
+            && cached.expires > chrono::Utc::now().timestamp() + 60
+        {
+            return Ok(cached.value.clone());
+        }
+        let mut command = self.cli_command(&[
+            "account",
+            "get-access-token",
+            "--resource",
+            "https://cognitiveservices.azure.com",
+            "--subscription",
+            &self.config.subscription,
+            "--output",
+            "json",
+            "--only-show-errors",
+        ])?;
         let fetched = async {
-            let mut child = command.spawn().map_err(|_| AUTH)?;
+            let mut child = command.spawn().map_err(|_| CLI_FAILED)?;
             let stdout = child.stdout.take().ok_or(AUTH)?;
             let stderr = child.stderr.take().ok_or(AUTH)?;
             let wait = async { child.wait().await.map_err(|_| AUTH.to_owned()) };
@@ -327,7 +527,7 @@ impl Router {
         };
         let fetched = tokio::time::timeout(Duration::from_secs(8), fetched)
             .await
-            .map_err(|_| AUTH)??;
+            .map_err(|_| AUTH_TIMEOUT)??;
         let value = fetched.value.clone();
         *token = Some(fetched);
         Ok(value)
@@ -392,9 +592,137 @@ impl Router {
     }
 }
 
+pub async fn check(root: &Path) -> Status {
+    let result = async { Router::load(root).await?.check_auth().await }.await;
+    match result {
+        Ok(()) => Status::signed_in(),
+        Err(error) => Status::error(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_router() -> Router {
+        Router {
+            config: config("https://synthetic.services.ai.azure.com/"),
+            client: reqwest::Client::new(),
+            token: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn auto_status_distinguishes_authentication_configuration_and_routing_failures() {
+        assert_eq!(Status::error(AUTH.into()).phase, Phase::SignInRequired);
+        assert_eq!(Status::error(CONFIGURE.into()).phase, Phase::Unconfigured);
+        assert_eq!(Status::error(AUTH_TIMEOUT.into()).phase, Phase::Failed);
+        assert_eq!(Status::error(CLI_FAILED.into()).phase, Phase::Failed);
+        assert_eq!(
+            routing_error("Microsoft-Decision-1 returned HTTP 401; choose a mode explicitly")
+                .unwrap()
+                .phase,
+            Phase::SignInRequired
+        );
+        assert_eq!(
+            routing_error("Microsoft-Decision-1 returned HTTP 403; choose a mode explicitly")
+                .unwrap()
+                .phase,
+            Phase::Failed
+        );
+        assert!(routing_error("WorkIQ authorization expired; sign in again").is_none());
+        assert!(
+            Status::signed_in()
+                .message
+                .contains("Deployment access is checked")
+        );
+        assert!(Status::new(Phase::SigningIn, "").busy());
+        assert!(!Status::signed_in().busy());
+    }
+
+    #[test]
+    fn device_login_is_tenant_bound_noninteractive_and_changes_no_persistent_cli_settings() {
+        let router = test_router();
+        let command = router.login_command().unwrap();
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "login",
+                "--tenant",
+                router.config.tenant.as_str(),
+                "--use-device-code",
+                "--output",
+                "none",
+                "--only-show-errors",
+            ]
+        );
+        let env = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| (key.to_str().unwrap(), value.unwrap().to_str().unwrap()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(env["AZURE_CORE_LOGIN_EXPERIENCE_V2"], "off");
+        assert_eq!(env["AZURE_CORE_ENABLE_BROKER_ON_WINDOWS"], "false");
+        assert_eq!(env["AZURE_EXTENSION_USE_DYNAMIC_INSTALL"], "no");
+        assert!(!args.contains(&"--password"));
+        assert!(!args.contains(&"set"));
+    }
+
+    #[tokio::test]
+    async fn device_code_stream_is_bounded_and_only_forwards_a_complete_code_not_provider_output() {
+        use tokio::io::AsyncWriteExt;
+        let (reader, mut writer) = tokio::io::duplex(128);
+        let codes = std::sync::Mutex::new(Vec::new());
+        let progress = |code| codes.lock().unwrap().push(code);
+        let read = login_output(reader, &progress);
+        let write = async move {
+            for part in [
+                "provider details withheld\nTo sign in, open https://microsoft.com/devicelogin and enter the code ABC",
+                "D-EF12",
+                " to authenticate.\nmore provider content",
+            ] {
+                writer.write_all(part.as_bytes()).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            drop(writer);
+        };
+        let (result, ()) = tokio::join!(read, write);
+        result.unwrap();
+        assert_eq!(*codes.lock().unwrap(), ["ABCD-EF12"]);
+        for invalid in [
+            "https://microsoft.com/devicelogin.evil.invalid enter the code ABCD-EF12 to authenticate",
+            "https://microsoft.com/devicelogin enter the code ABCD-E",
+            "https://microsoft.com/devicelogin enter the code token.secret to authenticate",
+            "https://microsoft.com/devicelogin enter the code ABCD-EF12SECRETTOOLONG to authenticate",
+        ] {
+            assert!(device_code(invalid.as_bytes()).is_none());
+        }
+        assert!(
+            login_output(&vec![b'x'; 16_385][..], &|_| panic!("No code"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_device_login_never_launches_a_process_and_missing_configuration_is_explicit()
+    {
+        let (_, cancelled) = watch::channel(true);
+        let (_shutdown, shutdown) = watch::channel(false);
+        let result = test_router()
+            .sign_in(cancelled, shutdown, |_| {
+                panic!("No code after cancellation")
+            })
+            .await;
+        assert_eq!(result.unwrap_err(), LOGIN_CANCELLED);
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(check(root.path()).await.phase, Phase::Unconfigured);
+    }
 
     fn result(choice: &str, fast: f64, deep: f64) -> Value {
         json!({"model":"microsoft-decision-1","answers":{"mode":{

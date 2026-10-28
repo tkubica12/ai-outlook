@@ -11,11 +11,13 @@ use std::time::Duration;
 
 pub const POLICY_BLOCKED: &str = "WorkIQ denied this calendar change. Your tenant may block mutations; an administrator must enable calendar writes. Nothing was changed by this request.";
 pub const UNCERTAIN: &str = "Calendar write outcome is uncertain. Inspect Outlook before proposing another change; this operation will not be replayed automatically.";
+pub const MEETING_CHANGED: &str = "Meeting changed after the recommendation; no calendar write was submitted";
 
 #[derive(Clone, Debug)]
 pub enum Outcome {
     Applied(Box<Event>),
     Removed(String),
+    Stale(Box<Event>),
     NotSent(String),
     Review(String),
 }
@@ -80,7 +82,7 @@ pub trait Api: Send + Sync {
     async fn schema(&self, create: bool) -> Result<(), String>;
     async fn capability(&self, change: &Change) -> Result<(), String> {
         match change {
-            Change::Category(_) | Change::ClearCategory => self.schema(false).await,
+            Change::Category(_) | Change::ClearCategory | Change::Follow(_) => self.schema(false).await,
             Change::Buffer { .. } => self.schema(true).await,
             _ => Err("Calendar provider has no verified meeting action capability".into()),
         }
@@ -200,11 +202,19 @@ pub async fn execute(api: &impl Api, operation: &Operation) -> Outcome {
         operation.validate(api.account())?;
         api.capability(&operation.change).await?;
         let current = api.event(&operation.event.id).await?;
-        if crate::scheduler::fingerprint(&current) != operation.recommendation.fingerprint {
-            return Err(
-                "Meeting changed after the recommendation; no calendar write was submitted".into(),
-            );
+        if current.id != operation.event.id {
+            return Err("Calendar provider returned a different meeting; no write was submitted".into());
         }
+        Ok::<Event, String>(current)
+    }.await;
+    let current = match check {
+        Ok(current) => current,
+        Err(message) => return Outcome::NotSent(message),
+    };
+    if crate::scheduler::fingerprint(&current) != operation.recommendation.fingerprint {
+        return Outcome::Stale(Box::new(current));
+    }
+    let check = async {
         if let Change::Category(category) = &operation.change
             && real_categories(&current) == [category.clone()]
         {
@@ -319,10 +329,21 @@ fn verified(event: &Event, operation: &Operation) -> bool {
         original.extra.insert("type".into(), json!("exception"));
     }
     match &operation.change {
+        Change::Follow(enabled) => {
+            let categories = crate::recommendations::follow_categories(&original, *enabled);
+            let mut expected = original;
+            expected.category = categories.join(", ");
+            expected.extra.insert("categories".into(), json!(categories));
+            if *enabled {
+                expected.extra.insert("showAs".into(), json!("free"));
+            }
+            event.id == operation.event.id
+                && crate::scheduler::fingerprint(event) == crate::scheduler::fingerprint(&expected)
+        }
         Change::Category(_) | Change::ClearCategory => {
             let categories = match &operation.change {
-                Change::Category(category) => vec![category.clone()],
-                _ => Vec::new(),
+                Change::Category(category) => crate::recommendations::replacement_categories(&original, Some(category)),
+                _ => crate::recommendations::replacement_categories(&original, None),
             };
             let mut expected = original;
             expected.category = categories.join(", ");
@@ -384,6 +405,13 @@ fn request(
     action_body_is_string: bool,
 ) -> Result<CallToolRequestParams, String> {
     let (name, arguments) = match &operation.change {
+        Change::Follow(enabled) => {
+            let mut body = json!({"categories": crate::recommendations::follow_categories(&operation.event, *enabled)});
+            if *enabled {
+                body["showAs"] = json!("free");
+            }
+            ("update_entity", json!({"entityUrl":event_path(&operation.event.id)?, "jsonBody":body.to_string()}))
+        }
         Change::Category(category) => {
             if category.trim().is_empty()
                 || category.len() > 256
@@ -394,12 +422,12 @@ fn request(
             (
                 "update_entity",
                 json!({"entityUrl":event_path(&operation.event.id)?,
-                "jsonBody":json!({"categories":[category]}).to_string()}),
+                "jsonBody":json!({"categories":crate::recommendations::replacement_categories(&operation.event, Some(category))}).to_string()}),
             )
         }
         Change::ClearCategory => (
             "update_entity",
-            json!({"entityUrl":event_path(&operation.event.id)?, "jsonBody":json!({"categories":[]}).to_string()}),
+            json!({"entityUrl":event_path(&operation.event.id)?, "jsonBody":json!({"categories":crate::recommendations::replacement_categories(&operation.event, None)}).to_string()}),
         ),
         Change::Delete => (
             "delete_entity",
@@ -518,6 +546,15 @@ impl Api for Connection {
     async fn capability(&self, change: &Change) -> Result<(), String> {
         match change {
             Change::Category(_) | Change::ClearCategory => Api::schema(self, false).await,
+            Change::Follow(_) => {
+                let schema = discover_schema(self, false).await?;
+                let schema = schema.get("data").unwrap_or(&schema);
+                if !compatible_schema(schema, false)
+                    || !schema_property(schema, schema, "showAs", 0).is_some_and(|property| property.get("readOnly") != Some(&Value::Bool(true))) {
+                    return Err("Calendar provider has no writable availability schema for Follow; nothing was submitted".into());
+                }
+                Ok(())
+            }
             Change::Buffer { .. } => Api::schema(self, true).await,
             Change::Delete if self.calendar_write_tools.contains("delete_entity") => Ok(()),
             // get_schema describes entity fetch/create/update, not POST actions.
@@ -709,7 +746,7 @@ fn submission_result(
             if result.is_error != Some(true)
                 && matches!(
                     operation.change,
-                    Change::Category(_) | Change::ClearCategory | Change::Delete
+                    Change::Category(_) | Change::ClearCategory | Change::Follow(_) | Change::Delete
                 ) =>
         {
             Ok(operation.event.id.clone())
@@ -1315,13 +1352,21 @@ mod tests {
             }
             let mut event = operation.event.clone();
             match &operation.change {
+                Change::Follow(enabled) => {
+                    let categories = crate::recommendations::follow_categories(&event, *enabled);
+                    event.category = categories.join(", ");
+                    event.extra.insert("categories".into(), json!(categories));
+                    if *enabled { event.extra.insert("showAs".into(), json!("free")); }
+                }
                 Change::Category(category) => {
-                    event.category = category.clone();
-                    event.extra.insert("categories".into(), json!([category]));
+                    let categories = crate::recommendations::replacement_categories(&event, Some(category));
+                    event.category = categories.join(", ");
+                    event.extra.insert("categories".into(), json!(categories));
                 }
                 Change::ClearCategory => {
-                    event.category.clear();
-                    event.extra.insert("categories".into(), json!([]));
+                    let categories = crate::recommendations::replacement_categories(&event, None);
+                    event.category = categories.join(", ");
+                    event.extra.insert("categories".into(), json!(categories));
                 }
                 Change::Respond {
                     response: MeetingResponse::Cancel,
@@ -1421,19 +1466,23 @@ mod tests {
 
     #[tokio::test]
     async fn stale_account_event_conflicting_or_uncovered_interval_never_submits() {
-        for mode in 0..4 {
+        for mode in 0..5 {
             let operation = operation(mode >= 2);
             let mut api = Fake::new(&operation);
             match mode {
                 0 => api.account = "other",
                 1 => api.current.title.push_str(" changed"),
                 2 => api.busy = true,
-                _ => api.incomplete = true,
+                3 => api.incomplete = true,
+                _ => api.current.id = "different-meeting".into(),
             }
-            assert!(matches!(
-                execute(&api, &operation).await,
-                Outcome::NotSent(_)
-            ));
+            let result = execute(&api, &operation).await;
+            assert!(if mode == 1 {
+                matches!(result, Outcome::Stale(event)
+                    if serde_json::to_value(&event).unwrap() == serde_json::to_value(&api.current).unwrap())
+            } else {
+                matches!(result, Outcome::NotSent(_))
+            });
             assert_eq!(api.writes.load(Ordering::SeqCst), 0);
         }
     }
@@ -1592,6 +1641,38 @@ mod tests {
             change,
             recommendation,
         }
+    }
+
+    #[tokio::test]
+    async fn follow_is_one_verified_update_preserving_categories_response_and_free_time() {
+        for enabled in [true, false] {
+            let mut operation = manual_operation(Change::Follow(true), false);
+            let categories = if enabled { vec!["Work", "AI"] } else { vec!["Work", "fOlLoW", "AI"] };
+            operation.event.category = categories.join(", ");
+            operation.event.extra.insert("categories".into(), json!(categories));
+            operation.event.extra.insert("showAs".into(), json!(if enabled { "busy" } else { "free" }));
+            operation.change = Change::Follow(enabled);
+            operation.recommendation = crate::recommendations::Recommendation::from_manual(
+                &operation.event, "owner", operation.change.clone(), Local::now().fixed_offset()).unwrap();
+            operation.recommendation.state = crate::recommendations::State::Dispatching;
+            let wire = request(&operation, false).unwrap();
+            assert_eq!(wire.name, "update_entity", "Follow must not send an invitation response");
+            let body: Value = serde_json::from_str(wire.arguments.unwrap()["jsonBody"].as_str().unwrap()).unwrap();
+            assert_eq!(body["categories"], json!(if enabled { vec!["Work", "AI", "Follow"] } else { vec!["Work", "AI"] }));
+            assert_eq!(body.get("showAs"), enabled.then_some(&json!("free")));
+            assert!(body.get("responseStatus").is_none());
+            assert!(body.get("sendResponse").is_none());
+            assert_eq!(submission_result(&rmcp::model::CallToolResult::structured(json!({"statusCode":204})), &operation).unwrap(), operation.event.id);
+            let api = Fake::new(&operation);
+            let Outcome::Applied(event) = execute(&api, &operation).await else { panic!("Follow was not verified"); };
+            assert_eq!(event.status, operation.event.status);
+            assert_eq!(event.extra["showAs"], "free");
+            assert_eq!(api.writes.load(Ordering::SeqCst), 1);
+        }
+        let mut event = manual_operation(Change::Follow(true), false).event;
+        event.extra.insert("categories".into(), json!(["Work", "Follow"]));
+        assert_eq!(crate::recommendations::replacement_categories(&event, Some("AI")), ["AI", "Follow"]);
+        assert_eq!(crate::recommendations::replacement_categories(&event, None), ["Follow"]);
     }
 
     #[tokio::test]
@@ -1797,7 +1878,7 @@ mod tests {
         fake.current.extra.insert("isOrganizer".into(), json!(true));
         assert!(matches!(
             execute(&fake, &operation).await,
-            Outcome::NotSent(_)
+            Outcome::Stale(_)
         ));
         assert_eq!(fake.writes.load(Ordering::Relaxed), 0);
     }

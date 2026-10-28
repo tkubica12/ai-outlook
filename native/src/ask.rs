@@ -196,6 +196,7 @@ pub enum Action {
     Resume(String),
     DiscardResearch(String),
     Retry(u64),
+    ConfigureAuto,
 }
 
 #[derive(Clone)]
@@ -218,6 +219,7 @@ pub struct View {
     pub chat: Arc<crate::chat::Conversation>,
     pub recoveries: Arc<Vec<crate::chat::Checkpoint>>,
     pub mode: crate::chat::Mode,
+    pub auto_status: crate::decision::Status,
 }
 
 pub struct Input {
@@ -251,6 +253,7 @@ impl Default for View {
             chat: Default::default(),
             recoveries: Default::default(),
             mode: Default::default(),
+            auto_status: Default::default(),
         }
     }
 }
@@ -505,6 +508,19 @@ pub fn draw(ui: &mut egui::Ui, view: &mut View, detached: bool) -> Option<Action
             }
         }
     });
+    if view.mode == crate::chat::Mode::Auto
+        && view.auto_status.phase != crate::decision::Phase::SignedIn
+    {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(language.text(view.auto_status.label()));
+            if ui
+                .small_button(language.text("Fix Auto connection"))
+                .clicked()
+            {
+                action = Some(Action::ConfigureAuto);
+            }
+        });
+    }
     ui.horizontal_wrapped(|ui| {
         if let Some(event) = &view.context {
             ui.weak(language.text("Meeting context"));
@@ -744,6 +760,13 @@ fn turn_ui(ui: &mut egui::Ui, turn: &crate::chat::Turn, view: &View, action: &mu
                 ui.add_space(6.0);
                 ui.strong(language.text("Could not complete"));
                 ui.label(language.text(error));
+                if crate::decision::routing_error(error).is_some()
+                    && ui
+                        .small_button(language.text("Fix Auto connection"))
+                        .clicked()
+                {
+                    *action = Some(Action::ConfigureAuto);
+                }
                 let local = matches!(
                     expand(&turn.question, view.context.as_ref(), language),
                     Ok(Submission::Local(_))
@@ -1015,6 +1038,66 @@ mod tests {
             repeat: false,
             modifiers: Modifiers::NONE,
         }
+    }
+
+    #[test]
+    fn auto_routing_errors_have_a_direct_connection_action_without_submission() {
+        let context = egui::Context::default();
+        let mut view = View {
+            ready: true,
+            mode: crate::chat::Mode::Auto,
+            auto_status: crate::decision::Status::new(
+                crate::decision::Phase::SignInRequired,
+                "Azure sign-in required",
+            ),
+            ..Default::default()
+        };
+        let error = "Microsoft-Decision-1 returned HTTP 401; choose a mode explicitly";
+        Arc::make_mut(&mut view.chat)
+            .admit(1, "Synthetic Auto question".into(), crate::chat::Mode::Auto)
+            .unwrap();
+        Arc::make_mut(&mut view.chat).finish(1, Err(error.into()));
+        assert!(frame(&context, &mut view, vec![]).0.is_none());
+        let (_, output) = frame(&context, &mut view, vec![]);
+        let positions = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text)
+                    if text.galley.job.text == "Fix Auto connection" =>
+                {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            positions.len(),
+            2,
+            "Both Auto mode and the failed turn must expose a repair action"
+        );
+        let position = positions[1];
+        let (action, _) = frame(
+            &context,
+            &mut view,
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(action, Some(Action::ConfigureAuto));
+        assert_eq!(view.chat.turns[0].error.as_deref(), Some(error));
     }
 
     #[test]

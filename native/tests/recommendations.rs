@@ -248,6 +248,7 @@ fn material_contacts_exclude_the_verified_primary_address_across_restart_and_bin
     let identity = tomlook::workiq::connection::Identity {
         account: "login@tenant.example".into(),
         mail: Some("primary@home.example".into()),
+        display_name: Some("Signed-in user".into()),
     };
     let root = tempfile::tempdir().unwrap();
     let store = Store::open(root.path()).unwrap();
@@ -282,6 +283,25 @@ fn material_contacts_exclude_the_verified_primary_address_across_restart_and_bin
     };
     store.save_workiq_identity(&no_mail).unwrap();
     assert_eq!(store.workiq_identity().unwrap(), Some(no_mail));
+}
+
+#[test]
+fn follow_eligibility_explains_organizer_and_missing_invitation_metadata() {
+    let (calendar, _) = fixture();
+    let mut event = calendar.events[0].clone();
+    event.organizer = "organizer@example.test".into();
+    event.extra.insert("type".into(), serde_json::json!("occurrence"));
+    event.extra.insert("isOrganizer".into(), serde_json::json!(false));
+    assert!(recommendations::validate_manual_change(&event, &Change::Follow(true)).is_ok());
+    event.extra.insert("isOrganizer".into(), serde_json::json!(true));
+    assert_eq!(recommendations::validate_manual_change(&event, &Change::Follow(true)).unwrap_err(),
+        "Follow is for invitations, not meetings you organize");
+    event.extra.remove("isOrganizer");
+    assert_eq!(recommendations::validate_manual_change(&event, &Change::Follow(true)).unwrap_err(),
+        "Refresh the calendar first; Follow needs verified invitation details");
+    event.extra.insert("isOrganizer".into(), serde_json::json!(false));
+    event.organizer.clear();
+    assert!(recommendations::validate_manual_change(&event, &Change::Follow(true)).is_err());
 }
 
 #[test]
