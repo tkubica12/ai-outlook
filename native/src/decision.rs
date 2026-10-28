@@ -21,6 +21,7 @@ const LOGIN_CANCELLED: &str = "Azure device-code sign-in cancelled. No question 
 const CLI_FAILED: &str =
     "Configured Azure CLI could not start. Check its installation and decision-router.json.";
 const AUTH_TIMEOUT: &str = "Azure sign-in check timed out. Check connectivity and retry.";
+const DEVICE_CODE_TIMEOUT: &str = "Azure CLI did not provide a device code within 60 seconds. Check connectivity and try signing in again.";
 pub const DEVICE_LOGIN_URL: &str = "https://microsoft.com/devicelogin";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -79,13 +80,13 @@ impl Status {
 
     pub fn label(&self) -> &'static str {
         match self.phase {
-            Phase::Unknown => "Auto: not checked",
-            Phase::Checking => "Auto: checking...",
-            Phase::SignedIn => "Auto: Azure signed in",
-            Phase::SignInRequired => "Auto: sign-in required",
-            Phase::Unconfigured => "Auto: not configured",
-            Phase::Failed => "Auto: unavailable",
-            Phase::SigningIn => "Auto: signing in...",
+            Phase::Unknown => "Foundry: not checked",
+            Phase::Checking => "Foundry: checking...",
+            Phase::SignedIn => "Foundry: signed in",
+            Phase::SignInRequired => "Foundry: sign-in required",
+            Phase::Unconfigured => "Foundry: not configured",
+            Phase::Failed => "Foundry: unavailable",
+            Phase::SigningIn => "Foundry: signing in...",
         }
     }
 }
@@ -133,7 +134,7 @@ fn device_code(bytes: &[u8]) -> Option<String> {
 
 async fn login_output(
     mut reader: impl AsyncRead + Unpin,
-    progress: &impl Fn(String),
+    progress: &impl Fn(String) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut bytes = Vec::new();
     let mut chunk = [0; 1024];
@@ -149,8 +150,19 @@ async fn login_output(
         bytes.extend_from_slice(&chunk[..count]);
         if !reported && let Some(code) = device_code(&bytes) {
             reported = true;
-            progress(code);
+            progress(code)?;
         }
+    }
+}
+
+async fn await_device_code(
+    mut received: watch::Receiver<bool>,
+    timeout: Duration,
+) -> Result<(), String> {
+    match tokio::time::timeout(timeout, received.wait_for(|received| *received)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(_)) => Err(LOGIN_FAILED.into()),
+        Err(_) => Err(DEVICE_CODE_TIMEOUT.into()),
     }
 }
 
@@ -406,7 +418,7 @@ impl Router {
             }
             let mut command = tokio::process::Command::new(python);
             command
-                .args(["-IBm", "azure.cli"])
+                .args(["-u", "-IBm", "azure.cli"])
                 .args(args)
                 .env("AZ_INSTALLER", "MSI");
             command
@@ -463,23 +475,41 @@ impl Router {
         &self,
         mut cancelled: watch::Receiver<bool>,
         mut shutdown: watch::Receiver<bool>,
-        progress: impl Fn(String),
+        progress: impl Fn(String) -> Result<(), String>,
     ) -> Result<(), String> {
         if *cancelled.borrow() || *shutdown.borrow() {
             return Err(LOGIN_CANCELLED.into());
         }
         let operation = async {
-            let mut child = self.login_command()?.spawn().map_err(|_| LOGIN_FAILED)?;
+            let mut child = self.login_command()?.spawn().map_err(|_| CLI_FAILED)?;
             let stdout = child.stdout.take().ok_or(LOGIN_FAILED)?;
             let stderr = child.stderr.take().ok_or(LOGIN_FAILED)?;
-            let wait = async { child.wait().await.map_err(|_| LOGIN_FAILED.to_owned()) };
-            let (_, _, status) = tokio::try_join!(
-                login_output(stdout, &progress),
-                login_output(stderr, &progress),
-                wait,
-            )?;
-            if !status.success() {
-                return Err(LOGIN_FAILED.into());
+            let (sent, received) = watch::channel(false);
+            let progress = |code| {
+                if !sent.send_replace(true) {
+                    progress(code)?;
+                }
+                Ok::<(), String>(())
+            };
+            let process = async {
+                let wait = async { child.wait().await.map_err(|_| LOGIN_FAILED.to_owned()) };
+                let (_, _, status) = tokio::try_join!(
+                    login_output(stdout, &progress),
+                    login_output(stderr, &progress),
+                    wait,
+                )?;
+                if !status.success() {
+                    return Err(LOGIN_FAILED.into());
+                }
+                Ok::<(), String>(())
+            };
+            tokio::pin!(process);
+            tokio::select! {
+                result = &mut process => result?,
+                result = await_device_code(received, Duration::from_secs(60)) => {
+                    result?;
+                    process.await?;
+                }
             }
             self.check_auth().await
         };
@@ -619,6 +649,21 @@ mod tests {
         assert_eq!(Status::error(AUTH_TIMEOUT.into()).phase, Phase::Failed);
         assert_eq!(Status::error(CLI_FAILED.into()).phase, Phase::Failed);
         assert_eq!(
+            Status::error(DEVICE_CODE_TIMEOUT.into()).phase,
+            Phase::Failed
+        );
+        for phase in [
+            Phase::Unknown,
+            Phase::Checking,
+            Phase::SignedIn,
+            Phase::SignInRequired,
+            Phase::Unconfigured,
+            Phase::Failed,
+            Phase::SigningIn,
+        ] {
+            assert!(Status::new(phase, "").label().starts_with("Foundry: "));
+        }
+        assert_eq!(
             routing_error("Microsoft-Decision-1 returned HTTP 401; choose a mode explicitly")
                 .unwrap()
                 .phase,
@@ -673,12 +718,94 @@ mod tests {
         assert!(!args.contains(&"set"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn msi_cli_uses_its_own_python_with_immediate_output_and_no_shell() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("wbin");
+        std::fs::create_dir(&bin).unwrap();
+        let cli = bin.join("az.cmd");
+        let python = root.path().join("python.exe");
+        std::fs::write(&cli, "").unwrap();
+        std::fs::write(&python, "").unwrap();
+        let mut router = test_router();
+        router.config.azure_cli = cli;
+        let command = router.login_command().unwrap();
+        assert_eq!(command.as_std().get_program(), python.as_os_str());
+        let args = command.as_std().get_args().collect::<Vec<_>>();
+        assert_eq!(&args[..4], ["-u", "-IBm", "azure.cli", "login"]);
+        assert!(!args.contains(&std::ffi::OsStr::new("/c")));
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_device_code_is_bounded_but_an_issued_code_ends_that_deadline() {
+        let (sent, received) = watch::channel(false);
+        assert_eq!(
+            await_device_code(received, Duration::from_millis(5))
+                .await
+                .unwrap_err(),
+            DEVICE_CODE_TIMEOUT
+        );
+        sent.send_replace(true);
+        await_device_code(sent.subscribe(), Duration::ZERO)
+            .await
+            .unwrap();
+        let (sent, received) = watch::channel(false);
+        drop(sent);
+        assert_eq!(
+            await_device_code(received, Duration::from_secs(60))
+                .await
+                .unwrap_err(),
+            LOGIN_FAILED
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_prompt_is_forwarded_before_process_exit_and_delivery_failure_is_visible() {
+        use tokio::io::AsyncWriteExt;
+        let prompt = "\x1b[93mTo sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code ABCD-EF12 to authenticate.\x1b[0m\n";
+        let (reader, mut writer) = tokio::io::duplex(256);
+        let (codes, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let read = tokio::spawn(async move {
+            login_output(reader, &|code| {
+                codes.send(code).unwrap();
+                Ok(())
+            })
+            .await
+        });
+        writer.write_all(prompt.as_bytes()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), received.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            "ABCD-EF12"
+        );
+        assert!(
+            !read.is_finished(),
+            "CLI is still waiting for the user to sign in"
+        );
+        drop(writer);
+        read.await.unwrap().unwrap();
+        assert_eq!(
+            login_output(prompt.as_bytes(), &|_| Err(
+                "Synthetic delivery failure".into()
+            ))
+            .await
+            .unwrap_err(),
+            "Synthetic delivery failure"
+        );
+    }
+
     #[tokio::test]
     async fn device_code_stream_is_bounded_and_only_forwards_a_complete_code_not_provider_output() {
         use tokio::io::AsyncWriteExt;
         let (reader, mut writer) = tokio::io::duplex(128);
         let codes = std::sync::Mutex::new(Vec::new());
-        let progress = |code| codes.lock().unwrap().push(code);
+        let progress = |code| {
+            codes.lock().unwrap().push(code);
+            Ok(())
+        };
         let read = login_output(reader, &progress);
         let write = async move {
             for part in [

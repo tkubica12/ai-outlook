@@ -585,6 +585,7 @@ impl Engine {
                 let mut auto_login_cancel: Option<watch::Sender<bool>> = None;
                 let mut auto_busy = !demo;
                 let mut auto_generation = 0;
+                let mut auto_status = crate::decision::Status::new(crate::decision::Phase::Checking, "Checking Foundry Azure sign-in...");
                 let (auto_progress, mut auto_updates) = async_mpsc::channel::<(u64, String)>(4);
                 let mut connectors = Arc::new(crate::connectors::Registry::default());
                 let mut connector_cancels = BTreeMap::<crate::connectors::Kind, watch::Sender<bool>>::new();
@@ -608,7 +609,7 @@ impl Engine {
                 let mut usage_busy = false;
                 let mut diagnostic_warned = false;
                 if !demo {
-                    notify(Notice::Auto(crate::decision::Status::new(crate::decision::Phase::Checking, "Checking Auto Azure sign-in...")));
+                    notify(Notice::Auto(auto_status.clone()));
                     let auto_root = root.clone();
                     tasks.spawn(async move { Completion::Auto { generation: 0, status: crate::decision::check(&auto_root).await } });
                     for kind in [crate::connectors::Kind::Webiq, crate::connectors::Kind::Github] {
@@ -803,9 +804,9 @@ impl Engine {
                         Some((generation, code)) = auto_updates.recv() => {
                             if generation == auto_generation && !stopping
                                 && auto_login_cancel.as_ref().is_some_and(|cancel| !*cancel.borrow()) {
-                                let mut status = crate::decision::Status::new(crate::decision::Phase::SigningIn, "Enter this code on Microsoft's device sign-in page.");
-                                status.device_code = Some(code);
-                                notify(Notice::Auto(status));
+                                auto_status = crate::decision::Status::new(crate::decision::Phase::SigningIn, "Enter this code on Microsoft's device sign-in page.");
+                                auto_status.device_code = Some(code);
+                                notify(Notice::Auto(auto_status.clone()));
                             }
                         }
                         Some((kind, generation, message)) = external_updates.recv() => {
@@ -820,14 +821,16 @@ impl Engine {
                         command = input.recv(), if !stopping => {
                             match command {
                                 Some(Command::CheckAuto | Command::SignInAuto) if demo => {
-                                    notify(Notice::Auto(crate::decision::Status::new(crate::decision::Phase::Unconfigured, "Offline demo never opens Azure sign-in.")));
+                                    auto_status = crate::decision::Status::new(crate::decision::Phase::Unconfigured, "Offline demo never opens Azure sign-in.");
+                                    notify(Notice::Auto(auto_status.clone()));
                                 }
                                 Some(Command::CheckAuto) if !auto_busy => {
                                     auto_busy = true;
                                     auto_generation += 1;
                                     let generation = auto_generation;
                                     let root = root.clone();
-                                    notify(Notice::Auto(crate::decision::Status::new(crate::decision::Phase::Checking, "Checking Auto Azure sign-in...")));
+                                    auto_status = crate::decision::Status::new(crate::decision::Phase::Checking, "Checking Foundry Azure sign-in...");
+                                    notify(Notice::Auto(auto_status.clone()));
                                     tasks.spawn(async move { Completion::Auto { generation, status: crate::decision::check(&root).await } });
                                 }
                                 Some(Command::SignInAuto) if !auto_busy => {
@@ -840,14 +843,14 @@ impl Engine {
                                     let shutdown = stopped.clone();
                                     let progress = auto_progress.clone();
                                     let harness = harness.clone();
-                                    notify(Notice::Auto(crate::decision::Status::new(crate::decision::Phase::SigningIn, "Starting Azure device-code sign-in...")));
+                                    auto_status = crate::decision::Status::new(crate::decision::Phase::SigningIn, "Requesting an Azure device code (up to 60 seconds)...");
+                                    notify(Notice::Auto(auto_status.clone()));
                                     tasks.spawn(async move {
                                         let result = async {
                                             let router = crate::decision::Router::load(&root).await?;
                                             router.sign_in(cancelled, shutdown, |code| {
-                                                if let Err(error) = progress.try_send((generation, code)) {
-                                                    eprintln!("Tomlook: Azure sign-in code could not reach the interface: {error}");
-                                                }
+                                                progress.try_send((generation, code))
+                                                    .map_err(|_| "Azure sign-in code could not reach the interface. Try signing in again.".to_owned())
                                             }).await?;
                                             if let Some(harness) = harness { harness.clear_router_auth().await; }
                                             Ok::<(), String>(())
@@ -858,7 +861,9 @@ impl Engine {
                                         } }
                                     });
                                 }
-                                Some(Command::CheckAuto | Command::SignInAuto) => {}
+                                Some(Command::CheckAuto | Command::SignInAuto) => {
+                                    notify(Notice::Auto(auto_status.clone()));
+                                }
                                 Some(Command::CancelAutoLogin) => {
                                     if let Some(cancel) = &auto_login_cancel { let _ = cancel.send(true); }
                                 }
@@ -1384,7 +1389,8 @@ impl Engine {
                                     if generation == auto_generation {
                                         auto_busy = false;
                                         auto_login_cancel = None;
-                                        if !stopping { notify(Notice::Auto(status)); }
+                                        auto_status = status;
+                                        if !stopping { notify(Notice::Auto(auto_status.clone())); }
                                     }
                                 }
                                 Some(Ok(Completion::CalendarDelivered { admitted, result })) => {
@@ -1598,10 +1604,14 @@ impl Engine {
                                 Some(Ok(Completion::Answer { id, connector_revision, result })) => {
                                     if auto_requests.remove(&id) && !auto_busy && !stopping {
                                         match &result {
-                                            Ok(_) => { notify(Notice::Auto(crate::decision::Status::signed_in())); }
+                                            Ok(_) => {
+                                                auto_status = crate::decision::Status::signed_in();
+                                                notify(Notice::Auto(auto_status.clone()));
+                                            }
                                             Err(error) => {
                                                 if let Some(status) = crate::decision::routing_error(error) {
-                                                    notify(Notice::Auto(status));
+                                                    auto_status = status;
+                                                    notify(Notice::Auto(auto_status.clone()));
                                                 }
                                             }
                                         }

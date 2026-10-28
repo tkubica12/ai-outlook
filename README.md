@@ -37,9 +37,9 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The latest native Windows release is **[v0.6.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.6.0)**.
-Read the [release notes](docs/releases/v0.6.0.md) for changes since v0.5.0.
-Download **[Tomlook-v0.6.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.6.0/Tomlook-v0.6.0-win-x64.zip)**
+The latest native Windows release is **[v0.6.1](https://github.com/tkubica12/ai-outlook/releases/tag/v0.6.1)**.
+Read the [release notes](docs/releases/v0.6.1.md) for changes since v0.6.0.
+Download **[Tomlook-v0.6.1-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.6.1/Tomlook-v0.6.1-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable, unsigned,
 and does not install anything.

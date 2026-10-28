@@ -154,24 +154,24 @@ fn capture<'a>(pattern: &str, text: &'a str) -> Option<Vec<&'a str>> {
 
 pub const TEXTS: &[(&str, &str)] = &[
     ("Settings", "Nastavení"),
-    ("Auto: not checked", "Auto: neověřeno"),
-    ("Auto: checking...", "Auto: ověřování..."),
-    ("Auto: Azure signed in", "Auto: Azure přihlášeno"),
-    ("Auto: sign-in required", "Auto: nutné přihlášení"),
-    ("Auto: not configured", "Auto: nenastaveno"),
-    ("Auto: unavailable", "Auto: nedostupné"),
-    ("Auto: signing in...", "Auto: přihlašování..."),
+    ("Foundry: not checked", "Foundry: neověřeno"),
+    ("Foundry: checking...", "Foundry: ověřování..."),
+    ("Foundry: signed in", "Foundry: přihlášeno"),
+    ("Foundry: sign-in required", "Foundry: nutné přihlášení"),
+    ("Foundry: not configured", "Foundry: nenastaveno"),
+    ("Foundry: unavailable", "Foundry: nedostupné"),
+    ("Foundry: signing in...", "Foundry: přihlašování..."),
     (
         "Azure sign-in verified. Deployment access is checked when Auto runs.",
         "Přihlášení Azure je ověřené. Přístup k nasazenému modelu se ověří při použití Auto.",
     ),
     (
-        "Checking Auto Azure sign-in...",
-        "Ověřuje se přihlášení Azure pro Auto...",
+        "Checking Foundry Azure sign-in...",
+        "Ověřuje se přihlášení Azure pro Foundry...",
     ),
     (
-        "Starting Azure device-code sign-in...",
-        "Spouští se přihlášení Azure pomocí kódu...",
+        "Requesting an Azure device code (up to 60 seconds)...",
+        "Čeká se na přihlašovací kód od Azure (nejvýše 60 sekund)...",
     ),
     (
         "Enter this code on Microsoft's device sign-in page.",
@@ -187,11 +187,11 @@ pub const TEXTS: &[(&str, &str)] = &[
         "Sign in to Azure (device code)",
         "Přihlásit Azure pomocí kódu",
     ),
-    ("Check Auto connection", "Ověřit připojení Auto"),
-    ("Fix Auto connection", "Vyřešit připojení Auto"),
+    ("Check Foundry connection", "Ověřit připojení Foundry"),
+    ("Fix Foundry connection", "Vyřešit připojení Foundry"),
     (
-        "Quick and Thorough use Copilot without Auto's Azure sign-in.",
-        "Režimy Rychle a Důkladně používají Copilot a toto přihlášení Azure nepotřebují.",
+        "GitHub Copilot generates answers and analyses. Foundry selects Quick or Thorough in Auto mode.",
+        "GitHub Copilot vytváří odpovědi a analýzy. Foundry v režimu Auto vybírá mezi Rychle a Důkladně.",
     ),
     (
         "Uses your Azure CLI profile; its default account may change during sign-in.",
@@ -208,6 +208,14 @@ pub const TEXTS: &[(&str, &str)] = &[
     (
         "Azure device-code sign-in failed or was blocked by tenant policy. Check the configured tenant and try again.",
         "Přihlášení Azure se nezdařilo nebo ho blokují pravidla tenantu. Zkontrolujte nastavený tenant a zkuste to znovu.",
+    ),
+    (
+        "Azure CLI did not provide a device code within 60 seconds. Check connectivity and try signing in again.",
+        "Azure CLI nevydalo přihlašovací kód do 60 sekund. Zkontrolujte připojení a spusťte přihlášení znovu.",
+    ),
+    (
+        "Azure sign-in code could not reach the interface. Try signing in again.",
+        "Přihlašovací kód Azure se nepodařilo předat do okna aplikace. Spusťte přihlášení znovu.",
     ),
     (
         "Configured Azure CLI could not start. Check its installation and decision-router.json.",
@@ -1944,9 +1952,9 @@ pub const TEXTS: &[(&str, &str)] = &[
     ),
     ("Exit Tomlook", "Ukončit Tomlook"),
     ("Dismiss", "Zavřít"),
-    ("AI: signing in...", "AI: přihlašuji…"),
-    ("AI: connected", "AI: připojeno"),
-    ("AI: disconnected", "AI: nepřipojeno"),
+    ("GitHub Copilot: signing in...", "GitHub Copilot: přihlašuji…"),
+    ("GitHub Copilot: connected", "GitHub Copilot: připojeno"),
+    ("GitHub Copilot: disconnected", "GitHub Copilot: nepřipojeno"),
     ("WorkIQ: working...", "WorkIQ: pracuje…"),
     ("WorkIQ: connected", "WorkIQ: připojeno"),
     ("WorkIQ: disconnected", "WorkIQ: nepřipojeno"),

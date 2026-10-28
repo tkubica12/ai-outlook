@@ -4297,7 +4297,7 @@ impl Tomlook {
     fn open_ai_connection(&mut self) {
         self.connection_panel = Some(ConnectionPanel::Ai);
         if !self.auto_status.busy() && self.ai_command(ai::Command::CheckAuto) {
-            self.auto_status = tomlook::decision::Status::new(tomlook::decision::Phase::Checking, "Checking Auto Azure sign-in...");
+            self.auto_status = tomlook::decision::Status::new(tomlook::decision::Phase::Checking, "Checking Foundry Azure sign-in...");
         }
     }
 
@@ -4325,7 +4325,7 @@ impl Tomlook {
         .default_width(440.0)
         .show(context, |ui| {
             if panel == ConnectionPanel::Ai {
-                ui.strong("Copilot");
+                ui.strong("GitHub Copilot");
                 ui.label(language.text(&self.connection));
                 if !self.ai_login_busy
                     && !self.ai_ready
@@ -4347,19 +4347,22 @@ impl Tomlook {
                 }
                 ui.add_space(10.0);
                 ui.separator();
-                ui.strong("Auto · Microsoft-Decision-1");
+                ui.strong("Foundry · Microsoft-Decision-1");
                 ui.label(language.text(if self.auto_status.message.is_empty() {
                     self.auto_status.label()
                 } else { &self.auto_status.message }));
-                ui.weak(language.text("Quick and Thorough use Copilot without Auto's Azure sign-in."));
+                ui.weak(language.text("GitHub Copilot generates answers and analyses. Foundry selects Quick or Thorough in Auto mode."));
                 if let Some(code) = &self.auto_status.device_code {
                     ui.horizontal(|ui| {
                         ui.monospace(code);
                         if ui.button(language.text("Copy code")).clicked() { ui.ctx().copy_text(code.clone()); }
                     });
-                    ui.hyperlink_to(language.text("Open Microsoft device sign-in"), tomlook::decision::DEVICE_LOGIN_URL);
                 }
                 if self.auto_status.phase == tomlook::decision::Phase::SigningIn {
+                    if self.auto_status.device_code.is_none() {
+                        ui.spinner();
+                    }
+                    ui.hyperlink_to(language.text("Open Microsoft device sign-in"), tomlook::decision::DEVICE_LOGIN_URL);
                     if ui.button(language.text("Cancel Azure sign-in")).clicked() {
                         self.ai_command(ai::Command::CancelAutoLogin);
                     }
@@ -4368,11 +4371,11 @@ impl Tomlook {
                     if self.auto_status.phase != tomlook::decision::Phase::Unconfigured
                         && ui.button(language.text("Sign in to Azure (device code)")).clicked()
                         && self.ai_command(ai::Command::SignInAuto) {
-                        self.auto_status = tomlook::decision::Status::new(tomlook::decision::Phase::SigningIn, "Starting Azure device-code sign-in...");
+                        self.auto_status = tomlook::decision::Status::new(tomlook::decision::Phase::SigningIn, "Requesting an Azure device code (up to 60 seconds)...");
                     }
-                    if ui.button(language.text("Check Auto connection")).clicked()
+                    if ui.button(language.text("Check Foundry connection")).clicked()
                         && self.ai_command(ai::Command::CheckAuto) {
-                        self.auto_status = tomlook::decision::Status::new(tomlook::decision::Phase::Checking, "Checking Auto Azure sign-in...");
+                        self.auto_status = tomlook::decision::Status::new(tomlook::decision::Phase::Checking, "Checking Foundry Azure sign-in...");
                     }
                 }
             } else if panel == ConnectionPanel::External(tomlook::connectors::Kind::Github) {
@@ -5561,11 +5564,11 @@ impl eframe::App for Tomlook {
                     ui.weak(language.text("Offline demo - fictional calendar"));
                 } else {
                 if status_text(ui, "status-ai", language.text(if self.ai_login_busy {
-                        "AI: signing in..."
+                        "GitHub Copilot: signing in..."
                     } else if self.ai_ready {
-                        "AI: connected"
+                        "GitHub Copilot: connected"
                     } else {
-                        "AI: disconnected"
+                        "GitHub Copilot: disconnected"
                     }))
                     .on_hover_text(language.text(&self.connection))
                     .clicked()
@@ -8707,11 +8710,28 @@ mod tests {
             let output = draw(&mut app, vec![]);
             let mut text = String::new();
             for shape in &output.shapes { append_shape_text(&shape.shape, &mut text); }
-            assert!(text.contains("Copilot") && text.contains("Microsoft-Decision-1"));
+            assert!(text.contains("GitHub Copilot") && text.contains("Foundry · Microsoft-Decision-1"));
             assert_eq!(text.matches(language.text(error).as_ref()).count(), 1, "Do not repeat the routing error as a Copilot failure: {text}");
             click(&mut app, language.text("Sign in to Azure (device code)").as_ref());
             assert!(matches!(commands.try_recv().unwrap(), ai::Command::SignInAuto));
             assert!(commands.try_recv().is_err());
+            let output = draw(&mut app, vec![]);
+            text.clear();
+            for shape in &output.shapes { append_shape_text(&shape.shape, &mut text); }
+            assert!(text.contains(language.text("Requesting an Azure device code (up to 60 seconds)...").as_ref()));
+            assert!(text.contains(language.text("Open Microsoft device sign-in").as_ref()));
+            assert!(text.contains(language.text("Cancel Azure sign-in").as_ref()));
+            assert!(output.platform_output.commands.is_empty());
+            let timeout = "Azure CLI did not provide a device code within 60 seconds. Check connectivity and try signing in again.";
+            notices.send(ai::Notice::Auto(Status::error(timeout.into()))).unwrap();
+            app.receive();
+            let output = draw(&mut app, vec![]);
+            text.clear();
+            for shape in &output.shapes { append_shape_text(&shape.shape, &mut text); }
+            assert!(text.contains(language.text(timeout).as_ref()));
+            assert!(app.ai_ready && !app.auto_status.busy());
+            click(&mut app, language.text("Sign in to Azure (device code)").as_ref());
+            assert!(matches!(commands.try_recv().unwrap(), ai::Command::SignInAuto));
             notices.send(ai::Notice::Auto(Status {
                 phase: Phase::SigningIn,
                 message: "Enter this code on Microsoft's device sign-in page.".into(),

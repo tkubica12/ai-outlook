@@ -619,7 +619,7 @@ lifecycle. Both settings changed together, so the experiment does not establish
 which alone caused the earlier failures. Long-running token refresh and other
 workloads still require separate live acceptance.
 
-The bottom status bar has independent, clickable **AI** and **WorkIQ**
+The bottom status bar has independent, clickable **GitHub Copilot**, **Foundry** and **WorkIQ**
 connections. WorkIQ's dialog asks for the expected work email, starts browser
 sign-in and shows progress, cancellation, refresh and disconnect controls.
 Authentication and reads run on Rust workers without starting Copilot or
@@ -1024,7 +1024,7 @@ granting any new collection scope.
 
 ### WebIQ and GitHub sign-in
 
-The bottom status bar uses frameless clickable text for AI, WorkIQ, WebIQ,
+The bottom status bar uses frameless clickable text for GitHub Copilot, Foundry, WorkIQ, WebIQ,
 GitHub and activity. Hover underlines and keyboard-focus outlines preserve
 discoverability without permanent gray button boxes. The neutral inbox bell
 also remains clickable without a filled box.
@@ -1233,16 +1233,24 @@ Only credential-free HTTPS Azure Foundry resource endpoints are accepted;
 redirects are disabled. No API key or bearer token is stored in this file.
 The router lazily obtains a Cognitive Services Entra token from the explicitly
 configured existing Azure CLI sign-in and retains it in memory until renewal.
-The status bar and AI connection dialog show Copilot and Auto authentication
-separately. Auto checks its saved Azure CLI login at startup and when its
+The status bar and AI connection dialog use the provider names **GitHub Copilot**
+and **Foundry** and show their authentication separately. Copilot generates
+answers and meeting analyses; Foundry only selects Quick or Thorough for the
+**Auto** answer mode. Auto is a mode, not a third provider.
+Foundry checks its saved Azure CLI login at startup and when its
 connection dialog opens. A verified Azure login does not assert deployment
 access: that is checked by the actual routing request, whose failure updates
-Auto status without marking Copilot disconnected.
+Foundry status without marking Copilot disconnected.
 
 **Sign in to Azure (device code)** is an explicit action in that dialog.
 It runs the configured CLI with `login --tenant ... --use-device-code`, shows
 only the short user code and a fixed Microsoft sign-in link, and supports cancel,
-expiry and retry. The browser does not open automatically. Broker login and
+expiry and retry. Waiting for the first code has a separate 60-second limit;
+failure ends the process and shows an explicit retryable error instead of
+remaining at "starting". The fixed link is already visible while waiting.
+Duplicate commands report the active operation rather than silently leaving
+the interface displaying a sign-in that was never started.
+The browser does not open automatically. Broker login and
 the subscription selector are disabled for that process only; no persistent
 CLI configuration is changed. The CLI's existing user profile/cache is used,
 so signing in can change its default account. Tomlook does not run
@@ -1251,7 +1259,8 @@ tenant and subscription. A completed login never resubmits the failed question.
 Quick and Thorough remain usable without this additional Azure sign-in.
 Tomlook never creates a deployment or changes grants on the user's behalf.
 On Windows MSI installations it runs the CLI's bundled isolated Python module
-directly, avoiding an intermediate shell or orphaned CLI child on cancellation.
+directly with unbuffered output, avoiding an intermediate shell or orphaned CLI
+child on cancellation.
 Token acquisition and inference each have an eight-second bound; requests are
 asynchronous, cancellable and response-size limited. Missing/expired sign-in,
 HTTP failures, timeouts and invalid choices are visible errors; manual profiles

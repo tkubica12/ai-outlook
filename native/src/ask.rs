@@ -514,7 +514,7 @@ pub fn draw(ui: &mut egui::Ui, view: &mut View, detached: bool) -> Option<Action
         ui.horizontal_wrapped(|ui| {
             ui.weak(language.text(view.auto_status.label()));
             if ui
-                .small_button(language.text("Fix Auto connection"))
+                .small_button(language.text("Fix Foundry connection"))
                 .clicked()
             {
                 action = Some(Action::ConfigureAuto);
@@ -762,7 +762,7 @@ fn turn_ui(ui: &mut egui::Ui, turn: &crate::chat::Turn, view: &View, action: &mu
                 ui.label(language.text(error));
                 if crate::decision::routing_error(error).is_some()
                     && ui
-                        .small_button(language.text("Fix Auto connection"))
+                        .small_button(language.text("Fix Foundry connection"))
                         .clicked()
                 {
                     *action = Some(Action::ConfigureAuto);
@@ -1064,7 +1064,7 @@ mod tests {
             .iter()
             .filter_map(|shape| match &shape.shape {
                 egui::epaint::Shape::Text(text)
-                    if text.galley.job.text == "Fix Auto connection" =>
+                    if text.galley.job.text == "Fix Foundry connection" =>
                 {
                     Some(text.pos + text.galley.size() * 0.5)
                 }
