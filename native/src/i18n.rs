@@ -2163,7 +2163,18 @@ mod tests {
 
     #[test]
     fn native_static_controls_are_in_the_shared_catalog() {
-        let sources = [include_str!("app.rs"), include_str!("ask.rs")];
+        let sources = [
+            include_str!("app/mod.rs"),
+            include_str!("app/ask_panel.rs"),
+            include_str!("app/calendar.rs"),
+            include_str!("app/connections.rs"),
+            include_str!("app/event_editor.rs"),
+            include_str!("app/meeting.rs"),
+            include_str!("app/palette.rs"),
+            include_str!("app/recommendations.rs"),
+            include_str!("app/settings.rs"),
+            include_str!("ask.rs"),
+        ];
         for source in sources {
             let app = source.split("#[cfg(test)]\nmod tests").next().unwrap();
             for rest in app.split("language.text(\"").skip(1) {
