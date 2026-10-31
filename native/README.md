@@ -1590,6 +1590,61 @@ Acceptance still requires the full cold/warm/interaction/DPI/input matrix,
 saturated live AI comparison, actual isolation/tray observations and owner
 approval. A small test corpus or one idle measurement is not that acceptance.
 
+## Updates
+
+Tomlook checks the public GitHub Releases of `tkubica12/ai-outlook` from a
+dedicated background thread; the UI thread never performs network or disk work
+for updates and nothing polls or repaints continuously. The first automatic
+check runs about 60 seconds after start and then every 24 hours while Tomlook
+runs, including hidden in the tray; the last successful check time is saved in
+preferences, so restarts do not add extra checks. Failed network checks retry
+after an hour. **Settings → Updates** shows the current version, the last check,
+progress and errors, has **Check now**, and can turn automatic checks off.
+
+Privacy: a check is one unauthenticated `GET` of
+`api.github.com/repos/tkubica12/ai-outlook/releases/latest` with
+`User-Agent: Tomlook/<version>`; no account, calendar or usage data is sent.
+Release downloads only follow HTTPS redirects within GitHub.
+
+Verification (the executable itself is not code-signed):
+
+- Drafts and prereleases are ignored; only a strictly newer semantic version is
+  considered.
+- `tomlook-update.json` and `tomlook-update.json.sig` (each at most 64 KiB) are
+  downloaded and the Ed25519 signature is checked against the public keys
+  embedded in Tomlook **before** the manifest is parsed. The manifest must name
+  Tomlook, match the release tag, link to the release page on github.com and
+  name the expected `Tomlook-vX.Y.Z-win-x64.zip`. An invalid signature is
+  reported and never offered or installed.
+- The archive (at most 150 MB) is streamed to a staging file and must match the
+  signed size and SHA-256. Only `Tomlook.exe`, `LICENSE` and
+  `THIRD_PARTY_NOTICES.txt` are accepted; paths, directories and any other
+  entry reject the whole archive. The extracted `Tomlook.exe` must match its
+  signed SHA-256.
+
+Verified files are staged in `.tomlook-update\<version>\` next to
+`Tomlook.exe`. The status bar then shows a small **Update X.Y.Z ready**
+indicator that opens Settings → Updates. **Restart now** exits through the
+normal Exit path (workers stop, the tray is removed), renames the running
+`Tomlook.exe` to `Tomlook.exe.old`, moves the staged executable into place,
+copies the notices and starts the new version with `--after-update <pid>`.
+That process waits up to 30 seconds for the old process to exit and then takes
+the profile lock directly; it never signals or restores the closing instance.
+Exiting Tomlook normally with a staged update installs it without restarting.
+Any failure rolls back to the previous executable and notices and is reported.
+The next start deletes `Tomlook.exe.old` and stale staging data in the
+background. The staged executable is hashed again just before installation.
+
+Updates never run in `--demo`, `--stress`, startup/idle/interaction
+measurements, the acceptance executable, or a build inside a Cargo `target`
+directory. If `Tomlook.exe` was renamed or its folder is not writable, Tomlook
+only offers **Open release page**. Downloading the ZIP manually still works.
+Disable automatic checks with the Settings toggle; **Check now** remains manual.
+
+Known limits: two Tomlook processes with different profiles running from the
+same folder can race on staging; a replaced process ID reused by an unrelated
+process can delay the relaunch by at most 30 seconds.
+
 ## Startup measurement
 
 `calendar::fixture` is the frozen benchmark corpus (`tomlook-frozen-fixture-v1`):

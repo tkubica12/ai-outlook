@@ -37,12 +37,14 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The latest native Windows release is **[v0.7.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.7.0)**.
-Read the [release notes](docs/releases/v0.7.0.md) for changes since v0.6.1.
-Download **[Tomlook-v0.7.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.7.0/Tomlook-v0.7.0-win-x64.zip)**
+The latest native Windows release is **[v0.8.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.8.0)**.
+Read the [release notes](docs/releases/v0.8.0.md) for changes since v0.7.0.
+Download **[Tomlook-v0.8.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.8.0/Tomlook-v0.8.0-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
-application and third-party/font license notices. It is portable, unsigned,
-and does not install anything.
+application and third-party/font license notices. It is portable and unsigned.
+From v0.8.0, Tomlook checks GitHub Releases once a day and installs
+Ed25519-signed, SHA-256-verified updates when you choose **Restart now** or exit
+Tomlook; manual download still works (see [Updates](native/README.md#updates)).
 
 Windows 10/11 x64 also needs the current
 [Microsoft Visual C++ v14 Redistributable (x64)](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
@@ -105,12 +107,29 @@ annotated tag and create the GitHub Release. It packages
 `native\target\release` directly and never replaces a running
 `release\Tomlook.exe`. Without `-Publish` it only stages the archive in
 `.build\releases\`.
+The script also writes `tomlook-update.json` (version, tag, release page,
+archive size/SHA-256 and `Tomlook.exe` SHA-256), signs it with the
+`release-sign` tool into `tomlook-update.json.sig`, verifies the signature,
+archive and extracted executable against the public keys embedded in
+`native\src\updater.rs`, and uploads both files with the release. The
+Ed25519 signing key is stored only DPAPI-protected for the releasing Windows
+user at `%LOCALAPPDATA%\Tomlook-release\update-signing-key.dpapi` (override with
+`-SigningKey <path>` or `TOMLOOK_RELEASE_SIGNING_KEY`); packaging fails if it is
+missing. Only the same Windows user profile can decrypt that file; if it is lost,
+releases must move to a new key and existing installations need one manual
+update. Never commit or print the key. From `native\`,
+`cargo run --locked --offline --bin release-sign -- public-key --key <path>`
+prints the public key; `generate --key <new path>` (refuses to overwrite)
+creates a rotation key whose public key must be added to `TRUSTED_KEYS` and
+shipped before releases are signed with it; `sign` and `verify` are used by the
+packaging script.
 Run native checks from `native\` with `cargo test --locked --offline` and
 `cargo clippy --locked --offline --all-targets -- -D warnings`.
 
 The gear opens a larger **Settings** window with left-hand navigation:
 **Display** contains language, theme and accent; **AI prompts** contains five
-editable guidance prompts with per-prompt default restoration.
+editable guidance prompts with per-prompt default restoration; **Updates** shows
+the version, update checks and a verified update ready to install.
 Save prompt edits explicitly; source boundaries, structured output and write
 approval rules are not editable. Already completed notes are never regenerated
 because a prompt changed. Ask and Commands use accessible vector icons.

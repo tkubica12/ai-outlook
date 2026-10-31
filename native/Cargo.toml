@@ -1,6 +1,6 @@
 [package]
 name = "tomlook"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -13,6 +13,12 @@ path = "src/main.rs"
 [[bin]]
 name = "tomlook-acceptance"
 path = "src/main.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "release-sign"
+path = "src/bin/release-sign.rs"
 test = false
 bench = false
 
@@ -33,6 +39,9 @@ base64 = "=0.22.1"
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "ico"] }
 tray-icon = { version = "=0.26.1", default-features = false }
 pulldown-cmark = { version = "=0.13.4", default-features = false }
+ring = "=0.17.14"
+semver = "=1.0.28"
+zip = { version = "=7.2.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "=3.27.0"

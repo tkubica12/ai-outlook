@@ -3,7 +3,10 @@ param(
     # Publish the staged archive as an annotated tag and GitHub Release.
     [switch]$Publish,
     # Reuse the existing native\target\release\tomlook.exe instead of rebuilding it.
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # DPAPI-protected Ed25519 update signing key (default: TOMLOOK_RELEASE_SIGNING_KEY or
+    # %LOCALAPPDATA%\Tomlook-release\update-signing-key.dpapi).
+    [string]$SigningKey
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,6 +19,15 @@ $version = $Matches[1]
 $tag = "v$version"
 $notes = Join-Path $root "docs\releases\$tag.md"
 if (-not (Test-Path -LiteralPath $notes -PathType Leaf)) { throw "Release notes $notes are missing." }
+
+if (-not $SigningKey) { $SigningKey = $env:TOMLOOK_RELEASE_SIGNING_KEY }
+if (-not $SigningKey) {
+    if (-not $env:LOCALAPPDATA) { throw 'LOCALAPPDATA is not defined; pass -SigningKey.' }
+    $SigningKey = Join-Path $env:LOCALAPPDATA 'Tomlook-release\update-signing-key.dpapi'
+}
+if (-not (Test-Path -LiteralPath $SigningKey -PathType Leaf)) {
+    throw "Update signing key $SigningKey is missing. Restore it, pass -SigningKey, or (for a planned key rotation only) create one with 'release-sign generate --key <path>' and add its public key to native\src\updater.rs TRUSTED_KEYS."
+}
 
 $cargo = Get-Command cargo -ErrorAction SilentlyContinue
 $cargoPath = if ($cargo) { $cargo.Source } else { Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe' }
@@ -30,16 +42,21 @@ if ($Publish) {
     if ($head -ne $remote) { throw 'Push the release commit before publishing.' }
 }
 
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+if (-not (Test-Path $vswhere -PathType Leaf)) { throw 'Visual Studio C++ Build Tools and Windows SDK are required.' }
+$installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+$setup = Join-Path $installation 'VC\Auxiliary\Build\vcvars64.bat'
+if (-not (Test-Path $setup -PathType Leaf)) { throw 'No installed x64 Visual Studio C++ toolchain was found.' }
 if (-not $SkipBuild) {
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-    if (-not (Test-Path $vswhere -PathType Leaf)) { throw 'Visual Studio C++ Build Tools and Windows SDK are required.' }
-    $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-    $setup = Join-Path $installation 'VC\Auxiliary\Build\vcvars64.bat'
-    if (-not (Test-Path $setup -PathType Leaf)) { throw 'No installed x64 Visual Studio C++ toolchain was found.' }
     $build = 'set "PATH={0};%PATH%" && call "{1}" >nul && cd /d "{2}" && "{3}" build --release --locked --offline --bin tomlook --target-dir target' -f (Split-Path -Parent $vswhere), $setup, $native, $cargoPath
     & $env:ComSpec /d /c $build
     if ($LASTEXITCODE -ne 0) { throw 'Native release build failed.' }
 }
+# The signing tool embeds the same trusted keys as Tomlook, so it can verify its own output.
+$signBuild = 'set "PATH={0};%PATH%" && call "{1}" >nul && cd /d "{2}" && "{3}" build --locked --offline --bin release-sign --target-dir target' -f (Split-Path -Parent $vswhere), $setup, $native, $cargoPath
+& $env:ComSpec /d /c $signBuild
+if ($LASTEXITCODE -ne 0) { throw 'release-sign build failed.' }
+$signer = Join-Path $native 'target\debug\release-sign.exe'
 # Package the build output directly so a running release\Tomlook.exe is never touched.
 $exe = Join-Path $native 'target\release\tomlook.exe'
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'native\target\release\tomlook.exe is missing.' }
@@ -88,19 +105,40 @@ Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $cont
 [IO.File]::WriteAllText((Join-Path $content 'THIRD_PARTY_NOTICES.txt'), $body, (New-Object Text.UTF8Encoding $false))
 $zip = Join-Path $stage "Tomlook-$tag-win-x64.zip"
 Compress-Archive -Path (Join-Path $content '*') -DestinationPath $zip -CompressionLevel Optimal
+$exeHash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+$zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
 $sums = @(
-    '{0}  Tomlook.exe' -f (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
-    '{0}  {1}' -f (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant(), (Split-Path -Leaf $zip)
+    '{0}  Tomlook.exe' -f $exeHash
+    '{0}  {1}' -f $zipHash, (Split-Path -Leaf $zip)
 )
 $sumsPath = Join-Path $stage 'SHA256SUMS.txt'
 [IO.File]::WriteAllText($sumsPath, ($sums -join "`n") + "`n", (New-Object Text.UTF8Encoding $false))
 Remove-Item -LiteralPath $content -Recurse -Force
+
+# Signed update manifest: Tomlook verifies this exact file before trusting any hash in it.
+$update = [ordered]@{
+    schema     = 1
+    product    = 'Tomlook'
+    version    = $version
+    tag        = $tag
+    published  = [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
+    notes_url  = "https://github.com/tkubica12/ai-outlook/releases/tag/$tag"
+    archive    = [ordered]@{ name = (Split-Path -Leaf $zip); size = (Get-Item -LiteralPath $zip).Length; sha256 = $zipHash }
+    executable = [ordered]@{ name = 'Tomlook.exe'; sha256 = $exeHash }
+}
+$updatePath = Join-Path $stage 'tomlook-update.json'
+$signaturePath = "$updatePath.sig"
+[IO.File]::WriteAllText($updatePath, ($update | ConvertTo-Json -Depth 4) + "`n", (New-Object Text.UTF8Encoding $false))
+& $signer sign --key $SigningKey --in $updatePath --out $signaturePath
+if ($LASTEXITCODE -ne 0) { throw 'Signing tomlook-update.json failed.' }
+& $signer verify --in $updatePath --sig $signaturePath --archive $zip
+if ($LASTEXITCODE -ne 0) { throw 'The signed update does not verify against the public keys trusted by Tomlook or its archive.' }
 Write-Output "Staged $tag in $stage ($($entries.Count) packages, $($texts.Count) notices)."
 
 if ($Publish) {
     git -C $root tag -a $tag -m "Tomlook $tag"
     git -C $root push --quiet origin $tag
-    gh release create $tag $zip $sumsPath --repo tkubica12/ai-outlook --verify-tag --title "Tomlook $tag" --notes-file $notes
+    gh release create $tag $zip $sumsPath $updatePath $signaturePath --repo tkubica12/ai-outlook --verify-tag --title "Tomlook $tag" --notes-file $notes
     if ($LASTEXITCODE -ne 0) { throw "GitHub Release creation failed; tag $tag was pushed." }
     Write-Output "Published https://github.com/tkubica12/ai-outlook/releases/tag/$tag"
 }

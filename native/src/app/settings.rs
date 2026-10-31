@@ -66,6 +66,11 @@ pub(super) fn activity_row(
 pub(super) enum PreferencesSection {
     Display,
     Prompts,
+    Updates,
+}
+
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
 }
 
 impl Tomlook {
@@ -84,6 +89,7 @@ impl Tomlook {
                         for (section, label) in [
                             (PreferencesSection::Display, "Display"),
                             (PreferencesSection::Prompts, "AI prompts"),
+                            (PreferencesSection::Updates, "Updates"),
                         ] {
                             if ui.add_sized([ui.available_width(), 36.0],
                                 egui::Button::new(language.text(label))
@@ -158,11 +164,126 @@ impl Tomlook {
                                 });
                                 ui.weak(language.text("Saved notes are not reprocessed when prompts change."));
                             }
+                            PreferencesSection::Updates => self.update_preferences(ui),
                         }
                     });
                 });
             });
         self.preferences_open = open;
+    }
+
+    fn update_preferences(&mut self, ui: &mut egui::Ui) {
+        use tomlook::updater::Activity;
+        let language = self.preferences.language;
+        let status = self.update_status.clone();
+        ui.heading(language.text("Updates"));
+        ui.add_space(16.0);
+        ui.strong(language.text("Current version"));
+        ui.label(env!("CARGO_PKG_VERSION"));
+        ui.add_space(16.0);
+        if let Some(reason) = &status.disabled {
+            ui.weak(language.text(reason));
+            return;
+        }
+        let mut automatic = self.preferences.automatic_update_check;
+        if ui
+            .checkbox(
+                &mut automatic,
+                language.text("Check for updates automatically once a day"),
+            )
+            .changed()
+        {
+            self.set_automatic_updates(automatic);
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    status.activity.is_none(),
+                    egui::Button::new(language.text("Check now")),
+                )
+                .clicked()
+            {
+                self.check_for_updates();
+            }
+            if status.activity.is_some() {
+                ui.spinner();
+            }
+        });
+        match status.checked_at.or(self.preferences.update_checked_at) {
+            Some(checked) => ui.weak(language.text(&format!(
+                "Last checked: {}",
+                checked.with_timezone(&Local).format("%d.%m.%Y %H:%M")
+            ))),
+            None => ui.weak(language.text("Not checked yet.")),
+        };
+        ui.add_space(12.0);
+        match &status.activity {
+            Some(Activity::Checking) => {
+                ui.label(language.text("Checking GitHub Releases..."));
+            }
+            Some(Activity::Downloading {
+                version,
+                received,
+                total,
+            }) => {
+                ui.label(language.text(&format!(
+                    "Downloading {version}: {} of {} MB",
+                    megabytes(*received),
+                    megabytes(*total)
+                )));
+                ui.add(
+                    egui::ProgressBar::new(*received as f32 / (*total).max(1) as f32)
+                        .desired_width(360.0),
+                );
+            }
+            Some(Activity::Verifying { version }) => {
+                ui.label(language.text(&format!("Verifying {version}...")));
+            }
+            None => {}
+        }
+        let latest = status
+            .latest
+            .clone()
+            .or_else(|| Some(self.preferences.update_latest_version.clone()))
+            .filter(|latest| !latest.is_empty());
+        if let Some(staged) = &status.staged {
+            ui.strong(language.text(&format!(
+                "Tomlook {} is downloaded and verified.",
+                staged.version
+            )));
+            ui.horizontal(|ui| {
+                if ui.button(language.text("Restart now")).clicked() {
+                    self.restart_for_update(ui.ctx());
+                }
+                if ui.button(language.text("Release notes")).clicked()
+                    && let Err(error) = tomlook::browser::open(&staged.notes_url)
+                {
+                    self.update_status.error = Some(error);
+                }
+            });
+            ui.weak(language.text("Otherwise the update is installed when you exit Tomlook."));
+        } else if let Some(offer) = &status.offer {
+            ui.strong(language.text(&format!("Tomlook {} is available.", offer.version)));
+            ui.weak(language.text(&offer.reason));
+            if ui.button(language.text("Open release page")).clicked()
+                && let Err(error) = tomlook::browser::open(&offer.notes_url)
+            {
+                self.update_status.error = Some(error);
+            }
+        } else if status.activity.is_none()
+            && status.error.is_none()
+            && latest.is_some_and(|latest| {
+                !tomlook::updater::is_newer(&latest, env!("CARGO_PKG_VERSION")).unwrap_or(true)
+            })
+        {
+            ui.label(language.text("Tomlook is up to date."));
+        }
+        if let Some(error) = &status.error {
+            ui.colored_label(ui.visuals().error_fg_color, language.text(error));
+        }
+        ui.add_space(20.0);
+        ui.weak(language.text("Tomlook makes at most one unauthenticated request per day to the GitHub Releases API. No account, calendar or usage data is sent."));
+        ui.weak(language.text("An update is installed only with a valid Tomlook release signature and matching SHA-256 hashes."));
     }
 
     pub(super) fn overlays(&mut self, context: &egui::Context) {

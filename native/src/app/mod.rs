@@ -247,6 +247,9 @@ pub struct Tomlook {
     lifecycle: Option<Arc<std::sync::Mutex<crate::Lifecycle>>>,
     interaction_trace: Option<crate::interaction_trace::Trace>,
     render_profile: Option<crate::interaction_trace::RenderProfile>,
+    updater: Option<tomlook::updater::Updater>,
+    update_status: tomlook::updater::Status,
+    update_configured: bool,
 }
 
 impl Tomlook {
@@ -260,6 +263,16 @@ impl Tomlook {
         demo_screenshot: Option<std::path::PathBuf>,
     ) -> Self {
         let preview = options.demo.is_some();
+        let update_disabled = if preview {
+            Some("Updates are disabled in the offline demo.")
+        } else if startup.is_some()
+            || interaction_trace.is_some()
+            || env!("CARGO_BIN_NAME") != "tomlook"
+        {
+            Some("Updates are disabled in measurement and diagnostic modes.")
+        } else {
+            None
+        };
         let mut startup = startup;
         if let Some(trace) = &mut startup {
             trace.mark("window_and_gl_ready");
@@ -337,6 +350,27 @@ impl Tomlook {
         app.preview = preview;
         app.demo_screenshot = demo_screenshot;
         app.tray = tray;
+        app.update_status.disabled = update_disabled.map(Into::into);
+        if update_disabled.is_none() {
+            let context = creation.egui_ctx.clone();
+            match std::env::current_exe()
+                .map_err(|error| format!("Locate Tomlook.exe for updates: {error}"))
+                .and_then(|executable| {
+                    tomlook::updater::Updater::start(executable, move || context.request_repaint())
+                }) {
+                Ok(updater) => {
+                    match shutdown.lock() {
+                        Ok(mut handle) => handle.update = Some(updater.exit_handle()),
+                        Err(_) => {
+                            app.update_status.error =
+                                Some("Updates cannot be installed on exit in this session.".into())
+                        }
+                    }
+                    app.updater = Some(updater);
+                }
+                Err(problem) => app.update_status.disabled = Some(problem),
+            }
+        }
         if startup.is_some() || interaction_trace.is_some() {
             app.lifecycle = Some(shutdown);
         }
@@ -454,6 +488,12 @@ impl Tomlook {
             lifecycle: None,
             interaction_trace: None,
             render_profile: None,
+            updater: None,
+            update_status: tomlook::updater::Status {
+                disabled: Some("Updates are not available in this session.".into()),
+                ..Default::default()
+            },
+            update_configured: false,
         }
     }
 
@@ -879,6 +919,63 @@ impl Tomlook {
         }
     }
 
+    fn receive_update(&mut self) {
+        let Some(updater) = &self.updater else {
+            return;
+        };
+        if !self.update_configured && !self.loading {
+            self.update_configured = true;
+            if let Err(error) = updater.configure(
+                self.preferences.automatic_update_check,
+                self.preferences.update_checked_at,
+            ) {
+                self.update_status.error = Some(error);
+            }
+        }
+        let Some(status) = updater.status(self.update_status.revision) else {
+            return;
+        };
+        let checked = status.checked_at.is_some()
+            && (status.checked_at != self.preferences.update_checked_at
+                || status.latest.as_deref().unwrap_or_default()
+                    != self.preferences.update_latest_version);
+        self.update_status = status;
+        if checked && !self.loading {
+            self.preferences.update_checked_at = self.update_status.checked_at;
+            self.preferences.update_latest_version =
+                self.update_status.latest.clone().unwrap_or_default();
+            self.save_preferences();
+        }
+    }
+
+    fn check_for_updates(&mut self) {
+        if let Some(updater) = &self.updater {
+            match updater.check_now() {
+                Ok(()) => self.update_status.error = None,
+                Err(error) => self.update_status.error = Some(error),
+            }
+        }
+    }
+
+    fn set_automatic_updates(&mut self, enabled: bool) {
+        self.preferences.automatic_update_check = enabled;
+        self.save_preferences();
+        if let Some(updater) = &self.updater
+            && let Err(error) = updater.configure(enabled, self.preferences.update_checked_at)
+        {
+            self.update_status.error = Some(error);
+        }
+    }
+
+    fn restart_for_update(&mut self, context: &egui::Context) {
+        if let Some(updater) = &self.updater
+            && self.update_status.staged.is_some()
+        {
+            updater.request_restart();
+            self.exit(context);
+        }
+    }
+
     fn select(&mut self, index: usize) {
         self.selected = Some(index);
         self.insights_expanded = false;
@@ -982,6 +1079,7 @@ impl Tomlook {
 impl eframe::App for Tomlook {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive();
+        self.receive_update();
         self.receive_ask_inputs(context);
         self.sync_detached_ask(context);
         if let Some(trace) = &self.startup
@@ -1179,6 +1277,14 @@ impl eframe::App for Tomlook {
                     if status_text(ui, kind.server(), language.text(&(format!("{}: {state}", kind.label())))).on_hover_text(language.text(&status.message)).clicked() {
                         self.connection_panel = Some(ConnectionPanel::External(kind));
                     }
+                }
+                if let Some(staged) = &self.update_status.staged
+                    && status_text(ui, "status-update", language.text(&format!("Update {} ready", staged.version)))
+                        .on_hover_text(language.text("A verified update is ready. Restart from Settings, or it is installed when you exit Tomlook."))
+                        .clicked()
+                {
+                    self.preferences_open = true;
+                    self.preferences_section = PreferencesSection::Updates;
                 }
                 }
                 ui.weak(language.text(&(format!("{} cached meetings", self.calendar.events.len())))).on_hover_text(

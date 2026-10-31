@@ -31,5 +31,6 @@ pub mod showcase;
 pub mod source_index;
 pub mod storage;
 pub mod telemetry;
+pub mod updater;
 pub mod worker;
 pub mod workiq;

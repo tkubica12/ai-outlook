@@ -46,6 +46,37 @@ pub fn acquire_or_restore(state: &Path) -> Result<Option<File>, String> {
     acquire(state).map(Some)
 }
 
+/// Used by the relaunch after an update: waits for the previous process to exit,
+/// then takes the profile without ever signalling the closing instance.
+pub fn acquire_after_update(
+    state: &Path,
+    previous: u32,
+    timeout: std::time::Duration,
+) -> Result<File, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    #[cfg(windows)]
+    if previous != std::process::id() {
+        windows::wait_for_exit(previous, timeout);
+    }
+    #[cfg(not(windows))]
+    let _ = previous;
+    loop {
+        match acquire(state) {
+            Ok(owner) => return Ok(owner),
+            Err(error)
+                if error.contains("already open") && std::time::Instant::now() < deadline =>
+            {
+                // Pre-window handover only; the UI has not started yet.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) if error.contains("already open") => {
+                return Err("The previous Tomlook is still closing after an update. Open Tomlook again in a moment.".into());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[cfg(windows)]
 pub use windows::{Activation, Listener};
 
@@ -76,6 +107,20 @@ mod windows {
             timeout: u32,
         ) -> u32;
         fn GetLastError() -> u32;
+        fn OpenProcess(access: u32, inherit: i32, process: u32) -> *mut std::ffi::c_void;
+        fn WaitForSingleObject(handle: *mut std::ffi::c_void, timeout: u32) -> u32;
+    }
+
+    /// Waits up to `timeout` for a process to exit; an unknown process counts as exited.
+    pub(super) fn wait_for_exit(process: u32, timeout: Duration) {
+        // SYNCHRONIZE only; the handle cannot read or control the previous process.
+        let raw = unsafe { OpenProcess(0x0010_0000, 0, process) };
+        if raw.is_null() {
+            return;
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        unsafe { WaitForSingleObject(handle.as_raw_handle(), milliseconds) };
     }
 
     fn event_name(state: &Path) -> Result<Vec<u16>, String> {

@@ -27,6 +27,9 @@ pub struct Preferences {
     pub repository_collections: Vec<PathBuf>,
     pub cloud_context_folder: String,
     pub prompts: crate::prompts::Prompts,
+    pub automatic_update_check: bool,
+    pub update_checked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub update_latest_version: String,
 }
 
 impl Default for Preferences {
@@ -46,6 +49,9 @@ impl Default for Preferences {
             repository_collections: Vec::new(),
             cloud_context_folder: String::new(),
             prompts: crate::prompts::Prompts::default(),
+            automatic_update_check: true,
+            update_checked_at: None,
+            update_latest_version: String::new(),
         }
     }
 }

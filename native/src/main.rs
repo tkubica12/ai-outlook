@@ -11,6 +11,7 @@ struct Lifecycle {
     ai: Option<tomlook::ai::Shutdown>,
     storage: Option<tomlook::worker::Shutdown>,
     startup: Option<serde_json::Value>,
+    update: Option<tomlook::updater::ExitHandle>,
 }
 
 /// Opt-in measurement mode: records the first presented calendar frame, then exits normally.
@@ -41,6 +42,7 @@ struct Launch {
     fixture: Option<tomlook::fixture_cache::Manifest>,
     screenshot: Option<PathBuf>,
     idle: bool,
+    after_update: Option<u32>,
 }
 
 fn options() -> Result<Launch, String> {
@@ -72,8 +74,16 @@ fn parse_options(
     let mut fixture_cache = false;
     let mut screenshot = None;
     let mut idle = false;
+    let mut after_update = None;
     while let Some(arg) = args.next() {
         match arg.to_str() {
+            Some(tomlook::updater::AFTER_UPDATE) => {
+                after_update = Some(
+                    args.next()
+                        .and_then(|value| value.to_str()?.parse::<u32>().ok())
+                        .ok_or("--after-update needs the previous Tomlook process id")?,
+                );
+            }
             Some("--demo-screenshot") => {
                 screenshot = Some(
                     args.next()
@@ -237,6 +247,13 @@ fn parse_options(
     if env!("CARGO_BIN_NAME") == "tomlook-acceptance" && fixture.is_none() {
         return Err("Acceptance measurements require a seeded frozen fixture cache".into());
     }
+    if after_update.is_some()
+        && (result.demo.is_some() || trace.is_some() || interactions.is_some() || fixture.is_some())
+    {
+        return Err(
+            "--after-update is only used when Tomlook restarts itself after an update".into(),
+        );
+    }
     Ok(Launch {
         worker: result,
         startup: trace,
@@ -244,6 +261,7 @@ fn parse_options(
         fixture,
         screenshot,
         idle,
+        after_update,
     })
 }
 
@@ -257,6 +275,7 @@ fn main() -> eframe::Result {
         fixture,
         screenshot,
         idle,
+        after_update,
     } = match options() {
         Ok(options) => options,
         Err(error) => {
@@ -265,7 +284,15 @@ fn main() -> eframe::Result {
         }
     };
     let normal_launch = trace.is_none() && interactions.is_none() && options.demo.is_none();
-    let _ownership = match if normal_launch {
+    let _ownership = match if let Some(previous) = after_update {
+        // A relaunch after an update waits for the old process instead of restoring it.
+        tomlook::instance::acquire_after_update(
+            &options.state,
+            previous,
+            std::time::Duration::from_secs(30),
+        )
+        .map(Some)
+    } else if normal_launch {
         tomlook::instance::acquire_or_restore(&options.state)
     } else {
         tomlook::instance::acquire(&options.state).map(Some)
@@ -396,7 +423,7 @@ fn main() -> eframe::Result {
     );
     // The UI is already closed; shutdown waiting never blocks a UI callback.
     let mut errors = Vec::new();
-    let startup_record = {
+    let (startup_record, update) = {
         let mut coordinator = match shutdown.lock() {
             Ok(coordinator) => coordinator,
             Err(poisoned) => {
@@ -437,8 +464,21 @@ fn main() -> eframe::Result {
                 }
             }
         }
-        coordinator.startup.take()
+        (coordinator.startup.take(), coordinator.update.take())
     };
+    // Workers have stopped; a verified staged update replaces the executable now.
+    let mut relaunch = None;
+    if let Some((staged, restart)) = update.and_then(|update| update.finish()) {
+        if let Err(error) = tomlook::updater::apply(&staged) {
+            errors.push(format!(
+                "Tomlook {} was not installed: {error}",
+                staged.version
+            ));
+        }
+        if restart {
+            relaunch = Some(staged.target);
+        }
+    }
     if let Some(path) = trace_path {
         let mut record = startup_record.unwrap_or_else(|| {
             serde_json::json!({ "error": "Window closed before the measurement finished", "threshold_pass": false })
@@ -451,6 +491,18 @@ fn main() -> eframe::Result {
     }
     if !errors.is_empty() {
         show_error(errors.join("\n"));
+    }
+    // After any error dialog closes, so the relaunch's bounded wait covers only process exit.
+    if let Some(executable) = relaunch
+        && let Err(error) = tomlook::updater::relaunch(
+            &executable,
+            tomlook::updater::relaunch_arguments(std::env::args_os().skip(1)),
+        )
+    {
+        show_error(error);
+        std::process::exit(1);
+    }
+    if !errors.is_empty() {
         std::process::exit(1);
     }
     if let Err(error) = &result {
@@ -647,6 +699,42 @@ mod tests {
         let created = process_created().unwrap();
         assert!(created > std::time::UNIX_EPOCH);
         assert!(created <= std::time::SystemTime::now());
+    }
+
+    #[test]
+    fn after_update_handover_is_only_accepted_for_normal_launches() {
+        let root = tempfile::tempdir().unwrap();
+        let parse = |args: Vec<std::ffi::OsString>| {
+            parse_options(
+                args.into_iter(),
+                root.path().join("personal"),
+                root.path().into(),
+            )
+        };
+        assert_eq!(
+            parse(vec!["--after-update".into(), "4242".into()])
+                .unwrap()
+                .after_update,
+            Some(4242)
+        );
+        assert!(parse(vec!["--after-update".into()]).is_err());
+        assert!(parse(vec!["--after-update".into(), "not-a-pid".into()]).is_err());
+        assert!(
+            parse(vec![
+                "--demo".into(),
+                "--state".into(),
+                root.path().join("fresh").into_os_string(),
+                "--after-update".into(),
+                "4242".into(),
+            ])
+            .is_err()
+        );
+        assert_eq!(
+            tomlook::updater::relaunch_arguments(
+                ["--legacy-root", "D:\\data", "--after-update", "17"].map(std::ffi::OsString::from)
+            ),
+            ["--legacy-root", "D:\\data"].map(std::ffi::OsString::from)
+        );
     }
 
     #[test]

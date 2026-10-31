@@ -3799,7 +3799,7 @@ dependencies = [
 
 [[package]]
 name = "tomlook"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3810,8 +3810,10 @@ dependencies = [
  "image",
  "pulldown-cmark",
  "reqwest",
+ "ring",
  "rmcp",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -3819,6 +3821,7 @@ dependencies = [
  "tokio",
  "tray-icon",
  "url",
+ "zip",
 ]
 
 [[package]]

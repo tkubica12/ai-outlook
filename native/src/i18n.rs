@@ -2036,6 +2036,151 @@ pub const TEXTS: &[(&str, &str)] = &[
         "Tool results captured; no cited links. Claims remain unverified.",
         "Výsledky byly uloženy, ale bez odkazů. Tvrzení zůstávají neověřená.",
     ),
+    ("Updates", "Aktualizace"),
+    ("Current version", "Aktuální verze"),
+    (
+        "Check for updates automatically once a day",
+        "Automaticky kontrolovat aktualizace jednou denně",
+    ),
+    ("Check now", "Zkontrolovat nyní"),
+    ("Not checked yet.", "Zatím nezkontrolováno."),
+    ("Checking GitHub Releases...", "Kontroluji GitHub Releases…"),
+    ("Restart now", "Restartovat nyní"),
+    ("Release notes", "Poznámky k vydání"),
+    (
+        "Otherwise the update is installed when you exit Tomlook.",
+        "Jinak se aktualizace nainstaluje při ukončení Tomlooku.",
+    ),
+    ("Open release page", "Otevřít stránku vydání"),
+    ("Tomlook is up to date.", "Tomlook je aktuální."),
+    (
+        "Tomlook makes at most one unauthenticated request per day to the GitHub Releases API. No account, calendar or usage data is sent.",
+        "Tomlook se nejvýše jednou denně anonymně dotáže rozhraní GitHub Releases API. Neodesílá žádné údaje o účtu, kalendáři ani používání.",
+    ),
+    (
+        "An update is installed only with a valid Tomlook release signature and matching SHA-256 hashes.",
+        "Aktualizace se nainstaluje jen s platným podpisem vydání Tomlooku a se shodnými otisky SHA-256.",
+    ),
+    (
+        "A verified update is ready. Restart from Settings, or it is installed when you exit Tomlook.",
+        "Ověřená aktualizace je připravená. Restartujte Tomlook v Nastavení, jinak se nainstaluje při jeho ukončení.",
+    ),
+    (
+        "Updates are not available in this session.",
+        "Aktualizace nejsou v této relaci k dispozici.",
+    ),
+    (
+        "Updates are disabled in the offline demo.",
+        "V offline ukázce jsou aktualizace vypnuté.",
+    ),
+    (
+        "Updates are disabled in measurement and diagnostic modes.",
+        "V měřicích a diagnostických režimech jsou aktualizace vypnuté.",
+    ),
+    (
+        "Updates cannot be installed on exit in this session.",
+        "V této relaci nelze aktualizaci nainstalovat při ukončení.",
+    ),
+    (
+        "The update checker is busy; try again in a moment.",
+        "Kontrola aktualizací je zaneprázdněná; zkuste to za chvíli.",
+    ),
+    (
+        "The update signature is invalid; the update was rejected.",
+        "Podpis aktualizace je neplatný; aktualizace byla odmítnuta.",
+    ),
+    (
+        "The downloaded archive does not match its signed SHA-256; it was discarded.",
+        "Stažený archiv neodpovídá podepsanému otisku SHA-256; byl zahozen.",
+    ),
+    (
+        "The extracted Tomlook.exe does not match its signed SHA-256; it was discarded.",
+        "Rozbalený Tomlook.exe neodpovídá podepsanému otisku SHA-256; byl zahozen.",
+    ),
+    (
+        "The update archive contains an unsafe path; it was rejected.",
+        "Archiv aktualizace obsahuje nebezpečnou cestu; byl odmítnut.",
+    ),
+    (
+        "The update archive contains an unexpected entry; it was rejected.",
+        "Archiv aktualizace obsahuje neočekávanou položku; byl odmítnut.",
+    ),
+    (
+        "GitHub Releases could not be reached; check the network and try again.",
+        "GitHub Releases není dostupný; zkontrolujte připojení a zkuste to znovu.",
+    ),
+    (
+        "GitHub API rate limit reached; Tomlook will try again later.",
+        "GitHub API dočasně omezil počet požadavků; Tomlook to zkusí později.",
+    ),
+    (
+        "No published Tomlook release was found.",
+        "Nenašlo se žádné zveřejněné vydání Tomlooku.",
+    ),
+    (
+        "The latest release has no signed update information.",
+        "Nejnovější vydání nemá podepsané informace o aktualizaci.",
+    ),
+    (
+        "A GitHub response exceeded its size limit; the update was rejected.",
+        "Odpověď GitHubu překročila povolenou velikost; aktualizace byla odmítnuta.",
+    ),
+    (
+        "Signed update information does not match the GitHub release; the update was rejected.",
+        "Podepsané informace o aktualizaci neodpovídají vydání na GitHubu; aktualizace byla odmítnuta.",
+    ),
+    (
+        "GitHub returned an unreadable release description.",
+        "GitHub vrátil nečitelný popis vydání.",
+    ),
+    (
+        "Signed update information is not readable.",
+        "Podepsané informace o aktualizaci nejsou čitelné.",
+    ),
+    (
+        "Signed update information is invalid; the update was rejected.",
+        "Podepsané informace o aktualizaci jsou neplatné; aktualizace byla odmítnuta.",
+    ),
+    (
+        "The update archive could not be read; it was discarded.",
+        "Archiv aktualizace nelze přečíst; byl zahozen.",
+    ),
+    (
+        "The update archive does not contain Tomlook.exe.",
+        "Archiv aktualizace neobsahuje Tomlook.exe.",
+    ),
+    (
+        "The update could not be saved next to Tomlook.exe.",
+        "Aktualizaci nelze uložit vedle souboru Tomlook.exe.",
+    ),
+    (
+        "The update download stopped because Tomlook is closing.",
+        "Stahování aktualizace se zastavilo, protože se Tomlook ukončuje.",
+    ),
+    (
+        "Tomlook can replace itself only as Tomlook.exe; download the update from the release page.",
+        "Tomlook se umí nahradit jen jako Tomlook.exe; stáhněte aktualizaci ze stránky vydání.",
+    ),
+    (
+        "Tomlook cannot write to its own folder; download the update from the release page.",
+        "Tomlook nemůže zapisovat do své složky; stáhněte aktualizaci ze stránky vydání.",
+    ),
+    (
+        "The staged update changed after verification and was not installed.",
+        "Připravená aktualizace se po ověření změnila a nebyla nainstalována.",
+    ),
+    (
+        "A previous Tomlook update is still in use; exit all Tomlook windows and try again.",
+        "Předchozí aktualizace Tomlooku se stále používá; ukončete všechna okna Tomlooku a zkuste to znovu.",
+    ),
+    (
+        "Development builds are not updated automatically; rebuild them instead.",
+        "Vývojová sestavení se automaticky neaktualizují; sestavte je znovu.",
+    ),
+    (
+        "The update checker could not start.",
+        "Kontrolu aktualizací nelze spustit.",
+    ),
 ];
 
 const PATTERNS: &[(&str, &str)] = &[
@@ -2155,6 +2300,16 @@ const PATTERNS: &[(&str, &str)] = &[
     ("Sync {}/{} · offline", "Načteno {0}/{1} · bez připojení"),
     ("Sync {}/{} · retrying", "Načteno {0}/{1} · opakuji"),
     ("Sync {}/{}", "Načteno {0}/{1}"),
+    ("Update {} ready", "Aktualizace {0} připravena"),
+    ("Last checked: {}", "Poslední kontrola: {0}"),
+    ("Downloading {}: {} of {} MB", "Stahuji {0}: {1} z {2} MB"),
+    ("Verifying {}...", "Ověřuji {0}…"),
+    (
+        "Tomlook {} is downloaded and verified.",
+        "Tomlook {0} je stažený a ověřený.",
+    ),
+    ("Tomlook {} is available.", "K dispozici je Tomlook {0}."),
+    ("GitHub returned HTTP {}.", "GitHub vrátil HTTP {0}."),
 ];
 
 #[cfg(test)]
@@ -2200,6 +2355,20 @@ mod tests {
         assert_eq!(
             Language::Cs.text("Waiting\nWaiting for an execution slot"),
             "Čeká\nČeká na volné místo pro zpracování"
+        );
+        for message in crate::updater::MESSAGES {
+            assert!(
+                TEXTS.iter().any(|(en, _)| en == message),
+                "Missing Czech update message: {message}"
+            );
+        }
+        assert_eq!(
+            Language::Cs.text("Downloading 0.8.0: 1.5 of 20.0 MB"),
+            "Stahuji 0.8.0: 1.5 z 20.0 MB"
+        );
+        assert_eq!(
+            Language::Cs.text("Update 0.8.0 ready"),
+            "Aktualizace 0.8.0 připravena"
         );
     }
 
@@ -2319,6 +2488,8 @@ mod tests {
             serde_json::from_str(r#"{"dark":false}"#).unwrap();
         assert_eq!(preferences.language, Language::En);
         assert!(!preferences.hide_unconfirmed);
+        assert!(preferences.automatic_update_check);
+        assert!(preferences.update_checked_at.is_none());
         let date = NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
         assert_eq!(Language::Cs.month(date), "říjen 2026");
         assert_eq!(Language::Cs.date(date, true), "neděle, 11. 10. 2026");

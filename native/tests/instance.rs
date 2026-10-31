@@ -173,3 +173,39 @@ fn a_secondary_process_only_signals_the_owned_profile() {
     drop(owner);
     acquire(&profile).unwrap();
 }
+
+#[test]
+fn an_update_relaunch_waits_for_the_previous_process_instead_of_restoring_it() {
+    use tomlook::instance::acquire_after_update;
+    let root = tempfile::tempdir().unwrap();
+    let profile = root.path().join("updated");
+    let mut previous = std::process::Command::new("cmd")
+        .args(["/d", "/c", "ping -n 2 127.0.0.1 >nul"])
+        .spawn()
+        .unwrap();
+    let owner = acquire_after_update(&profile, previous.id(), Duration::from_secs(30)).unwrap();
+    assert!(
+        previous.try_wait().unwrap().is_some(),
+        "The relaunch must not take the profile before the previous process exits"
+    );
+    drop(owner);
+
+    let owner = acquire(&profile).unwrap();
+    let (sender, received) = mpsc::channel();
+    let mut listener = Activation::new(&profile)
+        .unwrap()
+        .listen(move |result| sender.send(result).unwrap())
+        .unwrap();
+    let started = std::time::Instant::now();
+    let error =
+        acquire_after_update(&profile, std::process::id(), Duration::from_millis(300)).unwrap_err();
+    assert!(error.contains("still closing"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        received.recv_timeout(Duration::from_millis(100)).is_err(),
+        "A relaunch after an update must never restore the closing instance"
+    );
+    listener.shutdown().unwrap();
+    drop(owner);
+    acquire_after_update(&profile, u32::MAX - 1, Duration::from_secs(1)).unwrap();
+}

@@ -2,7 +2,7 @@
 fn settings_content_has_clear_padding_from_navigation_in_both_sections_and_themes() {
     for dark in [true, false] {
         for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
-            for section in [PreferencesSection::Display, PreferencesSection::Prompts] {
+            for section in [PreferencesSection::Display, PreferencesSection::Prompts, PreferencesSection::Updates] {
                 let mut app = Tomlook::initial(None, None, None);
                 app.preferences.dark = dark;
                 app.preferences.language = language;
@@ -29,6 +29,7 @@ fn settings_content_has_clear_padding_from_navigation_in_both_sections_and_theme
                 let heading = language.text(match section {
                     PreferencesSection::Display => "Display",
                     PreferencesSection::Prompts => "AI prompts",
+                    PreferencesSection::Updates => "Updates",
                 });
                 let content = output.shapes.iter().find_map(|shape| match &shape.shape {
                     egui::epaint::Shape::Text(text)
@@ -4620,4 +4621,92 @@ fn person_addresses_and_photo_errors_are_bounded() {
         .unwrap();
     app.receive();
     assert!(app.photos.is_empty());
+}
+
+#[test]
+fn update_settings_offer_restart_only_for_verified_staged_updates() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let render = |app: &mut Tomlook| {
+            let context = egui::Context::default();
+            let mut text = String::new();
+            for _ in 0..2 {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(1400.0, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| app.preferences_dialog(ui.ctx()),
+                );
+                output.textures_delta.clear();
+                text.clear();
+                for shape in &output.shapes {
+                    append_shape_text(&shape.shape, &mut text);
+                }
+            }
+            text
+        };
+        let mut app = Tomlook::initial(None, None, None);
+        app.preferences.language = language;
+        app.preferences_open = true;
+        app.preferences_section = PreferencesSection::Updates;
+        let text = render(&mut app);
+        assert!(
+            text.contains(
+                language
+                    .text("Updates are not available in this session.")
+                    .as_ref()
+            )
+        );
+        assert!(!text.contains(language.text("Check now").as_ref()));
+        app.update_status = tomlook::updater::Status {
+            staged: Some(tomlook::updater::Staged {
+                version: "9.9.9".into(),
+                notes_url: tomlook::updater::release_page("v9.9.9"),
+                directory: "C:\\staging\\9.9.9".into(),
+                target: "C:\\Tomlook\\Tomlook.exe".into(),
+                executable_sha256: "0".repeat(64),
+            }),
+            ..Default::default()
+        };
+        let text = render(&mut app);
+        assert!(text.contains(language.text("Restart now").as_ref()));
+        assert!(
+            text.contains(
+                language
+                    .text("Tomlook 9.9.9 is downloaded and verified.")
+                    .as_ref()
+            )
+        );
+        assert!(
+            text.contains(
+                language
+                    .text("Otherwise the update is installed when you exit Tomlook.")
+                    .as_ref()
+            )
+        );
+        assert!(text.contains(language.text("Check now").as_ref()));
+        app.update_status = tomlook::updater::Status {
+            error: Some(tomlook::updater::INVALID_SIGNATURE.into()),
+            ..Default::default()
+        };
+        let text = render(&mut app);
+        assert!(text.contains(language.text(tomlook::updater::INVALID_SIGNATURE).as_ref()));
+        assert!(!text.contains(language.text("Restart now").as_ref()));
+        assert!(!text.contains(language.text("Open release page").as_ref()));
+        assert!(!text.contains(language.text("Tomlook is up to date.").as_ref()));
+        app.update_status = tomlook::updater::Status {
+            offer: Some(tomlook::updater::Offer {
+                version: "9.9.9".into(),
+                notes_url: tomlook::updater::release_page("v9.9.9"),
+                reason: "Tomlook cannot write to its own folder; download the update from the release page.".into(),
+            }),
+            ..Default::default()
+        };
+        let text = render(&mut app);
+        assert!(text.contains(language.text("Open release page").as_ref()));
+        assert!(!text.contains(language.text("Restart now").as_ref()));
+    }
 }
