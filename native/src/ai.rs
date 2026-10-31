@@ -112,6 +112,7 @@ pub enum Command {
     DailyAiLimit(u32),
     Photos(Vec<String>),
     Companies(Vec<String>),
+    SuggestPrompt(Box<crate::feedback::SuggestionRequest>),
     Stop,
 }
 
@@ -227,6 +228,10 @@ pub enum Notice {
     },
     Photos(Vec<(String, Result<Option<egui::ColorImage>, String>)>),
     Companies(Vec<(String, Result<Option<egui::ColorImage>, String>)>),
+    PromptSuggestion {
+        id: u64,
+        result: Result<crate::feedback::Suggestion, String>,
+    },
     Stopped,
 }
 
@@ -270,6 +275,7 @@ struct Pending {
     chat_recovered: Option<Notice>,
     photos: Option<Notice>,
     companies: Option<Notice>,
+    prompt_suggestion: Option<Notice>,
     stopped: bool,
 }
 
@@ -287,6 +293,7 @@ impl Pending {
             .or_else(|| self.chat_recovered.take())
             .or_else(|| self.photos.take())
             .or_else(|| self.companies.take())
+            .or_else(|| self.prompt_suggestion.take())
             .or_else(|| self.sources.take())
             .or_else(|| self.usage.take())
             .or_else(|| self.diagnostic.take())
@@ -335,6 +342,7 @@ impl Notices {
             Notice::Stopped => pending.stopped = true,
             Notice::Photos(_) => pending.photos = Some(notice),
             Notice::Companies(_) => pending.companies = Some(notice),
+            Notice::PromptSuggestion { .. } => pending.prompt_suggestion = Some(notice),
         }
         drop(pending);
         self.changed.notify_all();
@@ -458,6 +466,10 @@ enum Completion {
         quota_day: Option<NaiveDate>,
     },
     Usage(Result<crate::telemetry::Summary, String>),
+    PromptSuggestion {
+        id: u64,
+        result: Result<crate::feedback::Suggestion, String>,
+    },
 }
 
 #[derive(Debug)]
@@ -1334,6 +1346,25 @@ impl Engine {
                                 Some(Command::Cancel(id)) => {
                                     if let Some((cancel, _)) = cancellations.get(&id) { cancel_request(cancel); }
                                 }
+                                Some(Command::SuggestPrompt(request)) => {
+                                    let key = request.id | SUGGESTION_BIT;
+                                    let denied = if demo { Some("Offline demo never sends AI requests.") }
+                                        else if harness.is_none() { Some("Connect GitHub Copilot first. No AI request was made.") }
+                                        else if cancellations.keys().any(|id| id & SUGGESTION_BIT != 0 && id & (1 << 63) == 0) || cancellations.len() >= 3 {
+                                            Some("AI execution capacity is busy; nothing was submitted")
+                                        } else { None };
+                                    if let Some(reason) = denied {
+                                        notify(Notice::PromptSuggestion { id: request.id, result: Err(reason.into()) });
+                                    } else if let Some(harness) = harness.clone() {
+                                        let (cancel, cancelled) = watch::channel(false);
+                                        cancellations.insert(key, (cancel, false));
+                                        let telemetry = telemetry.clone();
+                                        tasks.spawn(async move {
+                                            let result = suggest_prompt(harness, &request, cancelled, telemetry).await;
+                                            Completion::PromptSuggestion { id: request.id, result }
+                                        });
+                                    }
+                                }
                                 Some(Command::Prepare(request)) => {
                                     let id = request.id | (1 << 63);
                                     let denied = if stopping { Some("AI is stopping; nothing was submitted") }
@@ -1636,6 +1667,14 @@ impl Engine {
                                 }
                                 Some(Ok(Completion::ChatRecovered { account, result })) => {
                                     notify(Notice::ChatRecovered { account, result });
+                                }
+                                Some(Ok(Completion::PromptSuggestion { id, result })) => {
+                                    if let Err(error) = &result { telemetry.failure("prompt_suggestion", error, Some(id | SUGGESTION_BIT)); }
+                                    next_usage = Instant::now();
+                                    let result = finish_request(id | SUGGESTION_BIT, &mut cancellations, "", "", stopping, result);
+                                    active.store(cancellations.len(), Ordering::Release);
+                                    if let Some(wake) = &wake { let _ = wake.try_send(crate::worker::Command::Wake); }
+                                    notify(Notice::PromptSuggestion { id, result });
                                 }
                                 Some(Ok(Completion::Prepared { request, connector_revision, result, quota_day })) => {
                                     if let Err(error) = &result { telemetry.failure("preparation", error, Some(request.id)); }
@@ -2472,6 +2511,7 @@ async fn process_recap(
     let mut payload = previous.ok_or("Meeting transcript contained no usable source text")?;
     payload["sources"] = materials.sources.into();
     payload["tomlook_recap"] = true.into();
+    payload[crate::feedback::PROMPT_FIELD] = crate::feedback::prompt_hash(&request.prompts.recap).into();
     payload["completed_at"] = chrono::Utc::now().to_rfc3339().into();
     payload["evidence_status"] = "AI notes from the original transcript and available meeting chat; verify assignments against sources".into();
     for gap in materials.gaps {
@@ -2485,6 +2525,130 @@ async fn process_recap(
             .push(gap.into());
     }
     Ok(Some(payload))
+}
+
+const SUGGESTION_BIT: u64 = 1 << 62;
+const SUGGESTION_SECONDS: u64 = 300;
+const SUGGESTION_QUOTA: &str = "Daily AI request limit reached; no prompt suggestion was requested.";
+
+/// One bounded, tool-free Thorough-profile request that drafts a prompt revision from feedback.
+/// The validated draft is returned for review only; nothing is saved here.
+async fn suggest_prompt(
+    harness: Arc<Harness>,
+    request: &crate::feedback::SuggestionRequest,
+    mut cancel: watch::Receiver<bool>,
+    telemetry: Arc<crate::telemetry::Service>,
+) -> Result<crate::feedback::Suggestion, String> {
+    let prompt = request.prompt()?;
+    if harness.redactor.contains(&prompt) {
+        return Err("The prompt or feedback contains an app credential; nothing was submitted".into());
+    }
+    let key = request.id | SUGGESTION_BIT;
+    if *cancel.borrow() {
+        return Err("Cancelled before the prompt suggestion was sent".into());
+    }
+    if !telemetry.reserve(key).await? {
+        telemetry.record("accounting", "daily_limit_reached", Some(key), 0);
+        return Err(SUGGESTION_QUOTA.into());
+    }
+    telemetry.record("request", "prompt_suggestion_admitted", Some(key), 0);
+    let session = tokio::select! {
+        _ = cancel.changed() => return Err("Cancelled before the prompt suggestion was sent".into()),
+        result = tokio::time::timeout(Duration::from_secs(30), harness.prompt_review_session()) =>
+            result.map_err(|_| "Creating the prompt suggestion session timed out".to_owned())??,
+    };
+    let mut subscription = session.subscribe();
+    let result: Result<String, String> = async {
+        tokio::select! {
+            _ = cancel.changed() => {
+                return Err("Cancelled while submitting the prompt suggestion; provider outcome may be unknown".into());
+            }
+            sent = tokio::time::timeout(Duration::from_secs(30), session.send(MessageOptions::new(prompt))) => {
+                sent.map_err(|_| "Sending the SDK request timed out".to_string())?
+                    .map_err(|e| format!("SDK request failed: {e}"))?;
+            }
+        }
+        let timeout = tokio::time::sleep(Duration::from_secs(SUGGESTION_SECONDS));
+        tokio::pin!(timeout);
+        let mut answer = None;
+        loop {
+            tokio::select! {
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        return Err("Prompt suggestion cancelled; no draft was produced.".into());
+                    }
+                }
+                _ = &mut timeout => return Err(format!("Prompt suggestion exceeded its {SUGGESTION_SECONDS}-second limit; retry explicitly")),
+                event = subscription.recv() => {
+                    let event = event.map_err(|e| format!("SDK event stream failed: {e}"))?;
+                    match event.event_type.as_str() {
+                        "assistant.usage" => match crate::telemetry::Metrics::from_sdk(&event.data) {
+                            Ok(metrics) => {
+                                if telemetry.observe(key, &event.id, metrics).await.is_err() { telemetry.usage_failure(); }
+                            }
+                            Err(_) => telemetry.usage_failure(),
+                        },
+                        "assistant.message" => {
+                            if let Some(text) = event.data.get("content").and_then(|v| v.as_str()) {
+                                if text.len() > crate::feedback::SUGGESTION_OUTPUT_LIMIT {
+                                    return Err("AI returned an oversized prompt suggestion; nothing was changed.".into());
+                                }
+                                answer = Some(text.to_owned());
+                            }
+                        }
+                        "session.error" => return Err("Copilot reported a session error; no prompt suggestion was produced.".into()),
+                        "session.idle" => {
+                            return answer.filter(|text| !text.trim().is_empty())
+                                .ok_or_else(|| "AI returned an empty prompt suggestion; nothing was changed.".into());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    .await;
+    let aborted = if result.is_err() {
+        tokio::time::timeout(Duration::from_secs(5), session.abort())
+            .await
+            .map_err(|_| "Cancel SDK session timed out".to_string())
+            .and_then(|r| r.map_err(|e| format!("Cancel SDK session: {e}")))
+    } else {
+        Ok(())
+    };
+    let until = Instant::now() + Duration::from_millis(100);
+    for _ in 0..64 {
+        match tokio::time::timeout_at(until.into(), subscription.recv()).await {
+            Ok(Ok(event)) if event.event_type == "assistant.usage" => {
+                match crate::telemetry::Metrics::from_sdk(&event.data) {
+                    Ok(metrics) => {
+                        if telemetry.observe(key, &event.id, metrics).await.is_err() {
+                            telemetry.usage_failure();
+                        }
+                    }
+                    Err(_) => telemetry.usage_failure(),
+                }
+            }
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    let disconnected = tokio::time::timeout(Duration::from_secs(5), session.disconnect())
+        .await
+        .map_err(|_| "Detach SDK session timed out".to_string())
+        .and_then(|r| r.map_err(|e| format!("Detach SDK session: {e}")));
+    match (result, aborted, disconnected) {
+        (Ok(text), Ok(()), Ok(())) => {
+            crate::feedback::parse_suggestion(request, &harness.redactor.text(&text))
+        }
+        (result, aborted, disconnected) => {
+            let errors = [result.err(), aborted.err(), disconnected.err()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            Err(harness.redactor.text(&errors.join("; ")))
+        }
+    }
 }
 
 async fn ask(

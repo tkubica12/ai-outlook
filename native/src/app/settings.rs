@@ -1,4 +1,5 @@
 use super::*;
+use super::feedback::Panel;
 use super::palette::command_matches_in;
 
 pub(super) fn insight_state(state: tomlook::scheduler::State) -> &'static str {
@@ -169,6 +170,7 @@ impl Tomlook {
                                     }
                                 });
                                 ui.weak(language.text("Saved notes are not reprocessed when prompts change."));
+                                self.prompt_feedback(ui);
                             }
                             PreferencesSection::Notifications => self.notification_preferences(ui),
                             PreferencesSection::Updates => self.update_preferences(ui),
@@ -820,7 +822,18 @@ impl Tomlook {
                 .resizable(true)
                 .show(context, |ui| {
                     if let Some(index) = self.selected {
-                        ui.heading(language.text(&self.calendar.events[index].title));
+                        let document_feedback = self.document_feedback();
+                        ui.horizontal(|ui| {
+                            ui.heading(language.text(&self.calendar.events[index].title));
+                            if let Some((output, target)) = &document_feedback {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    self.feedback_thumbs(ui, output, target, Panel::Expanded);
+                                });
+                            }
+                        });
+                        if let Some((output, target)) = &document_feedback {
+                            self.feedback_reasons(ui, output, target, Panel::Expanded);
+                        }
                         ui.separator();
                     }
                     egui::ScrollArea::vertical().show(ui, |ui| self.render_insights(ui, true));

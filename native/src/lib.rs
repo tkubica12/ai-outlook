@@ -15,6 +15,7 @@ mod credentials;
 pub mod decision;
 pub mod evidence;
 pub mod event_creation;
+pub mod feedback;
 pub mod fixture_cache;
 mod html_text;
 pub mod i18n;

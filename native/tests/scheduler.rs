@@ -1687,6 +1687,8 @@ fn saturated_worker_waits_for_cancellation_and_persists_only_the_current_manual_
         .clone();
     let mut expected = validate_prepared(&raw.to_string(), &fingerprint).unwrap();
     expected["tomlook_event_fingerprint"] = promoted.event.fingerprint().into();
+    expected[tomlook::feedback::PROMPT_FIELD] =
+        tomlook::feedback::prompt_hash(tomlook::prompts::Kind::Preparation.default_text()).into();
     assert!(raw.to_string().len() > 48_000);
     occupied.store(1, Ordering::Release);
     promoted

@@ -37,9 +37,9 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The latest native Windows release is **[v0.9.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.9.0)**.
-Read the [release notes](docs/releases/v0.9.0.md) for changes since v0.8.0.
-Download **[Tomlook-v0.9.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.9.0/Tomlook-v0.9.0-win-x64.zip)**
+The latest native Windows release is **[v0.10.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.10.0)**.
+Read the [release notes](docs/releases/v0.10.0.md) for changes since v0.9.0.
+Download **[Tomlook-v0.10.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.10.0/Tomlook-v0.10.0-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable and unsigned.
 From v0.8.0, Tomlook checks GitHub Releases once a day and installs
@@ -134,6 +134,11 @@ the version, update checks and a verified update ready to install.
 Save prompt edits explicitly; source boundaries, structured output and write
 approval rules are not editable. Already completed notes are never regenerated
 because a prompt changed. Ask and Commands use accessible vector icons.
+Insights and meeting notes can be rated with thumbs up/down, with optional
+reasons and a short comment; ratings stay in the local database and are never
+sent automatically. **AI prompts** summarizes the last 90 days of feedback and
+can ask Copilot once for a reviewable prompt draft, which is never saved without
+**Save prompts** (see [Feedback on AI output](native/README.md#feedback-on-ai-output)).
 Controls, calendar dates,
 commands and tray labels share a tested catalog. AI answers follow the selected
 language; new meeting Insights save English and Czech from one shared research.

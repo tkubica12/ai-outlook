@@ -42,6 +42,7 @@ struct Launch {
     interactions: Option<PathBuf>,
     fixture: Option<tomlook::fixture_cache::Manifest>,
     screenshot: Option<PathBuf>,
+    scene: tomlook::showcase::Scene,
     idle: bool,
     after_update: Option<u32>,
 }
@@ -74,6 +75,7 @@ fn parse_options(
     let mut explicit_legacy = false;
     let mut fixture_cache = false;
     let mut screenshot = None;
+    let mut scene = None;
     let mut idle = false;
     let mut after_update = None;
     while let Some(arg) = args.next() {
@@ -91,6 +93,14 @@ fn parse_options(
                         .map(PathBuf::from)
                         .ok_or("--demo-screenshot needs a new PNG file path")?,
                 );
+            }
+            Some("--demo-scene") => {
+                scene = Some(tomlook::showcase::Scene::parse(
+                    &args
+                        .next()
+                        .and_then(|value| value.into_string().ok())
+                        .ok_or("--demo-scene needs details, feedback or prompts")?,
+                )?);
             }
             Some("--fixture-cache") => fixture_cache = true,
             Some("--interaction-trace") => {
@@ -156,6 +166,9 @@ fn parse_options(
             || path.exists())
     {
         return Err("Demo screenshots require --demo or --stress, a new PNG output, and no measurement mode".into());
+    }
+    if scene.is_some() && screenshot.is_none() {
+        return Err("--demo-scene only chooses what --demo-screenshot captures".into());
     }
     if result.demo.is_some() {
         if !explicit_state
@@ -261,6 +274,7 @@ fn parse_options(
         interactions,
         fixture,
         screenshot,
+        scene: scene.unwrap_or_default(),
         idle,
         after_update,
     })
@@ -275,6 +289,7 @@ fn main() -> eframe::Result {
         interactions,
         fixture,
         screenshot,
+        scene,
         idle,
         after_update,
     } = match options() {
@@ -430,7 +445,7 @@ fn main() -> eframe::Result {
                 startup,
                 Some(preload),
                 interaction_trace,
-                screenshot,
+                screenshot.map(|path| (path, scene)),
             )))
         }),
     );
@@ -652,6 +667,24 @@ mod tests {
             ]
         };
         assert_eq!(parse(arguments()).unwrap().screenshot, Some(png.clone()));
+        assert_eq!(parse(arguments()).unwrap().scene, tomlook::showcase::Scene::Details);
+        let mut scene = arguments();
+        scene.extend(["--demo-scene".into(), "prompts".into()]);
+        assert_eq!(parse(scene).unwrap().scene, tomlook::showcase::Scene::Prompts);
+        let mut unknown = arguments();
+        unknown.extend(["--demo-scene".into(), "anything".into()]);
+        assert!(parse(unknown).is_err());
+        assert!(
+            parse(vec![
+                "--demo".into(),
+                "--state".into(),
+                root.path().join("fresh").into_os_string(),
+                "--demo-scene".into(),
+                "feedback".into()
+            ])
+            .is_err(),
+            "A scene without a screenshot has no effect and is rejected"
+        );
         std::fs::write(&png, "existing").unwrap();
         assert!(parse(arguments()).is_err());
         assert_eq!(std::fs::read_to_string(png).unwrap(), "existing");

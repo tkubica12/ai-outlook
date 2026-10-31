@@ -1,7 +1,15 @@
 use super::*;
+use super::feedback::Panel;
 use super::settings::insight_state;
 
-fn insight_section(ui: &mut egui::Ui, label: &str, items: &[serde_json::Value], accent: Color32) {
+/// `feedback(ui, true)` adds header controls; `feedback(ui, false)` adds content below the header.
+fn insight_section(
+    ui: &mut egui::Ui,
+    label: &str,
+    items: &[serde_json::Value],
+    accent: Color32,
+    mut feedback: impl FnMut(&mut egui::Ui, bool),
+) {
     let language = tomlook::i18n::Language::En;
     if items.is_empty() {
         return;
@@ -17,7 +25,11 @@ fn insight_section(ui: &mut egui::Ui, label: &str, items: &[serde_json::Value], 
                 ui.painter().rect_filled(rect, 1.0, accent);
                 ui.strong(language.text(label));
                 ui.weak(language.text(&(items.len().to_string())));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    feedback(ui, true)
+                });
             });
+            feedback(ui, false);
             for (index, item) in items.iter().enumerate() {
                 let Some(text) = item.as_str() else { continue };
                 ui.add_space(9.0);
@@ -575,12 +587,21 @@ impl Tomlook {
         }
         ui.add_space(16.0);
         ui.separator();
+        let document_feedback = self.document_feedback();
         ui.horizontal(|ui| {
             ui.strong(language.text(if ended { "Meeting notes" } else { "Insights" }));
             if self.briefing.is_some() && ui.button(language.text("Expand")).clicked() {
                 self.insights_expanded = true;
             }
+            if let Some((output, target)) = &document_feedback {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.feedback_thumbs(ui, output, target, Panel::Details);
+                });
+            }
         });
+        if let Some((output, target)) = &document_feedback {
+            self.feedback_reasons(ui, output, target, Panel::Details);
+        }
         if self.preview {
             ui.weak(language.text("Offline demo - fictional calendar"));
         } else if !self.activity.enabled {
@@ -618,9 +639,25 @@ impl Tomlook {
         self.render_insights(ui, false);
     }
 
-    pub(super) fn render_insights(&self, ui: &mut egui::Ui, expanded: bool) {
+    pub(super) fn render_insights(&mut self, ui: &mut egui::Ui, expanded: bool) {
+        // Rendering borrows the document while feedback controls update `self`.
+        let Some(briefing) = self.briefing.take() else {
+            let language = self.preferences.language;
+            let ended = self.selected.and_then(|index| self.calendar.events.get(index))
+                .is_some_and(|event| event.end <= Local::now().fixed_offset());
+            ui.label(language.text(if ended { "No AI meeting notes yet." } else {
+                "No saved Insights yet. Research now prioritizes this meeting."
+            }));
+            return;
+        };
+        self.render_briefing(ui, &briefing, expanded);
+        self.briefing = Some(briefing);
+    }
+
+    fn render_briefing(&mut self, ui: &mut egui::Ui, briefing: &serde_json::Value, expanded: bool) {
         let language = self.preferences.language;
-        if let Some(briefing) = &self.briefing {
+        let output = if expanded { self.feedback_output(briefing) } else { None };
+        {
             let notes = briefing.get("tomlook_recap").and_then(serde_json::Value::as_bool) == Some(true);
             let narrative = language.insight(briefing);
             if tomlook::changes::approved_context(briefing).is_some() {
@@ -643,12 +680,23 @@ impl Tomlook {
                 .and_then(|value| value.get("summary"))
                 .and_then(|v| v.as_str())
             {
+                let target = output.as_ref().and_then(|output| output.target(briefing, "summary"));
                 egui::Frame::new()
                     .fill(ui.visuals().faint_bg_color)
                     .corner_radius(8)
                     .inner_margin(14)
                     .show(ui, |ui| {
-                        ui.strong(language.text("Overview"));
+                        ui.horizontal(|ui| {
+                            ui.strong(language.text("Overview"));
+                            if let (Some(output), Some(target)) = (&output, &target) {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    self.feedback_thumbs(ui, output, target, Panel::Expanded);
+                                });
+                            }
+                        });
+                        if let (Some(output), Some(target)) = (&output, &target) {
+                            self.feedback_reasons(ui, output, target, Panel::Expanded);
+                        }
                         ui.add_space(6.0);
                         ui.label(summary);
                     });
@@ -686,7 +734,7 @@ impl Tomlook {
                 if notes {
                     for (field, label) in [("preparation", "My tasks"), ("open_questions", "Mentions of me")] {
                         if let Some(items) = narrative.and_then(|value| value[field].as_array()).filter(|items| !items.is_empty()) {
-                            insight_section(ui, &language.text(label), items, self.accent());
+                            insight_section(ui, &language.text(label), items, self.accent(), |_, _| {});
                         }
                     }
                 }
@@ -702,6 +750,7 @@ impl Tomlook {
                 ("gaps", "Evidence gaps"),
             ];
             let columns = if ui.available_width() >= 640.0 { 2 } else { 1 };
+            let accent = self.accent();
             ui.columns(columns, |uis| {
                 for (index, (field, label)) in sections.iter().enumerate() {
                     if let Some(items) = narrative
@@ -710,7 +759,16 @@ impl Tomlook {
                         .filter(|items| !items.is_empty())
                     {
                         let ui = &mut uis[index % columns];
-                        insight_section(ui, &language.text(label), items, self.accent());
+                        let target = output.as_ref().and_then(|output| output.target(briefing, field));
+                        insight_section(ui, &language.text(label), items, accent, |ui, header| {
+                            if let (Some(output), Some(target)) = (&output, &target) {
+                                if header {
+                                    self.feedback_thumbs(ui, output, target, Panel::Expanded);
+                                } else {
+                                    self.feedback_reasons(ui, output, target, Panel::Expanded);
+                                }
+                            }
+                        });
                         ui.add_space(10.0);
                     }
                 }
@@ -824,12 +882,6 @@ impl Tomlook {
                     }
                 }
             }
-        } else {
-            let ended = self.selected.and_then(|index| self.calendar.events.get(index))
-                .is_some_and(|event| event.end <= Local::now().fixed_offset());
-            ui.label(language.text(if ended { "No AI meeting notes yet." } else {
-                "No saved Insights yet. Research now prioritizes this meeting."
-            }));
         }
     }
 

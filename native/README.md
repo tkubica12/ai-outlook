@@ -48,6 +48,10 @@ have loaded. It cannot be used in production or combined with measurements.
 Only the demo window content is captured, not other desktop windows or the
 Windows title bar. PNG encoding and exclusive-create file output run on the
 bounded storage worker. Existing images are never overwritten.
+`--demo-scene <details|feedback|prompts>` chooses what that screenshot shows:
+the default details pane, expanded Insights with a saved rating and an open
+reason panel, or **Settings > AI prompts** after fictional sample feedback is
+saved into the isolated demo profile through the normal storage path.
 
 ## Native interaction measurement
 
@@ -330,6 +334,47 @@ are theme-aware vector icons grouped in the Ask header, with translated tooltips
 accessible button names and visible keyboard focus. Enter asks; Shift+Enter adds
 a line. Meeting links select the meeting and open its saved Insights without
 losing the conversation or draft.
+
+### Feedback on AI output
+
+Insights and post-meeting notes have quiet thumbs-up/thumbs-down vector
+controls (tooltips **Helpful** / **Not helpful**): one in the meeting-details
+header for the whole document, and one per narrative section in **Expand**
+(overview, preparation or my tasks, talking points or technical takeaways, open
+questions or mentions of me, risks or decisions, evidence gaps). Helpful saves
+immediately. Not helpful opens inline reason chips (Inaccurate, Not relevant,
+Missing something important, Too long, Too vague, Wrong language, Other) and an
+optional comment of at most 500 characters. Clicking the selected thumb again
+clears the rating; saved ratings reappear when the document is reopened.
+
+Ratings are stored only in the local `ai_feedback` table of `tomlook.db`, one
+row per account, document (Insights: meeting id; notes: recap occurrence key),
+section and output revision; re-rating updates the row. The revision hashes the
+section key, UI language and displayed text, so re-researched or translated
+output starts unrated while older ratings still count in the summary. Rows also
+keep the prompt kind (Before the meeting for Insights, After the meeting for
+notes), the SHA-256 of the editable prompt saved with new output
+(`tomlook_prompt_sha256`) or, for older output, of the current prompt flagged as
+feedback-time, the model if saved with the output, meeting title and start, a
+400-character excerpt, and created/updated times. The storage worker performs
+all reads and writes, binds them to the calendar owner, and reports failures
+without stopping preparation. Feedback is never sent anywhere automatically. The
+offline demo keeps feedback in its isolated profile.
+
+**Settings > AI prompts** summarizes the last 90 days for Before the meeting and
+After the meeting: helpful/not helpful counts, top reasons, most criticized
+sections and the five newest comments with meeting and date.
+**Suggest prompt improvement** requires at least one negative rating and a
+connected GitHub Copilot. It sends one tool-free request with the Thorough
+profile through the isolated executor, counted against the daily AI limit: the
+editor's prompt, a summary of the fixed rules it must not change, the aggregate,
+and up to 20 recent negative ratings with comments and 400-character excerpts
+(at most 32 KB; the oldest examples are dropped first). The answer must be JSON
+with a changed prompt that passes prompt validation (at most 4,000 bytes) and a
+short rationale; malformed, empty, unchanged or oversized answers are rejected.
+The draft shows the rationale, a sentence/line diff and the full new text.
+**Use draft** only copies it into the editor, where **Save prompts** is still
+required; **Discard** drops it. No prompt is ever saved automatically.
 
 ### AI-proposed edits
 

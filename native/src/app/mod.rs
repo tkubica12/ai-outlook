@@ -17,6 +17,7 @@ mod ask_panel;
 mod calendar;
 mod connections;
 mod event_editor;
+mod feedback;
 mod meeting;
 mod palette;
 mod recommendations;
@@ -24,6 +25,7 @@ mod settings;
 
 use connections::status_text;
 use event_editor::EventDraft;
+use feedback::FeedbackUi;
 use meeting::MeetingActionDraft;
 use recommendations::inbox_button;
 use settings::PreferencesSection;
@@ -173,8 +175,11 @@ pub struct Tomlook {
     time_drag: Option<(NaiveDate, u16, u16)>,
     activity_filter: ActivityFilter,
     insights_expanded: bool,
+    feedback: FeedbackUi,
     preview: bool,
     demo_screenshot: Option<std::path::PathBuf>,
+    demo_scene: tomlook::showcase::Scene,
+    demo_frames: u32,
     screenshot_requested: bool,
     palette: bool,
     palette_query: String,
@@ -263,7 +268,7 @@ impl Tomlook {
         startup: Option<crate::StartupTrace>,
         preload: Option<tomlook::worker::Preload>,
         interaction_trace: Option<crate::interaction_trace::Trace>,
-        demo_screenshot: Option<std::path::PathBuf>,
+        demo_screenshot: Option<(std::path::PathBuf, tomlook::showcase::Scene)>,
     ) -> Self {
         let preview = options.demo.is_some();
         let measurement = startup.is_some()
@@ -352,7 +357,10 @@ impl Tomlook {
         };
         let mut app = Self::initial(worker, ai, error);
         app.preview = preview;
-        app.demo_screenshot = demo_screenshot;
+        if let Some((path, scene)) = demo_screenshot {
+            app.demo_screenshot = Some(path);
+            app.demo_scene = scene;
+        }
         app.tray = tray;
         if measurement {
             app.reminder_status.disabled =
@@ -454,8 +462,11 @@ impl Tomlook {
             time_drag: None,
             activity_filter: ActivityFilter::All,
             insights_expanded: false,
+            feedback: FeedbackUi::default(),
             preview: false,
             demo_screenshot: None,
+            demo_scene: Default::default(),
+            demo_frames: 0,
             screenshot_requested: false,
             palette: false,
             palette_query: String::new(),
@@ -698,6 +709,10 @@ impl Tomlook {
                     self.briefing = payload;
                 }
                 Notice::Detail { .. } => {}
+                Notice::Feedback { document, entries } => self.receive_feedback(document, entries),
+                Notice::FeedbackSummary { account, result } => {
+                    self.receive_feedback_summary(account, result)
+                }
                 Notice::Error(error) => {
                     self.error = Some(error);
                     self.loading = false;
@@ -934,7 +949,11 @@ impl Tomlook {
                     Arc::make_mut(&mut self.chat).finish(id, result);
                 }
                 ai::Notice::Answer { .. } => {}
+                ai::Notice::PromptSuggestion { id, result } => {
+                    self.receive_prompt_suggestion(id, result)
+                }
                 ai::Notice::Stopped => {
+                    self.stop_prompt_suggestion();
                     if !self.ai_ready && self.connection != "Not connected" {
                         self.error = Some(format!("AI stopped: {}", self.connection));
                     }
@@ -1311,9 +1330,14 @@ impl eframe::App for Tomlook {
                         self.select(index);
                     }
                 } else if self.briefing.is_some() {
-                    context
-                        .send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
-                    self.screenshot_requested = true;
+                    if self.demo_scene_ready() {
+                        context.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                            Default::default(),
+                        ));
+                        self.screenshot_requested = true;
+                    } else {
+                        context.request_repaint_after(std::time::Duration::from_millis(50));
+                    }
                 }
             }
         }

@@ -59,6 +59,10 @@ pub enum Command {
         change: crate::recommendations::Change,
     },
     Preferences(Preferences),
+    SaveFeedback(Box<crate::feedback::Entry>),
+    ClearFeedback(Box<crate::feedback::Key>),
+    LoadFeedback(Box<crate::feedback::DocumentId>),
+    FeedbackSummary(String),
     Detail {
         revision: u64,
         id: String,
@@ -112,6 +116,14 @@ pub enum Notice {
         revision: u64,
         payload: Option<serde_json::Value>,
     },
+    Feedback {
+        document: crate::feedback::DocumentId,
+        entries: Result<Vec<crate::feedback::Entry>, String>,
+    },
+    FeedbackSummary {
+        account: String,
+        result: Result<Arc<crate::feedback::Summary>, String>,
+    },
     Error(String),
 }
 
@@ -125,7 +137,7 @@ pub struct Worker {
 
 #[derive(Default)]
 pub struct Notices {
-    pending: Mutex<[Option<Notice>; 4]>,
+    pending: Mutex<[Option<Notice>; 6]>,
     poisoned: AtomicBool,
 }
 
@@ -136,6 +148,8 @@ impl Notices {
             Notice::Detail { .. } => 1,
             Notice::Error(_) => 2,
             Notice::LocalAnswer { .. } => 3,
+            Notice::Feedback { .. } => 4,
+            Notice::FeedbackSummary { .. } => 5,
         };
         self.pending
             .lock()
@@ -292,6 +306,19 @@ struct Sdk {
     terminated: Arc<AtomicBool>,
     analysis_revision: Arc<std::sync::OnceLock<String>>,
     workiq_ready: Arc<AtomicBool>,
+}
+
+fn feedback_owner(store: &Store, demo: bool, account: &str) -> Result<(), String> {
+    let owner = if demo {
+        Some(crate::feedback::PREVIEW_ACCOUNT.to_owned())
+    } else {
+        store.calendar_owner()?
+    };
+    if owner.as_deref() == Some(account) {
+        Ok(())
+    } else {
+        Err("Feedback belongs to a different calendar account; nothing was saved".into())
+    }
 }
 
 fn propose_change(
@@ -1018,6 +1045,10 @@ impl Worker {
                                             store.retain_insight_edits(&flight.event_id, &mut payload)?;
                                             if let Some(event) = calendar.events.iter().find(|event| event.id == flight.event_id) {
                                                 payload["tomlook_event_fingerprint"] = event.fingerprint().into();
+                                                if !flight.translation_only {
+                                                    // A current flight's analysis revision binds this preparation prompt.
+                                                    payload[crate::feedback::PROMPT_FIELD] = crate::feedback::prompt_hash(&preferences.prompts.preparation).into();
+                                                }
                                                 if let Some(account) = store.calendar_owner()? {
                                                     let review = queue.jobs.get(&flight.event_id).and_then(|job| job.review.as_ref());
                                                     let publish_kind = |kind| review.is_none_or(|review|
@@ -1587,6 +1618,42 @@ impl Worker {
                             preferences = next; Ok(())
                         })(),
                         Command::EnablePreparation(enabled) => { preferences.prepare_enabled = enabled; auto_ai_requested = false; store.save_preferences(&preferences) },
+                        // Feedback failures are reported but never stop preparation.
+                        Command::SaveFeedback(entry) => {
+                            let document = entry.key.document.clone();
+                            let entries = feedback_owner(&store, options.demo.is_some(), &document.account).and_then(|()| {
+                                if let Err(error) = store.save_feedback(&entry) {
+                                    notify(Notice::Error(error));
+                                }
+                                store.feedback_for_document(&document)
+                            });
+                            notify(Notice::Feedback { document, entries });
+                            Ok(())
+                        }
+                        Command::ClearFeedback(key) => {
+                            let entries = feedback_owner(&store, options.demo.is_some(), &key.document.account).and_then(|()| {
+                                if let Err(error) = store.clear_feedback(&key) {
+                                    notify(Notice::Error(error));
+                                }
+                                store.feedback_for_document(&key.document)
+                            });
+                            notify(Notice::Feedback { document: key.document, entries });
+                            Ok(())
+                        }
+                        Command::LoadFeedback(document) => {
+                            let entries = feedback_owner(&store, options.demo.is_some(), &document.account)
+                                .and_then(|()| store.feedback_for_document(&document));
+                            notify(Notice::Feedback { document: *document, entries });
+                            Ok(())
+                        }
+                        Command::FeedbackSummary(account) => {
+                            let now = chrono::Utc::now();
+                            let result = feedback_owner(&store, options.demo.is_some(), &account)
+                                .and_then(|()| store.feedback_since(&account, now - chrono::Duration::days(crate::feedback::WINDOW_DAYS)))
+                                .map(|entries| Arc::new(crate::feedback::summarize(&account, &entries, now)));
+                            notify(Notice::FeedbackSummary { account, result });
+                            Ok(())
+                        }
                         Command::PausePreparation(paused) => { preferences.paused = paused; store.save_preferences(&preferences) },
                         Command::ResumeQueued if queue.flights.is_empty() => {
                             failure = None; queue.failure = None; preferences.paused = false;
@@ -1767,6 +1834,50 @@ impl Worker {
 mod tests {
     use super::*;
     use chrono::Local;
+
+    #[test]
+    fn feedback_commands_run_on_the_worker_for_the_calendar_owner_only() {
+        use crate::feedback::{Output, Rating, Reason};
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::open(root.path()).unwrap();
+        let event = crate::calendar::fixture(1).remove(0);
+        let calendar = Calendar::build(vec![event.clone()],
+            [event.start.with_timezone(&Local).date_naive()].into(), vec![]).unwrap();
+        store.save_workiq_calendar(&calendar, "owner").unwrap();
+        let payload = serde_json::json!({"summary":"Agree on the pilot.","talking_points":["Start with the workflow."]});
+        let output = Output::new("owner", &event, &payload, crate::i18n::Language::En, &Default::default()).unwrap();
+        let target = output.target(&payload, "talking_points").unwrap();
+        let entry = output.entry(&target, Rating::Down, [Reason::TooLong].into(), "Shorter", chrono::Utc::now()).unwrap();
+        let mut worker = Worker::start(Options {state:root.path().into(),legacy_root:root.path().join("absent"),demo:None},
+            egui::Context::default()).unwrap();
+        let wait = |worker: &Worker, expected: &dyn Fn(&Notice) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(notice) = worker.notices.try_recv() && expected(&notice) { return notice; }
+                assert!(std::time::Instant::now() < deadline, "Feedback notice was not delivered");
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        worker.commands.send(Command::SaveFeedback(Box::new(entry.clone()))).unwrap();
+        let Notice::Feedback { document, entries } = wait(&worker, &|notice| matches!(notice, Notice::Feedback { .. })) else { unreachable!() };
+        assert_eq!(document, output.id);
+        assert_eq!(entries.unwrap(), vec![entry.clone()]);
+        worker.commands.send(Command::FeedbackSummary("owner".into())).unwrap();
+        let Notice::FeedbackSummary { result, .. } = wait(&worker, &|notice| matches!(notice, Notice::FeedbackSummary { .. })) else { unreachable!() };
+        assert_eq!(result.unwrap().preparation.reasons, vec![(Reason::TooLong, 1)]);
+        let mut foreign = entry.clone();
+        foreign.key.document.account = "someone-else".into();
+        worker.commands.send(Command::SaveFeedback(Box::new(foreign))).unwrap();
+        let Notice::Feedback { entries, .. } = wait(&worker, &|notice| matches!(notice, Notice::Feedback { .. })) else { unreachable!() };
+        assert!(entries.unwrap_err().contains("different calendar account"));
+        worker.commands.send(Command::ClearFeedback(Box::new(entry.key.clone()))).unwrap();
+        let Notice::Feedback { entries, .. } = wait(&worker, &|notice| matches!(notice, Notice::Feedback { .. })) else { unreachable!() };
+        assert!(entries.unwrap().is_empty());
+        assert!(worker.activity.lock().unwrap().error.is_none(), "Feedback never stops preparation");
+        worker.commands.send(Command::Exit).unwrap();
+        worker.done.take().unwrap().recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert!(Store::open(root.path()).unwrap().feedback_for_document(&output.id).unwrap().is_empty());
+    }
 
     #[test]
     fn ai_proposals_are_pending_only_and_local_approval_works_without_an_ai_or_workiq_connection() {

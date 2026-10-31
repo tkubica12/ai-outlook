@@ -4812,3 +4812,263 @@ fn reminder_activation_opens_meeting_details_without_ai_or_calendar_writes() {
     assert!(receiver.try_iter().all(|command| matches!(command, Command::Detail { .. } | Command::Preferences(_))));
     assert!(ai_commands.try_recv().is_err());
 }
+
+fn feedback_thumbs(output: &egui::FullOutput) -> Vec<(bool, egui::Pos2)> {
+    fn collect(shape: &egui::epaint::Shape, found: &mut Vec<(bool, egui::Pos2)>) {
+        match shape {
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect(shape, found);
+                }
+            }
+            egui::epaint::Shape::Path(path) if path.closed && path.points.len() == 10 => {
+                let rect = egui::Rect::from_points(&path.points);
+                found.push((path.points[1].y < rect.center().y, rect.center()));
+            }
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    for clipped in &output.shapes {
+        collect(&clipped.shape, &mut found);
+    }
+    found.sort_by_key(|(_, pos)| (pos.y.round() as i32, pos.x.round() as i32));
+    found
+}
+
+#[test]
+fn insight_feedback_thumbs_save_clear_and_collect_reasons_locally() {
+    use tomlook::feedback::{PromptSource, Rating, Reason};
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, _, mut ai_commands) = assistant_fixture();
+        let (sender, receiver) = mpsc::sync_channel(32);
+        app.worker = Some(Worker {
+            commands: sender, notices: Arc::new(Default::default()),
+            activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+            stop: Arc::new(Default::default()), done: None,
+        });
+        app.preferences.language = language;
+        app.calendar_owner = Some("owner".into());
+        let event = tomlook::calendar::fixture(1).remove(0);
+        app.calendar = Arc::new(Calendar::build(vec![event.clone()], Default::default(), vec![]).unwrap());
+        app.selected = Some(0);
+        app.briefing = Some(serde_json::json!({
+            "summary": "Agree on the pilot.", "talking_points": ["Start with the workflow."],
+            "preparation": [], "open_questions": [], "risks": [], "gaps": [], "sources": [],
+            "cs": {"summary": "Domluvit pilot.", "talking_points": ["Začít pracovním postupem."],
+                "preparation": [], "open_questions": [], "risks": [], "gaps": []}
+        }));
+        let context = egui::Context::default();
+        let draw = |app: &mut Tomlook, events| {
+            let mut output = context.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(480.0, 1200.0))),
+                events, ..Default::default()
+            }, |ui| app.render_insights(ui, true));
+            output.textures_delta.clear();
+            output
+        };
+        let click = |app: &mut Tomlook, pos: egui::Pos2| {
+            draw(app, vec![]);
+            for pressed in [true, false] {
+                draw(app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                    pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+                }]);
+            }
+        };
+        let text_position = |app: &mut Tomlook, label: &str| {
+            draw(app, vec![]);
+            let output = draw(app, vec![]);
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == label =>
+                    Some(text.pos + text.galley.size() * 0.5),
+                _ => None,
+            }).unwrap_or_else(|| panic!("Missing feedback control: {label}"))
+        };
+        let rendered = |app: &mut Tomlook| {
+            let output = draw(app, vec![]);
+            let mut text = String::new();
+            for shape in &output.shapes {
+                append_shape_text(&shape.shape, &mut text);
+            }
+            text
+        };
+        let output = draw(&mut app, vec![]);
+        assert!(matches!(receiver.try_recv().unwrap(), Command::LoadFeedback(id)
+            if id.account == "owner" && id.key == event.id && id.document == tomlook::changes::Document::Insights));
+        let thumbs = feedback_thumbs(&output);
+        assert_eq!(thumbs.iter().map(|(up, _)| *up).collect::<Vec<_>>(), vec![true, false, true, false],
+            "Overview and talking points each offer helpful and not helpful");
+        let document = app.feedback.document.clone().unwrap();
+        app.receive_feedback(document, Ok(Vec::new()));
+        click(&mut app, thumbs[0].1);
+        let Ok(Command::SaveFeedback(entry)) = receiver.try_recv() else { panic!("Helpful saves immediately") };
+        assert_eq!((entry.rating, entry.key.section.as_str(), entry.language), (Rating::Up, "summary", language));
+        assert_eq!(entry.prompt_kind, tomlook::prompts::Kind::Preparation);
+        assert_eq!(entry.prompt_source, PromptSource::FeedbackTime);
+        assert!(entry.reasons.is_empty() && entry.comment.is_empty());
+        assert_eq!(app.feedback.entries.len(), 1);
+        click(&mut app, thumbs[0].1);
+        assert!(matches!(receiver.try_recv().unwrap(), Command::ClearFeedback(key) if *key == entry.key),
+            "Clicking the selected thumb again clears the rating");
+        assert!(app.feedback.entries.is_empty());
+        click(&mut app, thumbs[3].1);
+        assert!(receiver.try_recv().is_err(), "Not helpful waits for optional reasons");
+        assert!(rendered(&mut app).contains(language.text("What was not helpful?").as_ref()));
+        let pos = text_position(&mut app, language.text("Too vague").as_ref());
+        click(&mut app, pos);
+        app.feedback.draft.as_mut().unwrap().comment = "  Name the trade-offs.  ".into();
+        let pos = text_position(&mut app, language.text("Save").as_ref());
+        click(&mut app, pos);
+        let Ok(Command::SaveFeedback(entry)) = receiver.try_recv() else { panic!("Reasons save the rating") };
+        assert_eq!(entry.rating, Rating::Down);
+        assert_eq!(entry.key.section, "talking_points");
+        assert_eq!(entry.reasons, [Reason::TooVague].into());
+        assert_eq!(entry.comment, "Name the trade-offs.");
+        assert!(app.feedback.draft.is_none());
+        assert!(!rendered(&mut app).contains(language.text("What was not helpful?").as_ref()));
+        app.briefing.as_mut().unwrap()["talking_points"] = serde_json::json!(["Re-researched talking point."]);
+        app.briefing.as_mut().unwrap()["cs"]["talking_points"] = serde_json::json!(["Nově zjištěné téma."]);
+        draw(&mut app, vec![]);
+        let new_revision = tomlook::feedback::Output::new("owner", &event, app.briefing.as_ref().unwrap(), language,
+            &Default::default()).unwrap().target(app.briefing.as_ref().unwrap(), "talking_points").unwrap();
+        assert!(tomlook::feedback::current(&app.feedback.entries, &new_revision.key).is_none(),
+            "A re-researched section starts unrated");
+        assert!(receiver.try_recv().is_err());
+        assert!(ai_commands.try_recv().is_err(), "Feedback is never sent to AI");
+        let mut compact = context.run_ui(egui::RawInput::default(), |ui| app.render_insights(ui, false));
+        assert!(feedback_thumbs(&compact).is_empty(), "Compact Insights only rate the whole document in the header");
+        compact.textures_delta.clear();
+        let mut details = context.run_ui(egui::RawInput::default(), |ui| app.details(ui, event.clone()));
+        assert_eq!(feedback_thumbs(&details).len(), 2, "Meeting details rate the whole document");
+        details.textures_delta.clear();
+    }
+}
+
+#[test]
+fn prompt_feedback_summary_and_suggestion_review_never_save_prompts() {
+    use tomlook::feedback::{DOCUMENT, Output, Rating, Reason};
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, notices, mut ai_commands) = assistant_fixture();
+        let (sender, receiver) = mpsc::sync_channel(32);
+        app.worker = Some(Worker {
+            commands: sender, notices: Arc::new(Default::default()),
+            activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+            stop: Arc::new(Default::default()), done: None,
+        });
+        app.loading = false;
+        app.preferences.language = language;
+        app.calendar_owner = Some("owner".into());
+        app.preferences_open = true;
+        app.preferences_section = PreferencesSection::Prompts;
+        app.prompt_kind = tomlook::prompts::Kind::Preparation;
+        app.prompt_draft = app.preferences.prompts.clone();
+        let context = egui::Context::default();
+        let draw = |app: &mut Tomlook, events| {
+            let mut output = context.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 1400.0))),
+                events, ..Default::default()
+            }, |ui| app.prompt_feedback(ui));
+            output.textures_delta.clear();
+            output
+        };
+        let text = |app: &mut Tomlook| {
+            draw(app, vec![]);
+            let output = draw(app, vec![]);
+            let mut text = String::new();
+            for shape in &output.shapes {
+                append_shape_text(&shape.shape, &mut text);
+            }
+            text
+        };
+        let click = |app: &mut Tomlook, label: &str| {
+            draw(app, vec![]);
+            let output = draw(app, vec![]);
+            let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == label =>
+                    Some(text.pos + text.galley.size() * 0.5),
+                _ => None,
+            }).unwrap_or_else(|| panic!("Missing prompt feedback control: {label}"));
+            for pressed in [true, false] {
+                draw(app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                    pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+                }]);
+            }
+        };
+        assert!(text(&mut app).contains(language.text("Loading feedback...").as_ref()));
+        assert!(matches!(receiver.try_recv().unwrap(), Command::FeedbackSummary(account) if account == "owner"));
+        assert!(receiver.try_recv().is_err(), "The summary is requested once");
+        let mut event = tomlook::calendar::fixture(1).remove(0);
+        event.title = "Fictional pilot review".into();
+        let payload = serde_json::json!({"summary": "Agree on the pilot.", "talking_points": ["Start with the workflow."],
+            "preparation": [], "open_questions": [], "risks": [], "gaps": [], "sources": []});
+        let output = Output::new("owner", &event, &payload, tomlook::i18n::Language::En, &Default::default()).unwrap();
+        let now = chrono::Utc::now();
+        let entries = vec![
+            output.entry(&output.target(&payload, "talking_points").unwrap(), Rating::Down,
+                [Reason::TooVague, Reason::TooLong].into(), "Name concrete trade-offs", now).unwrap(),
+            output.entry(&output.target(&payload, "summary").unwrap(), Rating::Down,
+                [Reason::TooVague].into(), "", now - chrono::Duration::hours(1)).unwrap(),
+            output.entry(&output.target(&payload, DOCUMENT).unwrap(), Rating::Up,
+                Default::default(), "", now - chrono::Duration::hours(2)).unwrap(),
+        ];
+        let summary = tomlook::feedback::summarize("owner", &entries, now);
+        app.receive_feedback_summary("owner".into(), Ok(Arc::new(summary.clone())));
+        let rendered = text(&mut app);
+        for expected in [
+            language.text("Feedback on AI output").into_owned(),
+            format!("{}: 1", language.text("Helpful")),
+            format!("{}: 2", language.text("Not helpful")),
+            format!("{} · 2", language.text("Too vague")),
+            format!("{} · 1", language.text("Talking points")),
+            "Name concrete trade-offs".into(),
+            "Fictional pilot review".into(),
+            language.text("Suggest prompt improvement").into_owned(),
+        ] {
+            assert!(rendered.contains(&expected), "Missing {expected}: {rendered}");
+        }
+        assert!(receiver.try_recv().is_err());
+        click(&mut app, language.text("Suggest prompt improvement").as_ref());
+        let Ok(ai::Command::SuggestPrompt(request)) = ai_commands.try_recv() else { panic!("Suggestion must use the AI executor") };
+        assert_eq!(request.kind, tomlook::prompts::Kind::Preparation);
+        assert_eq!(request.current, app.prompt_draft.preparation);
+        assert_eq!(request.feedback.down, 2);
+        assert!(request.prompt().unwrap().len() <= tomlook::feedback::SUGGESTION_INPUT_LIMIT);
+        assert!(text(&mut app).contains(language.text("Preparing a prompt suggestion...").as_ref()));
+        let revised = format!("{} Name concrete trade-offs.", tomlook::prompts::Kind::Preparation.default_text());
+        let raw = serde_json::json!({"prompt": revised, "rationale": ["Adds concrete trade-offs"]}).to_string();
+        let suggestion = tomlook::feedback::parse_suggestion(&request, &raw).unwrap();
+        notices.send(ai::Notice::PromptSuggestion { id: request.id, result: Ok(suggestion.clone()) }).unwrap();
+        app.receive();
+        let rendered = text(&mut app);
+        for expected in [
+            language.text("Suggested prompt (draft)").into_owned(),
+            "Adds concrete trade-offs".into(),
+            "+ Name concrete trade-offs.".into(),
+            language.text("Use draft").into_owned(),
+        ] {
+            assert!(rendered.contains(&expected), "Missing {expected}: {rendered}");
+        }
+        click(&mut app, language.text("Use draft").as_ref());
+        assert_eq!(app.prompt_draft.preparation, revised);
+        assert_eq!(app.preferences.prompts, tomlook::prompts::Prompts::default(), "Use draft never saves");
+        assert!(receiver.try_recv().is_err(), "No preferences were written");
+        click(&mut app, language.text("Suggest prompt improvement").as_ref());
+        let Ok(ai::Command::SuggestPrompt(request)) = ai_commands.try_recv() else { panic!("Retry must be explicit") };
+        notices.send(ai::Notice::PromptSuggestion { id: request.id,
+            result: Err("Daily AI request limit reached; no prompt suggestion was requested.".into()) }).unwrap();
+        app.receive();
+        assert!(text(&mut app).contains(language.text("Daily AI request limit reached; no prompt suggestion was requested.").as_ref()));
+        app.preview = true;
+        draw(&mut app, vec![]);
+        assert!(matches!(receiver.try_recv().unwrap(), Command::FeedbackSummary(account) if account == tomlook::feedback::PREVIEW_ACCOUNT));
+        app.receive_feedback_summary(tomlook::feedback::PREVIEW_ACCOUNT.into(), Ok(Arc::new(tomlook::feedback::Summary {
+            account: tomlook::feedback::PREVIEW_ACCOUNT.into(), ..summary.clone()
+        })));
+        assert!(text(&mut app).contains(language.text("Offline demo never sends AI requests.").as_ref()));
+        click(&mut app, language.text("Suggest prompt improvement").as_ref());
+        assert!(ai_commands.try_recv().is_err(), "The offline demo never requests a suggestion");
+        app.prompt_kind = tomlook::prompts::Kind::Quick;
+        assert!(text(&mut app).contains(language.text(
+            "Feedback is collected for the Before the meeting and After the meeting prompts.").as_ref()));
+    }
+}

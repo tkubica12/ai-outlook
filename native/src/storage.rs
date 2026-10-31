@@ -10,6 +10,22 @@ use std::{
 
 type Result<T> = std::result::Result<T, String>;
 
+const FEEDBACK_LIMIT: u32 = 100_000;
+
+fn feedback_time(time: chrono::DateTime<chrono::Utc>) -> String {
+    time.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+fn feedback_payload(payload: &str) -> Result<crate::feedback::Entry> {
+    if payload.len() > 16 * 1024 {
+        return Err("Saved feedback exceeds its safety limit".into());
+    }
+    let entry: crate::feedback::Entry =
+        serde_json::from_str(payload).map_err(|_| "Saved feedback is invalid")?;
+    entry.validate().map_err(|_| "Saved feedback is invalid")?;
+    Ok(entry)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
@@ -489,7 +505,13 @@ impl Store {
                    created_at TEXT NOT NULL,PRIMARY KEY(meeting_id,version));
                  CREATE TABLE IF NOT EXISTS legacy_records(
                    source TEXT NOT NULL,identity TEXT NOT NULL,payload TEXT NOT NULL,
-                   PRIMARY KEY(source,identity));",
+                   PRIMARY KEY(source,identity));
+                 CREATE TABLE IF NOT EXISTS ai_feedback(
+                   account TEXT NOT NULL,document TEXT NOT NULL,document_key TEXT NOT NULL,
+                   section TEXT NOT NULL,revision TEXT NOT NULL,prompt_kind TEXT NOT NULL,
+                   updated_at TEXT NOT NULL,payload TEXT NOT NULL,
+                   PRIMARY KEY(account,document,document_key,section,revision));
+                 CREATE INDEX IF NOT EXISTS ai_feedback_recent ON ai_feedback(account,updated_at);",
             )
             .map_err(|e| e.to_string())?;
         Ok(Self {
@@ -525,6 +547,131 @@ impl Store {
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Saves or replaces the rating of one displayed output revision; the first rating time is kept.
+    pub fn save_feedback(&self, entry: &crate::feedback::Entry) -> Result<crate::feedback::Entry> {
+        entry.validate()?;
+        let key = &entry.key;
+        let document = crate::feedback::document_code(key.document.document);
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| "Begin feedback storage failed")?;
+        let previous: Option<String> = transaction
+            .query_row(
+                "SELECT payload FROM ai_feedback WHERE account=?1 AND document=?2
+                 AND document_key=?3 AND section=?4 AND revision=?5",
+                params![key.document.account, document, key.document.key, key.section, key.revision],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "Read saved feedback failed")?;
+        let mut saved = entry.clone();
+        match previous {
+            Some(previous) => {
+                saved.created_at = feedback_payload(&previous)?.created_at.min(saved.updated_at);
+            }
+            None => {
+                let count: u32 = transaction
+                    .query_row("SELECT count(*) FROM ai_feedback", [], |row| row.get(0))
+                    .map_err(|_| "Read saved feedback failed")?;
+                if count >= FEEDBACK_LIMIT {
+                    return Err("Saved feedback reached its safety limit; nothing was saved".into());
+                }
+            }
+        }
+        let payload = serde_json::to_string(&saved).map_err(|_| "Encode feedback failed")?;
+        transaction
+            .execute(
+                "INSERT INTO ai_feedback(account,document,document_key,section,revision,prompt_kind,updated_at,payload)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                 ON CONFLICT(account,document,document_key,section,revision) DO UPDATE SET
+                   prompt_kind=excluded.prompt_kind,updated_at=excluded.updated_at,payload=excluded.payload",
+                params![
+                    key.document.account,
+                    document,
+                    key.document.key,
+                    key.section,
+                    key.revision,
+                    crate::feedback::kind_code(saved.prompt_kind),
+                    feedback_time(saved.updated_at),
+                    payload
+                ],
+            )
+            .map_err(|_| "Save feedback failed")?;
+        transaction.commit().map_err(|_| "Commit feedback failed")?;
+        Ok(saved)
+    }
+
+    /// Removes the rating of one output revision; returns whether a rating existed.
+    pub fn clear_feedback(&self, key: &crate::feedback::Key) -> Result<bool> {
+        self.connection
+            .execute(
+                "DELETE FROM ai_feedback WHERE account=?1 AND document=?2
+                 AND document_key=?3 AND section=?4 AND revision=?5",
+                params![
+                    key.document.account,
+                    crate::feedback::document_code(key.document.document),
+                    key.document.key,
+                    key.section,
+                    key.revision
+                ],
+            )
+            .map(|count| count > 0)
+            .map_err(|_| "Clear feedback failed".into())
+    }
+
+    /// Every saved rating of one document, across all of its output revisions.
+    pub fn feedback_for_document(
+        &self,
+        id: &crate::feedback::DocumentId,
+    ) -> Result<Vec<crate::feedback::Entry>> {
+        let entries = self.feedback_rows(
+            "SELECT payload FROM ai_feedback WHERE account=?1 AND document=?2 AND document_key=?3
+             ORDER BY updated_at DESC LIMIT 512",
+            params![id.account, crate::feedback::document_code(id.document), id.key],
+        )?;
+        if entries.iter().any(|entry| entry.key.document != *id) {
+            return Err("Saved feedback does not match its document".into());
+        }
+        Ok(entries)
+    }
+
+    /// An account's ratings updated since `since`, newest first and bounded.
+    pub fn feedback_since(
+        &self,
+        account: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<crate::feedback::Entry>> {
+        let entries = self.feedback_rows(
+            "SELECT payload FROM ai_feedback WHERE account=?1 AND updated_at>=?2
+             ORDER BY updated_at DESC LIMIT 10000",
+            params![account, feedback_time(since)],
+        )?;
+        if entries.iter().any(|entry| entry.key.document.account != account) {
+            return Err("Saved feedback does not match its account".into());
+        }
+        Ok(entries)
+    }
+
+    fn feedback_rows(
+        &self,
+        sql: &str,
+        parameters: impl rusqlite::Params,
+    ) -> Result<Vec<crate::feedback::Entry>> {
+        let mut statement = self
+            .connection
+            .prepare(sql)
+            .map_err(|_| "Read saved feedback failed")?;
+        let rows = statement
+            .query_map(parameters, |row| row.get::<_, String>(0))
+            .map_err(|_| "Read saved feedback failed")?;
+        rows.map(|row| {
+            row.map_err(|_| "Read saved feedback failed".to_owned())
+                .and_then(|payload| feedback_payload(&payload))
+        })
+        .collect()
     }
 
     /// Occurrence keys of meeting reminders already shown, with each meeting's start.
@@ -1272,5 +1419,101 @@ mod document_edit_tests {
         assert!(store.apply_document_recommendation(&proposal, &event).unwrap_err().contains("being prepared"));
         assert_eq!(store.document("owner", &event, Document::Notes).unwrap(), before);
         assert_eq!(store.recommendations().unwrap()[&proposal.id].state, State::Pending);
+    }
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+    use crate::feedback::{DOCUMENT, Output, Rating, Reason, summarize};
+    use serde_json::json;
+
+    fn output(language: crate::i18n::Language) -> (Output, serde_json::Value) {
+        let mut event = crate::calendar::fixture(1).remove(0);
+        event.id = "meeting-1".into();
+        let payload = json!({"summary":"Agree on the pilot.","preparation":["Bring the comparison."],
+            "talking_points":["Start with the workflow."],"open_questions":[],"risks":[],"gaps":[],"sources":[],
+            "cs":{"summary":"Domluvit pilot.","preparation":["Přinést srovnání."],"talking_points":["Začít postupem."],
+                "open_questions":[],"risks":[],"gaps":[]}});
+        let output = Output::new("owner", &event, &payload, language,
+            &crate::prompts::Prompts::default()).unwrap();
+        (output, payload)
+    }
+
+    #[test]
+    fn feedback_round_trips_upserts_clears_and_survives_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let (output, payload) = output(crate::i18n::Language::En);
+        let target = output.target(&payload, "talking_points").unwrap();
+        let first = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let down = output.entry(&target, Rating::Down, [Reason::TooVague].into(), "Be specific", first).unwrap();
+        assert_eq!(store.save_feedback(&down).unwrap(), down);
+        assert_eq!(store.feedback_for_document(&output.id).unwrap(), vec![down.clone()]);
+        let later = chrono::Utc::now();
+        let up = output.entry(&target, Rating::Up, Default::default(), "", later).unwrap();
+        let saved = store.save_feedback(&up).unwrap();
+        assert_eq!(saved.created_at, first, "Re-rating keeps the first rating time");
+        assert_eq!(saved.updated_at, later);
+        assert_eq!(saved.rating, Rating::Up);
+        let document = output.target(&payload, DOCUMENT).unwrap();
+        store.save_feedback(&output.entry(&document, Rating::Up, Default::default(), "", later).unwrap()).unwrap();
+        drop(store);
+        let store = Store::open(root.path()).unwrap();
+        let entries = store.feedback_for_document(&output.id).unwrap();
+        assert_eq!(entries.len(), 2, "One row per document, revision and section");
+        assert_eq!(crate::feedback::current(&entries, &target.key).unwrap(), &saved);
+        assert!(store.clear_feedback(&target.key).unwrap());
+        assert!(!store.clear_feedback(&target.key).unwrap());
+        let entries = store.feedback_for_document(&output.id).unwrap();
+        assert!(crate::feedback::current(&entries, &target.key).is_none());
+        assert_eq!(entries.len(), 1);
+        let mut invalid = down;
+        invalid.key.revision = "invalid".into();
+        assert!(store.save_feedback(&invalid).is_err());
+    }
+
+    #[test]
+    fn new_revisions_start_unrated_but_old_feedback_counts_in_the_window() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let (output, payload) = output(crate::i18n::Language::En);
+        let now = chrono::Utc::now();
+        let old = output.target(&payload, "summary").unwrap();
+        store.save_feedback(&output.entry(&old, Rating::Down, [Reason::Inaccurate].into(), "", now).unwrap()).unwrap();
+        let ancient = output.target(&payload, "preparation").unwrap();
+        store.save_feedback(&output.entry(&ancient, Rating::Down, [Reason::TooLong].into(), "",
+            now - chrono::Duration::days(120)).unwrap()).unwrap();
+        let mut regenerated = payload.clone();
+        regenerated["summary"] = json!("A re-researched overview.");
+        let current = output.target(&regenerated, "summary").unwrap();
+        let entries = store.feedback_for_document(&output.id).unwrap();
+        assert!(crate::feedback::current(&entries, &current.key).is_none());
+        let (czech, _) = self::output(crate::i18n::Language::Cs);
+        assert!(crate::feedback::current(&entries, &czech.target(&payload, "summary").unwrap().key).is_none());
+        let recent = store.feedback_since("owner", now - chrono::Duration::days(crate::feedback::WINDOW_DAYS)).unwrap();
+        assert_eq!(recent.len(), 1);
+        let summary = summarize("owner", &recent, now);
+        assert_eq!(summary.preparation.down, 1);
+        assert_eq!(summary.preparation.reasons, vec![(Reason::Inaccurate, 1)]);
+        assert!(store.feedback_since("other", now - chrono::Duration::days(90)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn existing_profiles_gain_the_feedback_table_without_losing_data() {
+        let root = tempfile::tempdir().unwrap();
+        {
+            let connection = Connection::open(root.path().join("tomlook.db")).unwrap();
+            connection.execute_batch("CREATE TABLE settings(key TEXT PRIMARY KEY,payload TEXT NOT NULL);
+                INSERT INTO settings VALUES('preferences','{\"dark\":false}');").unwrap();
+        }
+        let store = Store::open(root.path()).unwrap();
+        assert!(!store.preferences().unwrap().dark);
+        let (output, payload) = output(crate::i18n::Language::En);
+        let target = output.target(&payload, "summary").unwrap();
+        store.save_feedback(&output.entry(&target, Rating::Up, Default::default(), "", chrono::Utc::now()).unwrap()).unwrap();
+        drop(store);
+        let store = Store::open(root.path()).unwrap();
+        assert_eq!(store.feedback_for_document(&output.id).unwrap().len(), 1);
     }
 }

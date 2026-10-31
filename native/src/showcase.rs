@@ -1,7 +1,82 @@
 use crate::calendar::Event;
-use chrono::{DateTime, Duration, Local};
+use chrono::{DateTime, Duration, Local, Utc};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+
+/// What `--demo-screenshot` captures; chosen with `--demo-scene`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scene {
+    /// Calendar with the selected workshop's details and sample Insights.
+    #[default]
+    Details,
+    /// Expanded sample Insights with ratings and an open "not helpful" reason panel.
+    Feedback,
+    /// Settings > AI prompts summarizing fictional sample feedback.
+    Prompts,
+}
+
+impl Scene {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "details" => Ok(Self::Details),
+            "feedback" => Ok(Self::Feedback),
+            "prompts" => Ok(Self::Prompts),
+            _ => Err("--demo-scene must be details, feedback or prompts".into()),
+        }
+    }
+}
+
+/// Fictional ratings of sample Insights, saved only by the `prompts` screenshot scene.
+pub fn sample_feedback(
+    events: &[Event],
+    prompts: &crate::prompts::Prompts,
+    now: DateTime<Utc>,
+) -> Result<Vec<crate::feedback::Entry>, String> {
+    use crate::feedback::{DOCUMENT, Output, Rating, Reason};
+    type Sample = (&'static str, &'static str, Rating, &'static [Reason], &'static str);
+    const SAMPLES: &[Sample] = &[
+        ("Northstar / Architecture workshop", "talking_points", Rating::Down, &[Reason::TooVague],
+            "Name the concrete trade-offs instead of a generic order."),
+        ("Cedar / Discovery call", "preparation", Rating::Down, &[Reason::TooLong],
+            "Three bullets are enough for a short call."),
+        ("Orbit / Project kickoff", "risks", Rating::Down, &[Reason::NotRelevant], ""),
+        ("Northstar / Pilot review", "talking_points", Rating::Down,
+            &[Reason::TooVague, Reason::MissingImportant],
+            "Missing the open budget question from the last review."),
+        ("Weekly planning", DOCUMENT, Rating::Up, &[], ""),
+        ("Product design review", "summary", Rating::Up, &[], "Clear and short."),
+        ("Cedar / Solution review", DOCUMENT, Rating::Up, &[], ""),
+    ];
+    SAMPLES
+        .iter()
+        .enumerate()
+        .map(|(index, (title, section, rating, reasons, comment))| {
+            let event = events
+                .iter()
+                .find(|event| event.title == *title)
+                .ok_or("Sample feedback meeting is missing")?;
+            let payload = insights(event)?;
+            let output = Output::new(
+                crate::feedback::PREVIEW_ACCOUNT,
+                event,
+                &payload,
+                crate::i18n::Language::En,
+                prompts,
+            )
+            .ok_or("Sample feedback output is invalid")?;
+            let target = output
+                .target(&payload, section)
+                .ok_or("Sample feedback section is missing")?;
+            output.entry(
+                &target,
+                *rating,
+                reasons.iter().copied().collect(),
+                comment,
+                now - Duration::hours(index as i64 + 1),
+            )
+        })
+        .collect()
+}
 
 // Day, start minute, duration, title, category, location, response.
 const MEETINGS: &[(i64, u32, i64, &str, &str, &str, &str)] = &[
@@ -428,6 +503,23 @@ mod tests {
                     .iter()
                     .all(|name| name.ends_with("@example.invalid>"))
         }));
+    }
+
+    #[test]
+    fn sample_feedback_is_fictional_valid_and_summarizes_for_the_demo_account() {
+        let now = Utc::now();
+        let entries = sample_feedback(&events(Local::now(), 200), &Default::default(), now).unwrap();
+        assert!(entries.iter().all(|entry| entry.validate().is_ok()
+            && entry.key.document.account == crate::feedback::PREVIEW_ACCOUNT
+            && entry.event_id.starts_with("synthetic-")));
+        let summary = crate::feedback::summarize(crate::feedback::PREVIEW_ACCOUNT, &entries, now);
+        assert_eq!((summary.preparation.up, summary.preparation.down), (3, 4));
+        assert_eq!(summary.preparation.hot_spots[0], ("talking_points".into(), 2));
+        assert_eq!(summary.preparation.reasons[0], (crate::feedback::Reason::TooVague, 2));
+        for (value, scene) in [("details", Scene::Details), ("feedback", Scene::Feedback), ("prompts", Scene::Prompts)] {
+            assert_eq!(Scene::parse(value).unwrap(), scene);
+        }
+        assert!(Scene::parse("settings").is_err());
     }
 
     #[test]

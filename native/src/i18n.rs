@@ -2294,9 +2294,161 @@ pub const TEXTS: &[(&str, &str)] = &[
         "Question: Who owns the follow-up?",
         "Otázka: Kdo převezme navazující úkol?",
     ),
+    ("Helpful", "Užitečné"),
+    ("Not helpful", "Neužitečné"),
+    ("Click again to clear the rating.", "Dalším kliknutím hodnocení zrušíte."),
+    ("What was not helpful?", "Co nebylo užitečné?"),
+    ("Inaccurate", "Nepřesné"),
+    ("Not relevant", "Nerelevantní"),
+    ("Missing something important", "Chybí něco důležitého"),
+    ("Too long", "Příliš dlouhé"),
+    ("Too vague", "Příliš obecné"),
+    ("Wrong language", "Špatný jazyk"),
+    ("Other", "Jiné"),
+    ("Whole document", "Celý dokument"),
+    (
+        "Comment (optional, up to 500 characters)",
+        "Komentář (nepovinný, nejvýše 500 znaků)",
+    ),
+    ("Save", "Uložit"),
+    (
+        "Feedback stays on this computer and is never sent automatically.",
+        "Zpětná vazba zůstává v tomto počítači a nikdy se automaticky neodesílá.",
+    ),
+    ("Feedback on AI output", "Zpětná vazba na výstupy AI"),
+    (
+        "Feedback is collected for the Before the meeting and After the meeting prompts.",
+        "Zpětná vazba se sbírá pro prompty Před schůzkou a Po schůzce.",
+    ),
+    (
+        "Ratings from the last 90 days. They stay on this computer and are never sent automatically.",
+        "Hodnocení za posledních 90 dní. Zůstávají v tomto počítači a nikdy se automaticky neodesílají.",
+    ),
+    (
+        "Feedback is available once the calendar account is known.",
+        "Zpětná vazba bude dostupná, jakmile bude známý účet kalendáře.",
+    ),
+    ("Loading feedback...", "Načítám zpětnou vazbu…"),
+    (
+        "No feedback in the last 90 days. Rate Insights or meeting notes with the thumb icons.",
+        "Za posledních 90 dní tu není žádná zpětná vazba. Hodnoťte přehledy a zápisy ze schůzek ikonami palce.",
+    ),
+    ("Top reasons:", "Nejčastější důvody:"),
+    ("Most criticized sections:", "Nejčastěji kritizované části:"),
+    ("Recent comments", "Nedávné komentáře"),
+    (
+        "A suggestion needs at least one negative rating.",
+        "Návrh vyžaduje alespoň jedno negativní hodnocení.",
+    ),
+    (
+        "Offline demo never sends AI requests.",
+        "Offline demo nikdy neodesílá požadavky na AI.",
+    ),
+    (
+        "Connect GitHub Copilot to suggest prompt improvements.",
+        "Pro návrh vylepšení promptu připojte GitHub Copilot.",
+    ),
+    (
+        "Connect GitHub Copilot first. No AI request was made.",
+        "Nejdřív připojte GitHub Copilot. Žádný požadavek na AI nebyl odeslán.",
+    ),
+    ("Suggest prompt improvement", "Navrhnout vylepšení promptu"),
+    (
+        "Sends the editor's prompt and summarized feedback to GitHub Copilot once (Thorough profile, no tools). Counts toward the daily AI limit.",
+        "Jednou odešle prompt z editoru a souhrn zpětné vazby do GitHub Copilotu (profil Důkladně, bez nástrojů). Započítá se do denního limitu AI.",
+    ),
+    ("Preparing a prompt suggestion...", "Připravuji návrh promptu…"),
+    ("Suggested prompt (draft)", "Navržený prompt (koncept)"),
+    (
+        "Use draft copies it into the editor above; nothing is saved until you click Save prompts.",
+        "Tlačítko Použít koncept jej zkopíruje do editoru výše; nic se neuloží, dokud nekliknete na Uložit prompty.",
+    ),
+    ("Why these changes", "Proč tyto změny"),
+    ("Changes", "Změny"),
+    (
+        "The editor changed after this suggestion was requested; Use draft replaces the editor text.",
+        "Text v editoru se od vyžádání návrhu změnil; Použít koncept jej nahradí.",
+    ),
+    ("Suggested prompt", "Navržený prompt"),
+    ("Use draft", "Použít koncept"),
+    ("Discard", "Zahodit"),
+    (
+        "Prompt suggestions use feedback on Insights and meeting notes only.",
+        "Návrhy promptů vycházejí jen ze zpětné vazby na přehledy a zápisy ze schůzek.",
+    ),
+    (
+        "Fix the current prompt before requesting a suggestion.",
+        "Před vyžádáním návrhu opravte současný prompt.",
+    ),
+    (
+        "Feedback exceeds the prompt suggestion input limit; nothing was submitted.",
+        "Zpětná vazba překračuje vstupní limit návrhu promptu; nic nebylo odesláno.",
+    ),
+    (
+        "AI returned an oversized prompt suggestion; nothing was changed.",
+        "AI vrátila příliš dlouhý návrh promptu; nic se nezměnilo.",
+    ),
+    (
+        "AI returned an invalid prompt suggestion; nothing was changed.",
+        "AI vrátila neplatný návrh promptu; nic se nezměnilo.",
+    ),
+    (
+        "AI returned an empty prompt suggestion; nothing was changed.",
+        "AI vrátila prázdný návrh promptu; nic se nezměnilo.",
+    ),
+    (
+        "The suggested prompt exceeds 4,000 bytes or contains unsupported characters; nothing was changed.",
+        "Navržený prompt překračuje 4 000 bajtů nebo obsahuje nepodporované znaky; nic se nezměnilo.",
+    ),
+    (
+        "The suggestion did not change the prompt; nothing was changed.",
+        "Návrh prompt nijak neupravil; nic se nezměnilo.",
+    ),
+    (
+        "AI returned a suggestion without a rationale; nothing was changed.",
+        "AI vrátila návrh bez zdůvodnění; nic se nezměnilo.",
+    ),
+    (
+        "Feedback is invalid or exceeds its bounds; nothing was saved",
+        "Zpětná vazba je neplatná nebo překračuje limity; nic nebylo uloženo.",
+    ),
+    (
+        "Feedback no longer matches the displayed document; nothing was saved",
+        "Zpětná vazba už neodpovídá zobrazenému dokumentu; nic nebylo uloženo.",
+    ),
+    (
+        "Feedback belongs to a different calendar account; nothing was saved",
+        "Zpětná vazba patří k jinému účtu kalendáře; nic nebylo uloženo.",
+    ),
+    (
+        "Saved feedback reached its safety limit; nothing was saved",
+        "Uložená zpětná vazba dosáhla bezpečnostního limitu; nic nebylo uloženo.",
+    ),
+    ("Saved feedback is invalid", "Uložená zpětná vazba je neplatná."),
+    ("Save feedback failed", "Zpětnou vazbu se nepodařilo uložit."),
+    (
+        "Daily AI request limit reached; no prompt suggestion was requested.",
+        "Denní limit požadavků na AI je vyčerpán; návrh promptu nebyl vyžádán.",
+    ),
+    (
+        "Copilot reported a session error; no prompt suggestion was produced.",
+        "Copilot nahlásil chybu relace; návrh promptu nevznikl.",
+    ),
+    (
+        "Prompt suggestion cancelled; no draft was produced.",
+        "Návrh promptu byl zrušen; koncept nevznikl.",
+    ),
+    (
+        "The prompt or feedback contains an app credential; nothing was submitted",
+        "Prompt nebo zpětná vazba obsahuje přihlašovací údaj aplikace; nic nebylo odesláno.",
+    ),
 ];
 
 const PATTERNS: &[(&str, &str)] = &[
+    (
+        "Prompt suggestion exceeded its {}-second limit; retry explicitly",
+        "Návrh promptu překročil limit {0} s; zkuste to znovu ručně.",
+    ),
     (
         "Automatic reconnect in about {} seconds.",
         "Další automatický pokus přibližně za {0} s.",
@@ -2477,6 +2629,7 @@ mod tests {
             include_str!("app/calendar.rs"),
             include_str!("app/connections.rs"),
             include_str!("app/event_editor.rs"),
+            include_str!("app/feedback.rs"),
             include_str!("app/meeting.rs"),
             include_str!("app/palette.rs"),
             include_str!("app/recommendations.rs"),
