@@ -37,9 +37,9 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The latest native Windows release is **[v0.6.1](https://github.com/tkubica12/ai-outlook/releases/tag/v0.6.1)**.
-Read the [release notes](docs/releases/v0.6.1.md) for changes since v0.6.0.
-Download **[Tomlook-v0.6.1-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.6.1/Tomlook-v0.6.1-win-x64.zip)**
+The latest native Windows release is **[v0.7.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.7.0)**.
+Read the [release notes](docs/releases/v0.7.0.md) for changes since v0.6.1.
+Download **[Tomlook-v0.7.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.7.0/Tomlook-v0.7.0-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable, unsigned,
 and does not install anything.
@@ -97,7 +97,14 @@ Exit a running release before publishing. `release\`, `.build\` and Cargo
 Published binaries are versioned through GitHub Releases; the local `release\`
 directory still contains only the current executable. The native Cargo package
 version also sets the executable's Windows file/product version. Versioned
-release notes are kept in `docs\releases\`.
+release notes are kept in `docs\releases\`. After committing and pushing a
+version bump with its `docs\releases\vX.Y.Z.md`, run
+`.\scripts\package-release.ps1 -Publish` to build, stage the ZIP (executable,
+license and regenerated third-party notices) and `SHA256SUMS.txt`, push an
+annotated tag and create the GitHub Release. It packages
+`native\target\release` directly and never replaces a running
+`release\Tomlook.exe`. Without `-Publish` it only stages the archive in
+`.build\releases\`.
 Run native checks from `native\` with `cargo test --locked --offline` and
 `cargo clippy --locked --offline --all-targets -- -D warnings`.
 
@@ -283,7 +290,7 @@ provider call using saved findings, not a resumed provider session.
 background. Travel-before/after or category proposals go to the recommendation
 bell, not just the Ask answer; no calendar write occurs without approval.
 
-In the current development build, AI can also propose edits instead of only
+AI can also propose edits instead of only
 describing them: add existing-material references to Insights, correct saved
 meeting notes, change a category, reserve travel before/after a timed meeting,
 or edit the title/description of an event you organize. **Review changes**
@@ -296,8 +303,7 @@ in bounded, revision-consistent pages. Online descriptions permit appending text
 without replacing the Teams meeting blob. This does not grant the model a
 calendar, file, CRM or approval tool; uncertain calendar outcomes are never
 automatically replayed. See [AI-proposed edits](native/README.md#ai-proposed-edits)
-for limits and approval safeguards. Published v0.6.1 does not yet include this
-development feature.
+for limits and approval safeguards.
 
 The SDK still owns an installed proprietary Copilot runtime child, not a Rust
 rewrite of that runtime. Preparation requires isolated authentication and
