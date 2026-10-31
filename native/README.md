@@ -330,6 +330,56 @@ are theme-aware vector icons grouped in the Ask header, with translated tooltips
 accessible button names and visible keyboard focus. Enter asks; Shift+Enter adds
 a line. Meeting links select the meeting and open its saved Insights without
 losing the conversation or draft.
+
+### AI-proposed edits
+
+Interactive Quick, Thorough and Auto conversations can call
+`tomlook_propose_meeting_change` to stage a typed **pending proposal**, not execute
+a mutation. The answer's **Review changes** button opens the exact proposal in
+Messages (also available from the bell). Inspect its meeting, dates, reason and
+before/after preview, then explicitly choose **Approve change** or skip it.
+Opening the preview, continuing the conversation, or saying "approve" in chat
+never executes the change. Pending proposals and consumed approvals survive
+restart; ordinary chat history remains memory-only.
+
+Completed bilingual Insights and meeting notes support replacement of selected
+narrative sections: summary, preparation, talking points, open questions, risks
+and gaps. Both languages change together; original sources, observed evidence,
+recommendations and host metadata are not model-editable. References can be
+Markdown links in narrative, with their actual verification limits stated.
+The host retains approved sections during later preparation and updates
+untouched sections normally. Bounded, explicitly marked excerpts of approved
+English context inform subsequent research; source-backed contradictions belong
+in gaps for review, not silent replacement of approved text.
+
+`tomlook_insights_read` also reads notes and individual bilingual sections.
+Large results use bounded UTF-8 byte pages with an opaque full-document revision;
+mixed-version continuation is rejected. A proposal must replace a complete
+section, not a truncated page. Local approval atomically adds a briefing version
+or updates notes and consumes the approval in the same SQLite transaction,
+without requiring a network connection. Changed account, event or document
+rejects the old proposal; stale document proposals are removed. Completed notes
+remain processed-once, and in-flight notes cannot be edited until they finish.
+Pending automatic recommendations are expired after an approved document edit
+rather than leaving tips based on the superseded narrative.
+
+Calendar proposals reuse the native single-use, account/occurrence/fingerprint
+bound writer. They can set/clear ordinary categories while preserving Follow,
+add an exact before/after travel block for an accepted timed meeting, or edit the
+title/description of an event the user organizes. Travel is one 15-180 minute
+block in 15-minute steps, without attendees, with inherited parent privacy;
+all-day or conflicting intervals are rejected. Text proposals show notification
+consequences when attendees exist. The original description is read again just
+before dispatch. Inserted description text is escaped; online meetings permit
+append only, preserving the complete original meeting blob as required by
+[Graph's update-event guidance](https://learn.microsoft.com/graph/api/event-update).
+No series master, arbitrary PATCH body, direct MCP write, file/CRM write or
+approval tool is exposed to the model. Background preparation stays read-only.
+At most four proposals per question and sixteen pending manual changes per
+account are admitted. Unknown remote outcomes stay review-only, never replayed
+automatically. Fresh preflight is not remote compare-and-swap: WorkIQ's generic
+update tool cannot supply an If-Match header.
+
 Hide, native-window Close, and Ctrl+Space only hide Ask, never cancel it.
 Escape first dismisses visible command suggestions, then hides the panel.
 **Stop** explicitly requests cancellation. A quiet Ask status in the main header
@@ -467,7 +517,8 @@ buffer or post-meeting follow-up. A neighbouring workshop does not establish an
 active role in that placeholder; recommendations must concern their own meeting.
 Category corrections remain available for these entries.
 
-The SDK and its tools remain strictly read-only. A separate native WorkIQ writer
+The SDK has source-reading tools and a proposal-only staging tool, never a
+mutation or approval tool. A separate native WorkIQ writer
 accepts only a concrete user-confirmed proposal for the calendar's connected owner.
 It can replace an event's **entire categories array with exactly one existing
 category**, or create one busy preparation/travel buffer with **no attendees**.

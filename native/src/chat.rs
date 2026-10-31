@@ -108,6 +108,8 @@ pub struct Run {
     pub local: Arc<AtomicUsize>,
     pub remote: Arc<AtomicUsize>,
     pub cancelled: std::sync::atomic::AtomicBool,
+    proposal_attempts: AtomicUsize,
+    changes: Mutex<Vec<String>>,
     started: Instant,
     progress: Mutex<Progress>,
     protected: Mutex<Option<BTreeSet<String>>>,
@@ -122,6 +124,8 @@ impl Run {
             local: Arc::new(AtomicUsize::new(mode.local_reads())),
             remote: Arc::new(AtomicUsize::new(mode.remote_reads())),
             cancelled: std::sync::atomic::AtomicBool::new(false),
+            proposal_attempts: AtomicUsize::new(0),
+            changes: Mutex::new(Vec::new()),
             started: Instant::now(),
             progress: Mutex::new(Progress {
                 mode,
@@ -134,6 +138,23 @@ impl Run {
 
     pub fn stage(&self, stage: &str) {
         self.update(|progress| progress.stage = stage.into());
+    }
+
+    pub fn reserve_proposal(&self) -> Result<(), String> {
+        self.proposal_attempts.try_update(Ordering::AcqRel, Ordering::Acquire, |count|
+            (count < 4).then_some(count + 1)).map(|_| ())
+            .map_err(|_| "At most four change proposals can be requested per question".into())
+    }
+
+    pub fn record_change(&self, id: String) -> Result<(), String> {
+        let mut changes = self.changes.lock().map_err(|_| "Proposal was saved, but its chat link could not be recorded; inspect Messages")?;
+        if !changes.contains(&id) { changes.push(id); }
+        Ok(())
+    }
+
+    pub fn changes(&self) -> Result<Vec<String>, String> {
+        self.changes.lock().map(|changes| changes.clone())
+            .map_err(|_| "Saved proposal links are unavailable; inspect Messages".into())
     }
 
     pub fn protect(&self, terms: impl IntoIterator<Item = String>) {
@@ -278,6 +299,7 @@ pub fn tool_label(name: &str) -> &'static str {
         crate::chat_cache::SEARCH => "Searching saved meetings",
         crate::chat_cache::DETAIL => "Reading a saved meeting",
         crate::chat_cache::INSIGHTS => "Reading saved Insights",
+        crate::changes::PROPOSE => "Preparing a change for approval",
         crate::context::SEARCH => "Searching local materials",
         crate::context::READ => "Reading a local document",
         crate::workiq::connection::SDK_TOOL => "Reading mail or calendar in Microsoft 365",

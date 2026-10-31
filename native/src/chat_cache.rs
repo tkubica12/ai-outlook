@@ -285,12 +285,36 @@ struct Id {
     id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentRead {
+    id: String,
+    #[serde(default)]
+    document: Option<crate::changes::Document>,
+    #[serde(default)]
+    section: Option<String>,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    revision: Option<String>,
+}
+
 pub fn valid(name: &str, arguments: &Value) -> bool {
     match name {
         SEARCH => serde_json::from_value::<Search>(arguments.clone())
             .is_ok_and(|args| args.range().is_ok()),
-        DETAIL | INSIGHTS => serde_json::from_value::<Id>(arguments.clone())
+        DETAIL => serde_json::from_value::<Id>(arguments.clone())
             .is_ok_and(|args| !args.id.is_empty() && args.id.len() <= 2000),
+        INSIGHTS => serde_json::from_value::<DocumentRead>(arguments.clone()).is_ok_and(|args|
+            !args.id.is_empty() && args.id.len() <= 2000 && args.offset <= 512_000
+            && (args.offset == 0 || args.revision.is_some())
+            && args.revision.as_ref().is_none_or(|revision| revision.len() == 64
+                && revision.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            && args.section.as_ref().is_none_or(|section|
+                crate::changes::SECTION_NAMES.contains(&section.as_str())
+                    || matches!(section.as_str(), "sources" | "recommendations" | "tomlook_approved_sections"))),
+        crate::changes::PROPOSE => serde_json::from_value::<crate::changes::Request>(arguments.clone())
+            .is_ok_and(|request| request.validate().is_ok()),
         _ => false,
     }
 }
@@ -354,7 +378,7 @@ fn compact(event: &Event) -> Value {
         "is_all_day":event.is_all_day,"category":event.category,"status":event.status,
         "organizer":event.organizer,"attendees":event.attendees.iter().take(16).collect::<Vec<_>>(),
         "attendees_total":event.attendee_count(),"location":event.location,"source_url":event.source_url,
-        "event_fingerprint":event.fingerprint()})
+        "event_fingerprint":event.fingerprint(),"event_revision":crate::scheduler::fingerprint(event)})
 }
 
 impl Cache {
@@ -411,34 +435,48 @@ impl Cache {
                 "note":"Local snapshot, not a live provider read. Results are candidates, not verified entity matches. search_match shows each keyword's matched field, normalized token and typo distance; fuzzy similarity is not identity or semantic relevance. Inspect actual meeting metadata and reject unrelated candidates. Incomplete or old coverage cannot prove absence. No matches are not proof that an event or material does not exist."
             }));
         }
-        let id: Id = serde_json::from_value(arguments).map_err(|_| "Invalid meeting identity")?;
+        let id = arguments["id"].as_str().ok_or("Invalid meeting identity")?;
         let event = calendar
             .events
             .iter()
-            .find(|event| event.id == id.id)
+            .find(|event| event.id == id)
             .ok_or("Meeting is not in this account's cache")?;
         if name == DETAIL {
             return Ok(compact(event));
         }
-        let saved = store
-            .briefing(&id.id)?
-            .map(|text| {
-                serde_json::from_str::<Value>(&text).map_err(|_| "Saved Insights are invalid")
-            })
-            .transpose()?;
-        if saved
-            .as_ref()
-            .is_some_and(|value| value.to_string().len() > 56_000)
-        {
-            return Err("Saved Insights exceed the bounded tool result; narrow the request".into());
-        }
+        let args: DocumentRead = serde_json::from_value(arguments).map_err(|_| "Invalid document read")?;
+        let document = args.document.unwrap_or(crate::changes::Document::Insights);
+        let owner = store.calendar_owner()?.ok_or("Calendar account disappeared")?;
+        let saved = store.document(&owner, event, document)?;
         let current = saved.as_ref().is_some_and(|value| {
             value["tomlook_event_fingerprint"].as_str() == Some(event.fingerprint().as_str())
         });
-        Ok(
-            json!({"meeting":compact(event),"insights":saved,"matches_current_meeting":current,
-            "note":"Saved AI analysis is derived evidence, not verified current fact. Check captured source dates and gaps. Missing or stale Insights do not prove missing preparation."}),
-        )
+        let revision = saved.as_ref().map(crate::changes::revision).transpose()?;
+        if args.revision.is_some() && args.revision != revision {
+            return Err("Saved document changed between pages; restart with offset zero".into());
+        }
+        let selected = match (&saved, &args.section) {
+            (Some(value), Some(section)) if crate::changes::SECTION_NAMES.contains(&section.as_str()) =>
+                Some(json!({"en":value[section],"cs":value["cs"][section]})),
+            (Some(value), Some(section)) => Some(value[section].clone()),
+            _ => saved.clone(),
+        };
+        let raw = selected.as_ref().map(Value::to_string).unwrap_or_default();
+        if args.offset > raw.len() || !raw.is_char_boundary(args.offset) {
+            return Err("Use the next_offset returned by the previous document page".into());
+        }
+        let end = raw.floor_char_boundary((args.offset + 12_000).min(raw.len()));
+        let legacy = args.section.is_none() && args.offset == 0 && raw.len() <= 40_000;
+        let mut result = json!({"meeting":compact(event),"document":document,"revision":revision,
+            "section":args.section,"editable_sections":crate::changes::SECTION_NAMES,
+            "content":(!legacy).then(|| &raw[args.offset..end]),"format":"json_utf8",
+            "offset":args.offset,"total_bytes":raw.len(),
+            "next_offset":(!legacy && end < raw.len()).then_some(end),
+            "matches_current_meeting":current,
+            "note":"Saved AI analysis is derived evidence, not fresh source verification. Narrative sections are bilingual: summary is a string and other sections are arrays of strings. For large documents read only the needed section, then follow next_offset with the SAME revision, document and section. Offsets are UTF-8 bytes. A proposal replaces complete selected sections, not partial pages; preserve their other items. Original sources and host metadata are not editable. Missing/stale analysis does not prove missing preparation."});
+        result[if document == crate::changes::Document::Insights { "insights" } else { "notes" }] =
+            if legacy { saved.unwrap_or(Value::Null) } else { Value::Null };
+        Ok(result)
     }
 }
 
@@ -507,9 +545,92 @@ pub fn tools(
             .with_handler(handler.clone()),
         github_copilot_sdk::Tool::new(DETAIL).with_description("Read one saved meeting by an already known id. Includes full local times, response state and bounded participant metadata. Calendar search already returns these same fields; do not reread its meetings merely to confirm the title, dates, category or invitation response. Read-only; never changes a meeting.")
             .with_parameters(json!({"type":"object","properties":{"id":{"type":"string","maxLength":2000}},"required":["id"],"additionalProperties":false})).with_handler(handler.clone()),
-        github_copilot_sdk::Tool::new(INSIGHTS).with_description("Read saved meeting Insights before researching it again. Reports whether the derived analysis matches the current event fingerprint and includes captured sources/gaps. Old AI conclusions are not fresh original-source verification.")
-            .with_parameters(json!({"type":"object","properties":{"id":{"type":"string","maxLength":2000}},"required":["id"],"additionalProperties":false})).with_handler(handler),
+        github_copilot_sdk::Tool::new(INSIGHTS).with_description("Read saved Insights or post-meeting notes, including an opaque document revision for proposing edits. Defaults to insights; document=notes reads saved meeting notes. Large results are paged as JSON text in content. Prefer section=summary/preparation/talking_points/open_questions/risks/gaps to read its complete bilingual en/cs values without large source arrays. May also read sources, recommendations or tomlook_approved_sections (read-only metadata). Continue with next_offset plus identical document, section and revision; a changed document rejects mixed-version pages. Never edit a section you have not read completely, and keep unaffected items. Small unsectioned results retain the insights/notes object. Reports whether analysis matches the current event. Old AI conclusions are not fresh source verification.")
+            .with_parameters(json!({"type":"object","properties":{"id":{"type":"string","maxLength":2000},
+                "document":{"type":"string","enum":["insights","notes"]},"section":{"type":"string",
+                    "enum":["summary","preparation","talking_points","open_questions","risks","gaps","sources","recommendations","tomlook_approved_sections"]},
+                "offset":{"type":"integer","minimum":0,"maximum":512000},"revision":{"type":"string","minLength":64,"maxLength":64}},
+                "required":["id"],"additionalProperties":false})).with_handler(handler),
     ]
+}
+
+struct ProposalHandler {
+    cache: Cache,
+    commands: std::sync::mpsc::SyncSender<crate::worker::Command>,
+    recorder: Arc<Recorder>,
+    run: Arc<crate::chat::Run>,
+}
+
+#[async_trait]
+impl github_copilot_sdk::tool::ToolHandler for ProposalHandler {
+    async fn call(&self, invocation: github_copilot_sdk::ToolInvocation)
+        -> Result<github_copilot_sdk::ToolResult, github_copilot_sdk::Error> {
+        let name = invocation.tool_name;
+        self.run.stage("Preparing a change for approval");
+        let result = async {
+            self.run.reserve(false)?;
+            self.run.reserve_proposal()?;
+            if self.run.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("Question stopped; no proposal was submitted".into());
+            }
+            let request: crate::changes::Request = serde_json::from_value(invocation.arguments)
+                .map_err(|_| "Invalid typed meeting-change proposal")?;
+            request.validate()?;
+            let (reply, result) = tokio::sync::oneshot::channel();
+            self.commands.try_send(crate::worker::Command::ProposeChange {
+                account: self.cache.account.clone(), request: Box::new(request), run: self.run.clone(), reply,
+            }).map_err(|_| "Proposal worker is busy or stopped; no proposal was queued")?;
+            let value = tokio::time::timeout(std::time::Duration::from_secs(30), result).await
+                .map_err(|_| "Proposal confirmation timed out; inspect Messages before requesting it again")?
+                .map_err(|_| "Proposal worker stopped; inspect Messages before requesting it again")??;
+            if let Some(id) = value["change_id"].as_str() { self.run.record_change(id.into())?; }
+            self.run.protect_result(&value);
+            Ok(value)
+        }.await;
+        let succeeded = result.is_ok();
+        let output = crate::context::result_for(&self.recorder, &name, result);
+        self.run.completed(&name, succeeded);
+        Ok(output)
+    }
+}
+
+pub fn proposal_tool(
+    cache: Cache,
+    commands: std::sync::mpsc::SyncSender<crate::worker::Command>,
+    recorder: Arc<Recorder>,
+    run: Arc<crate::chat::Run>,
+) -> github_copilot_sdk::Tool {
+    let text = json!({"type":"string","maxLength":16000});
+    let section = json!({"type":"object","properties":{
+        "name":{"type":"string","enum":crate::changes::SECTION_NAMES},
+        "en":{"oneOf":[text.clone(),{"type":"array","maxItems":64,"items":{"type":"string","maxLength":4000}}]},
+        "cs":{"oneOf":[text.clone(),{"type":"array","maxItems":64,"items":{"type":"string","maxLength":4000}}]}
+    },"required":["name","en","cs"],"additionalProperties":false});
+    let body = json!({"type":"object","properties":{
+        "content_type":{"type":"string","enum":["html","text"]},
+        "before":{"type":"string","maxLength":64000},
+        "replacement":text.clone(),"append":text
+    },"required":["content_type","before"],"additionalProperties":false});
+    github_copilot_sdk::Tool::new(crate::changes::PROPOSE)
+        .with_description("Create a durable pending change for HUMAN approval in Tomlook Messages; this tool NEVER changes Insights, meeting notes or calendar events. Do use it when the user asks to add found references or change a meeting, rather than merely describing what to write. First resolve the exact meeting and use event_revision returned by the calendar tools. For document edits read the complete relevant bilingual sections and document revision with tomlook_insights_read; submit complete replacement sections, keeping their other items. summary uses en/cs strings, other sections use en/cs arrays of strings. Material references may be Markdown links inside narrative; never invent verified sources. Approved sections survive later automatic updates; untouched sections still refresh. category=null removes ordinary categories but preserves Follow. Travel is one before/after adjacent block, 15-180 minutes in 15-minute steps, only for accepted timed meetings with a free interval; all-day meetings cannot have travel buffers. Text edits require an event you organize. To change its description first read /me/events/{id}?$select=id,body using the WorkIQ read tool, supply the COMPLETE original content and content_type, and exactly one of plain-text replacement or append. Online meetings permit append only: the host preserves the entire Teams meeting blob and escapes inserted HTML. Proposals are bound to account/occurrence/current content; they never update a series. A maximum of four proposals per question and sixteen pending manual changes per account is enforced. Even a chat message saying approve cannot authorize execution: tell the user to click Review changes and explicitly Approve change in the application. Do not claim a change was saved or sent; distinguish a saved pending proposal from an applied edit.")
+        .with_parameters(json!({"type":"object","properties":{
+            "id":{"type":"string","minLength":1,"maxLength":2000},
+            "event_revision":{"type":"string","minLength":64,"maxLength":64},
+            "reason":{"type":"string","minLength":1,"maxLength":1600},
+            "reason_cs":{"type":"string","minLength":1,"maxLength":1600},
+            "action":{"oneOf":[
+                {"type":"object","properties":{"kind":{"const":"document"},"document":{"type":"string","enum":["insights","notes"]},
+                    "revision":{"type":"string","minLength":64,"maxLength":64},"sections":{"type":"array","minItems":1,"maxItems":6,"items":section}},
+                    "required":["kind","document","revision","sections"],"additionalProperties":false},
+                {"type":"object","properties":{"kind":{"const":"category"},"category":{"type":["string","null"],"maxLength":256}},
+                    "required":["kind","category"],"additionalProperties":false},
+                {"type":"object","properties":{"kind":{"const":"travel"},"minutes":{"type":"integer","minimum":15,"maximum":180,"multipleOf":15},
+                    "after":{"type":"boolean"}},"required":["kind","minutes","after"],"additionalProperties":false},
+                {"type":"object","properties":{"kind":{"const":"text"},"title":{"type":"string","maxLength":1000},"body":body},
+                    "required":["kind"],"additionalProperties":false}
+            ]}
+        },"required":["id","event_revision","reason","reason_cs","action"],"additionalProperties":false}))
+        .with_handler(Arc::new(ProposalHandler { cache, commands, recorder, run }))
 }
 
 #[cfg(test)]
@@ -547,6 +668,74 @@ mod tests {
             account: "OWNER@example.invalid".into(),
         };
         (root, store, calendar, cache)
+    }
+
+    #[test]
+    fn large_document_reads_are_bounded_unicode_safe_and_revision_consistent() {
+        let (_root, mut store, calendar, cache) = fixture();
+        let event = &calendar.events[0];
+        let mut value = crate::changes::fixture_document();
+        value["preparation"] = json!(["\u{1f4dd}\u{17e}".repeat(3000)]);
+        value["cs"]["preparation"] = value["preparation"].clone();
+        value["sources"] = json!([{"excerpt":"original evidence ".repeat(6000)}]);
+        store.save_prepared(&Default::default(), &event.id, &value).unwrap();
+        let header = cache.read(INSIGHTS, json!({"id":event.id})).unwrap();
+        assert!(header["insights"].is_null());
+        assert!(header["next_offset"].as_u64().unwrap() > 0);
+        assert!(header.to_string().len() < 56_000);
+        let expected = json!({"en":value["preparation"],"cs":value["cs"]["preparation"]});
+        let mut offset = 0;
+        let mut content = String::new();
+        loop {
+            let page = cache.read(INSIGHTS, json!({"id":event.id,"section":"preparation",
+                "offset":offset,"revision":header["revision"]})).unwrap();
+            let chunk = page["content"].as_str().unwrap();
+            assert!(chunk.len() <= 12_000);
+            assert!(page.to_string().len() < 56_000);
+            assert_eq!(page["revision"], header["revision"]);
+            content.push_str(chunk);
+            let Some(next) = page["next_offset"].as_u64() else { break; };
+            assert!(next > offset);
+            offset = next;
+        }
+        assert_eq!(serde_json::from_str::<Value>(&content).unwrap(), expected);
+        value["summary"] = json!("An intervening update");
+        store.save_prepared(&Default::default(), &event.id, &value).unwrap();
+        assert!(cache.read(INSIGHTS, json!({"id":event.id,"section":"preparation","offset":12000,
+            "revision":header["revision"]})).unwrap_err().contains("changed between pages"));
+        assert!(!valid(INSIGHTS, &json!({"id":event.id,"offset":12000})));
+    }
+
+    #[test]
+    fn saved_notes_are_read_by_account_and_proposal_arguments_cannot_request_direct_writes() {
+        let (_root, store, calendar, cache) = fixture();
+        let event = &calendar.events[0];
+        let mut value = crate::changes::fixture_document();
+        value["tomlook_recap"] = json!(true);
+        let now = Local::now().fixed_offset();
+        let mut ledger = crate::recaps::Ledger::default();
+        let key = ledger.begin("owner@example.invalid", event, now);
+        ledger.finish(&key, Ok(Some(value.clone())), now);
+        store.save_recaps(&ledger).unwrap();
+        let result = cache.read(INSIGHTS, json!({"id":event.id,"document":"notes"})).unwrap();
+        assert_eq!(result["notes"], value);
+        assert_eq!(result["revision"], crate::changes::revision(&value).unwrap());
+        assert_eq!(result["meeting"]["event_revision"], crate::scheduler::fingerprint(event));
+        let request = json!({"id":event.id,"event_revision":crate::scheduler::fingerprint(event),
+            "reason":"Existing draft found","reason_cs":"Nalezen existujici koncept",
+            "action":{"kind":"document","document":"notes","revision":result["revision"],
+                "sections":[{"name":"summary","en":"Updated summary","cs":"Upraveny souhrn"}]}});
+        assert!(valid(crate::changes::PROPOSE, &request));
+        for action in [json!({"kind":"approve"}), json!({"kind":"delete"}),
+            json!({"kind":"document","document":"notes","revision":result["revision"],
+                "sections":[{"name":"sources","en":[],"cs":[]}]})] {
+            let mut invalid = request.clone();
+            invalid["action"] = action;
+            assert!(!valid(crate::changes::PROPOSE, &invalid));
+        }
+        let mut account_injection = request;
+        account_injection["account"] = json!("another-owner");
+        assert!(!valid(crate::changes::PROPOSE, &account_injection));
     }
 
     #[test]

@@ -32,6 +32,7 @@ pub struct Answer {
     pub markdown: Arc<crate::markdown::Document>,
     pub evidence: Arc<crate::evidence::Snapshot>,
     pub proposals: Arc<Vec<crate::proposals::Proposal>>,
+    pub change_ids: Arc<Vec<String>>,
 }
 
 impl Answer {
@@ -45,12 +46,14 @@ impl Answer {
             text: Arc::new(text),
             evidence,
             proposals,
+            change_ids: Arc::new(Vec::new()),
         }
     }
 }
 
 struct Sources {
     translation: bool,
+    wake: Option<std::sync::mpsc::SyncSender<crate::worker::Command>>,
     workiq: Option<Arc<crate::workiq::connection::Connection>>,
     index: Option<Arc<crate::source_index::Index>>,
     connectors: Option<Arc<crate::connectors::Registry>>,
@@ -1272,9 +1275,10 @@ impl Engine {
                                         let connector_revision = connectors.context_revision();
                                         let telemetry = telemetry.clone();
                                         let prompts = prompts.clone();
+                                        let proposal_wake = wake.clone();
                                         tasks.spawn(async move {
                                             let id = question.id;
-                                            let result = ask(harness, *question, cancelled, progress, true, Sources { translation: false, workiq: workiq_connection, index, connectors: Some(connectors), telemetry: Some(telemetry), prompts }).await.map_err(RequestError::message);
+                                            let result = ask(harness, *question, cancelled, progress, true, Sources { translation: false, wake: proposal_wake, workiq: workiq_connection, index, connectors: Some(connectors), telemetry: Some(telemetry), prompts }).await.map_err(RequestError::message);
                                             Completion::Answer { id, connector_revision, result }
                                         });
                                     } else {
@@ -1310,7 +1314,7 @@ impl Engine {
                                             cancellations.insert(id, (cancel, false));
                                             if request.mode == crate::chat::Mode::Auto { auto_requests.insert(id); }
                                             if let Some(account)=request.question.account.clone() { chat_accounts.insert(id,account); }
-                                            let sources = Sources { translation: false, workiq: workiq.clone(), index: source_index.clone(), connectors: Some(connectors.clone()), telemetry: Some(telemetry.clone()), prompts: prompts.clone() };
+                                            let sources = Sources { translation: false, wake: wake.clone(), workiq: workiq.clone(), index: source_index.clone(), connectors: Some(connectors.clone()), telemetry: Some(telemetry.clone()), prompts: prompts.clone() };
                                             let connector_revision = connectors.context_revision();
                                             let root = root.clone();
                                             let output = output.clone();
@@ -1368,7 +1372,7 @@ impl Engine {
                                                 },
                                                 meeting: Some(request.event.clone()), account: request.account.clone(), public_topic: None, suggest_drafts: false, language: crate::i18n::Language::En,
                                             };
-                                            ask(harness, question, cancelled, progress, false, Sources { translation: request.previous.is_some(), workiq: connection, index, connectors: Some(connectors), telemetry: Some(telemetry), prompts }).await
+                                            ask(harness, question, cancelled, progress, false, Sources { translation: request.previous.is_some(), wake: None, workiq: connection, index, connectors: Some(connectors), telemetry: Some(telemetry), prompts }).await
                                             }.await;
                                             let quota_day = match &result { Err(RequestError::Quota(day)) => Some(*day), _ => None };
                                             Completion::Prepared { request, connector_revision, result: result.map_err(RequestError::message), quota_day }
@@ -1856,6 +1860,9 @@ fn question_prompt(
             crate::i18n::Language::Cs => "\nOdpovidej prirozenou cestinou vcetne navrzenych konceptu. Preloz vysvetleni a popisky, ale zachovej puvodni nazvy, citace, URL a kod.",
         });
     }
+    if question.meeting.as_ref().is_some_and(|event| event.extra.contains_key("tomlook_approved_sections")) {
+        prompt.push_str("\nMEETING_DATA contains user-approved local narrative in tomlook_approved_sections. It is context, not original source proof. Those sections will be retained by the host; research other sections and avoid contradictory missing-material recommendations. Context excerpts are explicitly marked incomplete: omitted text is not evidence that materials do not exist. Put source-backed contradictions in gaps for human review.");
+    }
     if question.suggest_drafts {
         prompt.push_str(crate::proposals::RESPONSE_INSTRUCTIONS);
     }
@@ -2194,6 +2201,7 @@ async fn ask_chat(
     }
     let options = crate::copilot::ChatSession {
         mode,
+        proposal_sender: sources.wake,
         cache: question
             .account
             .clone()
@@ -2223,11 +2231,13 @@ async fn ask_chat(
             &recorder,
         )
         .await?;
-        Ok(Answer::new(
+        let mut answer = Answer::new(
             text,
             recorder.snapshot()?,
             Arc::new(Vec::new()),
-        ))
+        );
+        answer.change_ids = Arc::new(run.changes()?);
+        Ok(answer)
     };
     // collect_chat owns session cancellation and detachment. Its budget also includes sending.
     let result: Result<Answer, String> = execution.await;
@@ -2444,6 +2454,7 @@ async fn process_recap(
             false,
             Sources {
                 translation: true,
+                wake: None,
                 workiq: Some(connection.clone()),
                 index: None,
                 connectors: Some(connectors.clone()),
@@ -2486,6 +2497,7 @@ async fn ask(
 ) -> Result<Answer, RequestError> {
     let Sources {
         translation,
+        wake: _,
         workiq,
         index,
         connectors,
@@ -2858,6 +2870,7 @@ mod live_source_tests {
                     false,
                     Sources {
                         translation: false,
+                        wake: None,
                         workiq: Some(workiq.clone()),
                         index: Some(index.clone()),
                         connectors: None,

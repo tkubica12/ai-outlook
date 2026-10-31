@@ -99,8 +99,19 @@ impl Ledger {
     }
 
     pub fn record(&self, account: &str, event: &Event) -> Option<&Record> {
-        self.records.get(&key(account, event)).or_else(|| self.records.values()
+        self.records.get(&key(account, event)).filter(|record| record.account == account).or_else(|| self.records.values()
             .find(|record| record.account == account && record.event_id == event.id))
+    }
+
+    pub fn record_mut(&mut self, account: &str, event: &Event) -> Option<&mut Record> {
+        let preferred = key(account, event);
+        let key = if self.records.get(&preferred).is_some_and(|record| record.account == account) {
+            preferred
+        } else {
+            self.records.iter().find(|(_, record)| record.account == account && record.event_id == event.id)
+                .map(|(key, _)| key.clone())?
+        };
+        self.records.get_mut(&key)
     }
 }
 

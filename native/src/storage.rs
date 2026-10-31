@@ -646,6 +646,12 @@ impl Store {
         let coverage = current.coverage.union(&next.coverage).copied().collect();
         let calendar = Calendar::build(events, coverage, Vec::new())?;
         let transaction = self.connection.transaction().map_err(|e| e.to_string())?;
+        if let Some(owner) = owner.as_deref().filter(|owner| *owner != account) {
+            transaction.execute(
+                "UPDATE briefings SET payload=json_set(payload,'$.tomlook_account',?1)
+                 WHERE json_valid(payload) AND json_extract(payload,'$.tomlook_account') IS NULL",
+                [owner]).map_err(|_| "Bind existing Insights to their calendar account failed")?;
+        }
         Self::write_calendar(&transaction, &calendar)?;
         if owner.as_deref() != Some(account) {
             transaction
@@ -837,12 +843,133 @@ impl Store {
         Ok(())
     }
 
+    pub fn document(
+        &self,
+        account: &str,
+        event: &Event,
+        document: crate::changes::Document,
+    ) -> Result<Option<serde_json::Value>> {
+        if self.calendar_owner()?.as_deref() != Some(account) {
+            return Err("Saved document belongs to a different calendar account".into());
+        }
+        let value = match document {
+            crate::changes::Document::Insights => self.briefing(&event.id)?
+                .map(|raw| serde_json::from_str(&raw).map_err(|_| "Saved Insights are invalid"))
+                .transpose()?,
+            crate::changes::Document::Notes => self.recaps()?.record(account, event)
+                .filter(|record| record.account == account).and_then(|record| record.payload.clone()),
+        };
+        if let Some(value) = &value { crate::changes::revision(value)?; }
+        Ok(value)
+    }
+
+    pub fn retain_insight_edits(&self, id: &str, payload: &mut serde_json::Value) -> Result<()> {
+        if let Some(raw) = self.briefing(id)? {
+            let previous = serde_json::from_str(&raw).map_err(|_| "Saved Insights are invalid")?;
+            crate::changes::retain_approved(&previous, payload)?;
+        }
+        Ok(())
+    }
+
+    pub fn apply_document_recommendation(
+        &self,
+        proposal: &crate::recommendations::Recommendation,
+        event: &Event,
+    ) -> Result<std::collections::BTreeMap<String, crate::recommendations::Recommendation>> {
+        use crate::recommendations::{Change, Kind, State};
+        let Some(Change::Document(edit)) = &proposal.manual_change else {
+            return Err("This approval is not a saved-document edit".into());
+        };
+        let transaction = self.connection.unchecked_transaction()
+            .map_err(|_| "Begin document approval failed")?;
+        if self.calendar_owner()?.as_deref() != Some(proposal.account.as_str())
+            || proposal.suggestion.kind != Kind::Manual || event.id != proposal.event_id {
+            return Err("Document approval no longer matches its calendar account".into());
+        }
+        let calendar = self.calendar()?;
+        let current = proposal.current(&calendar, Some(&proposal.account), chrono::Local::now().fixed_offset())
+            .ok_or("Meeting changed after this proposal; nothing was saved")?;
+        if crate::scheduler::fingerprint(event) != crate::scheduler::fingerprint(current) {
+            return Err("Meeting changed after confirmation; nothing was saved".into());
+        }
+        let raw: String = transaction.query_row(
+            "SELECT payload FROM settings WHERE key='recommendation-inbox-v1'", [], |row| row.get(0))
+            .map_err(|_| "Read saved document proposal failed")?;
+        if raw.len() > 4 * 1024 * 1024 { return Err("Saved proposal inbox exceeds its safety limit".into()); }
+        let mut inbox: std::collections::BTreeMap<String, crate::recommendations::Recommendation> =
+            serde_json::from_str(&raw).map_err(|_| "Saved proposal inbox is invalid")?;
+        let saved = inbox.get_mut(&proposal.id).ok_or("Document proposal no longer exists")?;
+        if saved.state != State::Pending || saved.account != proposal.account
+            || saved.fingerprint != proposal.fingerprint || saved.manual_change != proposal.manual_change {
+            return Err("Document approval was already consumed or changed; nothing was saved".into());
+        }
+        let original = self.document(&proposal.account, current, edit.document)?
+            .ok_or("The saved document no longer exists")?;
+        let mut next = edit.apply(&original, &proposal.id)?;
+        next["tomlook_account"] = proposal.account.clone().into();
+        crate::changes::revision(&next)?;
+        let json = serde_json::to_string(&next).map_err(|_| "Encode edited document failed")?;
+        match edit.document {
+            crate::changes::Document::Insights => {
+                transaction.execute(
+                    "INSERT INTO briefings SELECT ?1,COALESCE(MAX(version),0)+1,?2,?3 FROM briefings WHERE meeting_id=?1",
+                    params![event.id, json, chrono::Utc::now().to_rfc3339()])
+                    .map_err(|_| "Save approved Insights failed")?;
+            }
+            crate::changes::Document::Notes => {
+                let raw: String = transaction.query_row(
+                    "SELECT payload FROM settings WHERE key='meeting-recaps-v1'", [], |row| row.get(0))
+                    .map_err(|_| "Read saved notes ledger failed")?;
+                if raw.len() > 32 * 1024 * 1024 { return Err("Saved notes ledger exceeds its safety limit".into()); }
+                let mut ledger: crate::recaps::Ledger = serde_json::from_str(&raw)
+                    .map_err(|_| "Saved notes ledger is invalid")?;
+                let record = ledger.record_mut(&proposal.account, current)
+                    .ok_or("Saved meeting notes no longer exist")?;
+                if record.checking {
+                    return Err("Meeting notes are being prepared; wait before approving their edit".into());
+                }
+                record.payload = Some(next.clone());
+                record.message = "Approved meeting notes saved".into();
+                let json = serde_json::to_string(&ledger).map_err(|_| "Encode edited notes ledger failed")?;
+                if json.len() > 32 * 1024 * 1024 {
+                    return Err("Meeting notes ledger exceeds its safety limit".into());
+                }
+                transaction.execute("UPDATE settings SET payload=?1 WHERE key='meeting-recaps-v1'", [json])
+                    .map_err(|_| "Save approved meeting notes failed")?;
+            }
+        }
+        if self.document(&proposal.account, current, edit.document)?.as_ref() != Some(&next) {
+            return Err("Edited document read-back did not match; nothing was saved".into());
+        }
+        saved.state = State::Applied;
+        saved.message = "Approved edits saved; changed sections are preserved during future AI updates".into();
+        for record in inbox.values_mut().filter(|record| record.account == proposal.account
+            && record.event_id == event.id && record.suggestion.kind != Kind::Manual && record.state == State::Pending) {
+            record.state = State::Expired;
+            record.message = "Insights changed after this recommendation; review the updated meeting".into();
+        }
+        let json = serde_json::to_string(&inbox).map_err(|_| "Encode consumed document approval failed")?;
+        if json.len() > 4 * 1024 * 1024 { return Err("Proposal inbox exceeds its safety limit".into()); }
+        transaction.execute("UPDATE settings SET payload=?1 WHERE key='recommendation-inbox-v1'", [&json])
+            .map_err(|_| "Save consumed document approval failed")?;
+        let saved: String = transaction.query_row(
+            "SELECT payload FROM settings WHERE key='recommendation-inbox-v1'", [], |row| row.get(0))
+            .map_err(|_| "Verify consumed document approval failed")?;
+        if saved != json { return Err("Document approval read-back did not match".into()); }
+        transaction.commit().map_err(|_| "Commit document edit and approval failed")?;
+        Ok(inbox)
+    }
+
     pub fn briefing(&self, id: &str) -> Result<Option<String>> {
         use rusqlite::OptionalExtension;
         self.connection
             .query_row(
-                "SELECT payload FROM briefings WHERE meeting_id=?1 ORDER BY version DESC LIMIT 1",
-                [id],
+                "SELECT payload FROM briefings WHERE meeting_id=?1
+                 AND CASE WHEN json_valid(payload) THEN
+                    (json_extract(payload,'$.tomlook_account') IS NULL OR json_extract(payload,'$.tomlook_account')=?2)
+                    ELSE 1 END
+                 ORDER BY version DESC LIMIT 1",
+                params![id, self.calendar_owner()?],
                 |row| row.get(0),
             )
             .optional()
@@ -888,12 +1015,28 @@ impl Store {
         id: &str,
         payload: &serde_json::Value,
     ) -> Result<()> {
-        let json = serde_json::to_string(payload).map_err(|e| e.to_string())?;
+        let mut payload = payload.clone();
+        let account = self.calendar_owner()?;
+        if let Some(account) = &account {
+            payload["tomlook_account"] = account.clone().into();
+        }
         let ledger = serde_json::to_string(queue).map_err(|e| e.to_string())?;
         if ledger.len() > 32 * 1024 * 1024 {
             return Err("Preparation ledger reached its safety limit".into());
         }
         let transaction = self.connection.transaction().map_err(|e| e.to_string())?;
+        let previous: Option<String> = transaction.query_row(
+            "SELECT payload FROM briefings WHERE meeting_id=?1
+             AND CASE WHEN json_valid(payload) THEN
+                (json_extract(payload,'$.tomlook_account') IS NULL OR json_extract(payload,'$.tomlook_account')=?2)
+                ELSE 1 END
+             ORDER BY version DESC LIMIT 1",
+            params![id, account], |row| row.get(0)).optional().map_err(|_| "Read approved sections before preparation failed")?;
+        if let Some(previous) = previous {
+            let previous = serde_json::from_str(&previous).map_err(|_| "Saved Insights are invalid")?;
+            crate::changes::retain_approved(&previous, &mut payload)?;
+        }
+        let json = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
         transaction.execute("INSERT INTO briefings SELECT ?1,COALESCE(MAX(version),0)+1,?2,?3 FROM briefings WHERE meeting_id=?1",
             params![id, json, chrono::Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
         let saved: String = transaction
@@ -910,5 +1053,163 @@ impl Store {
         transaction
             .commit()
             .map_err(|e| format!("Commit prepared briefing: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod document_edit_tests {
+    use super::*;
+    use crate::{changes::{Document, DocumentEdit, Section}, recommendations::{Change, Recommendation, State}};
+    use serde_json::json;
+
+    fn fixture(document: Document) -> (tempfile::TempDir, Store, Event, Recommendation) {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::open(root.path()).unwrap();
+        let now = chrono::Local::now().fixed_offset();
+        let mut event = crate::calendar::fixture(1).remove(0);
+        event.start = now + chrono::Duration::hours(if document == Document::Notes { -2 } else { 24 });
+        event.end = event.start + chrono::Duration::hours(1);
+        event.is_all_day = false;
+        event.status = "accepted".into();
+        event.extra.insert("type".into(), json!("singleInstance"));
+        event.extra.insert("isOrganizer".into(), json!(true));
+        event.extra.insert("onlineMeeting".into(), json!({"joinUrl":"https://teams.microsoft.com/l/meetup-join/example"}));
+        let calendar = Calendar::build(vec![event.clone()],
+            [event.start.with_timezone(&chrono::Local).date_naive()].into(), vec![]).unwrap();
+        store.save_workiq_calendar(&calendar, "owner").unwrap();
+        let mut value = crate::changes::fixture_document();
+        value["tomlook_event_fingerprint"] = json!(event.fingerprint());
+        match document {
+            Document::Insights => store.save_prepared(&Default::default(), &event.id, &value).unwrap(),
+            Document::Notes => {
+                value["tomlook_recap"] = json!(true);
+                let mut ledger = crate::recaps::Ledger::default();
+                let key = ledger.begin("owner", &event, now);
+                ledger.finish(&key, Ok(Some(value)), now);
+                store.save_recaps(&ledger).unwrap();
+            }
+        }
+        let value = store.document("owner", &event, document).unwrap().unwrap();
+        let section = Section { name: "preparation".into(),
+            en: json!(["Review the [existing draft](https://example.invalid/draft)."]),
+            cs: json!(["Zkontrolovat [existujici koncept](https://example.invalid/draft)."]) };
+        let edit = DocumentEdit::new(document, crate::changes::revision(&value).unwrap(), vec![section], &value).unwrap();
+        let proposal = Recommendation::from_manual(&event, "owner", Change::Document(edit), now).unwrap();
+        store.save_recommendations(&[(proposal.id.clone(), proposal.clone())].into()).unwrap();
+        (root, store, event, proposal)
+    }
+
+    #[test]
+    fn local_document_approval_is_atomic_single_use_and_survives_restart() {
+        let (root, store, event, proposal) = fixture(Document::Insights);
+        let before = store.document("owner", &event, Document::Insights).unwrap().unwrap();
+        assert_eq!(before["preparation"], json!(["Review the existing draft."]));
+        assert_eq!(store.recommendations().unwrap()[&proposal.id].state, State::Pending);
+        let inbox = store.apply_document_recommendation(&proposal, &event).unwrap();
+        assert_eq!(inbox[&proposal.id].state, State::Applied);
+        let saved = store.document("owner", &event, Document::Insights).unwrap().unwrap();
+        assert_eq!(saved["preparation"], json!(["Review the [existing draft](https://example.invalid/draft)."]));
+        assert_eq!(saved["cs"]["preparation"], json!(["Zkontrolovat [existujici koncept](https://example.invalid/draft)."]));
+        assert_eq!(saved["sources"], before["sources"]);
+        assert!(store.apply_document_recommendation(&proposal, &event).is_err());
+        drop(store);
+        let store = Store::open(root.path()).unwrap();
+        assert_eq!(store.document("owner", &event, Document::Insights).unwrap().unwrap(), saved);
+        assert_eq!(store.recommendations().unwrap()[&proposal.id].state, State::Applied);
+        store.save_recommendations(&[(proposal.id.clone(), proposal.clone())].into()).unwrap();
+        assert_eq!(store.recommendations().unwrap()[&proposal.id].state, State::Applied);
+        assert!(store.apply_document_recommendation(&proposal, &event).is_err());
+        let versions: u32 = store.connection.query_row(
+            "SELECT count(*) FROM briefings WHERE meeting_id=?1", [&event.id], |row| row.get(0)).unwrap();
+        assert_eq!(versions, 2);
+    }
+
+    #[test]
+    fn consumed_approval_failure_rolls_back_document_insert_and_keeps_proposal_pending() {
+        let (_root, store, event, proposal) = fixture(Document::Insights);
+        let before = store.briefing(&event.id).unwrap();
+        store.connection.execute_batch(
+            "CREATE TRIGGER reject_document_receipt BEFORE UPDATE ON settings
+             WHEN NEW.key='recommendation-inbox-v1'
+             BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;").unwrap();
+        assert!(store.apply_document_recommendation(&proposal, &event).is_err());
+        assert_eq!(store.briefing(&event.id).unwrap(), before);
+        assert_eq!(store.recommendations().unwrap()[&proposal.id].state, State::Pending);
+        let versions: u32 = store.connection.query_row("SELECT count(*) FROM briefings", [], |row| row.get(0)).unwrap();
+        assert_eq!(versions, 1);
+    }
+
+    #[test]
+    fn changed_document_or_meeting_cannot_consume_the_original_approval() {
+        let (_root, mut store, event, proposal) = fixture(Document::Insights);
+        let mut fresh = crate::changes::fixture_document();
+        fresh["summary"] = json!("A newer analysis arrived");
+        store.save_prepared(&Default::default(), &event.id, &fresh).unwrap();
+        let before = store.briefing(&event.id).unwrap();
+        assert!(store.apply_document_recommendation(&proposal, &event).is_err());
+        assert_eq!(store.briefing(&event.id).unwrap(), before);
+        assert_eq!(store.recommendations().unwrap()[&proposal.id].state, State::Pending);
+        let mut changed = event.clone();
+        changed.title.push_str(" rescheduled");
+        let calendar = Calendar::build(vec![changed.clone()],
+            [changed.start.with_timezone(&chrono::Local).date_naive()].into(), vec![]).unwrap();
+        store.save_workiq_calendar(&calendar, "owner").unwrap();
+        assert!(store.apply_document_recommendation(&proposal, &event).is_err());
+    }
+
+    #[test]
+    fn fresh_automatic_preparation_retains_only_approved_sections_and_does_not_cross_accounts() {
+        let (_root, mut store, event, proposal) = fixture(Document::Insights);
+        store.apply_document_recommendation(&proposal, &event).unwrap();
+        let approved = store.document("owner", &event, Document::Insights).unwrap().unwrap();
+        let mut fresh = crate::changes::fixture_document();
+        fresh["preparation"] = json!(["Generated text must not replace the approved edit"]);
+        fresh["talking_points"] = json!(["New technical detail"]);
+        fresh["cs"]["talking_points"] = json!(["Novy technicky detail"]);
+        store.save_prepared(&Default::default(), &event.id, &fresh).unwrap();
+        let saved = store.document("owner", &event, Document::Insights).unwrap().unwrap();
+        assert_eq!(saved["preparation"], approved["preparation"]);
+        assert_eq!(saved["cs"]["preparation"], approved["cs"]["preparation"]);
+        assert_eq!(saved["talking_points"], fresh["talking_points"]);
+        assert_eq!(saved["cs"]["talking_points"], fresh["cs"]["talking_points"]);
+        store.connection.execute(
+            "UPDATE briefings SET payload=json_remove(payload,'$.tomlook_account')", []).unwrap();
+        let calendar = store.calendar().unwrap();
+        store.save_workiq_calendar(&calendar, "different-owner").unwrap();
+        assert!(store.briefing(&event.id).unwrap().is_none());
+        assert!(store.document("owner", &event, Document::Insights).is_err());
+        assert!(store.apply_document_recommendation(&proposal, &event).is_err());
+        store.save_prepared(&Default::default(), &event.id, &fresh).unwrap();
+        let other = store.document("different-owner", &event, Document::Insights).unwrap().unwrap();
+        assert_eq!(other["preparation"], fresh["preparation"]);
+        assert!(crate::changes::approved_context(&other).is_none());
+        store.save_workiq_calendar(&calendar, "owner").unwrap();
+        assert_eq!(store.document("owner", &event, Document::Insights).unwrap().unwrap()["preparation"], approved["preparation"]);
+    }
+
+    #[test]
+    fn editing_notes_keeps_original_sources_and_processed_once_behavior() {
+        let (_root, store, event, proposal) = fixture(Document::Notes);
+        let before = store.document("owner", &event, Document::Notes).unwrap().unwrap();
+        store.apply_document_recommendation(&proposal, &event).unwrap();
+        let ledger = store.recaps().unwrap();
+        let saved = ledger.record("owner", &event).unwrap().payload.as_ref().unwrap();
+        assert_eq!(saved["tomlook_recap"], true);
+        assert_eq!(saved["sources"], before["sources"]);
+        assert!(crate::recaps::eligible(&event, chrono::Local::now().fixed_offset()));
+        assert!(ledger.due("owner", &[event], chrono::Local::now().fixed_offset()).is_none());
+        assert!(crate::changes::approved_context(saved).is_some());
+    }
+
+    #[test]
+    fn in_flight_notes_cannot_overwrite_a_newly_approved_local_edit() {
+        let (_root, store, event, proposal) = fixture(Document::Notes);
+        let before = store.document("owner", &event, Document::Notes).unwrap();
+        let mut ledger = store.recaps().unwrap();
+        ledger.begin("owner", &event, chrono::Local::now().fixed_offset());
+        store.save_recaps(&ledger).unwrap();
+        assert!(store.apply_document_recommendation(&proposal, &event).unwrap_err().contains("being prepared"));
+        assert_eq!(store.document("owner", &event, Document::Notes).unwrap(), before);
+        assert_eq!(store.recommendations().unwrap()[&proposal.id].state, State::Pending);
     }
 }

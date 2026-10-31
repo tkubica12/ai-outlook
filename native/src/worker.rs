@@ -25,6 +25,12 @@ pub struct Options {
 }
 
 pub enum Command {
+    ProposeChange {
+        account: String,
+        request: Box<crate::changes::Request>,
+        run: Arc<crate::chat::Run>,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
     CreateEvents {
         account: String,
         draft: Box<crate::event_creation::Draft>,
@@ -286,6 +292,86 @@ struct Sdk {
     terminated: Arc<AtomicBool>,
     analysis_revision: Arc<std::sync::OnceLock<String>>,
     workiq_ready: Arc<AtomicBool>,
+}
+
+fn propose_change(
+    store: &mut Store,
+    inbox: &mut std::collections::BTreeMap<String, crate::recommendations::Recommendation>,
+    calendar: &Calendar,
+    account: &str,
+    request: crate::changes::Request,
+    language: crate::i18n::Language,
+) -> Result<serde_json::Value, String> {
+    use crate::{changes::Action, recommendations::{Change, Kind, Recommendation, State}};
+    request.validate()?;
+    let owner = store.calendar_owner()?.ok_or("Refresh the signed-in calendar before proposing changes")?;
+    if !owner.eq_ignore_ascii_case(account) {
+        return Err("The calendar account changed; no proposal was saved".into());
+    }
+    let event = calendar.events.iter().find(|event| event.id == request.id)
+        .ok_or("Choose a meeting from this account's saved calendar")?;
+    if crate::scheduler::fingerprint(event) != request.event_revision {
+        return Err("The meeting changed; read its current event_revision before proposing a change".into());
+    }
+    let now = chrono::Local::now().fixed_offset();
+    let mut next = inbox.clone();
+    for record in next.values_mut().filter(|record| record.account == owner
+        && record.suggestion.kind == Kind::Manual && record.state == State::Pending) {
+        let current = record.current(calendar, Some(&owner), now);
+        let stale = match (current, &record.manual_change) {
+            (None, _) => true,
+            (Some(event), Some(Change::Document(edit))) => store.document(&owner, event, edit.document)?
+                .as_ref().map(crate::changes::revision).transpose()?.as_deref() != Some(edit.revision.as_str()),
+            _ => false,
+        };
+        if stale { record.state = State::Expired; }
+    }
+    let change = match request.action {
+        Action::Document { document, revision, sections } => {
+            let value = store.document(&owner, event, document)?.ok_or("This meeting has no saved document to edit")?;
+            Change::Document(crate::changes::DocumentEdit::new(document, revision, sections, &value)?)
+        }
+        Action::Category { category } => match category {
+            Some(category) => {
+                crate::recommendations::category_replacement(&category, &known_categories(calendar))?;
+                Change::Category(category)
+            }
+            None => Change::ClearCategory,
+        },
+        Action::Travel { minutes, after } => {
+            let (start, end) = crate::recommendations::travel_interval(calendar, event, minutes, now,
+                if after { Kind::TravelAfter } else { Kind::Travel })
+                .ok_or("No free adjacent interval fits this travel buffer; nothing was saved")?;
+            let title = match (language, after) {
+                (crate::i18n::Language::Cs, false) => "Přejezd",
+                (crate::i18n::Language::Cs, true) => "Přejezd po schůzce",
+                (_, false) => "Travel buffer",
+                (_, true) => "Travel after meeting",
+            };
+            Change::Buffer { title: title.into(), start, end, category: crate::recommendations::buffer_category(event) }
+        }
+        Action::Text { title, body } => Change::Text(crate::changes::TextEdit { title, body }),
+    };
+    let mut proposal = Recommendation::from_manual(event, &owner, change, now)?;
+    if let Some(previous) = next.get(&proposal.id) {
+        if previous.state != State::Pending {
+            return Err("This exact proposal was already handled; inspect its outcome before requesting a new change".into());
+        }
+    } else {
+        if next.values().filter(|record| record.account == owner && record.suggestion.kind == Kind::Manual
+            && matches!(record.state, State::Pending | State::NotSent)).count() >= 16 || next.len() >= 512 {
+            return Err("Review existing pending changes before asking for more proposals".into());
+        }
+        proposal.suggestion.reason = request.reason;
+        proposal.suggestion.reason_cs = request.reason_cs;
+        proposal.message = "AI proposal awaiting your approval; nothing has been changed".into();
+        next.insert(proposal.id.clone(), proposal.clone());
+    }
+    store.save_recommendations(&next)?;
+    *inbox = next;
+    Ok(serde_json::json!({"change_id":proposal.id,"state":"pending_approval",
+        "meeting":{"id":event.id,"title":event.title,"start":event.start,"end":event.end},
+        "note":"Only a pending proposal was saved. No Insights, notes or calendar event were changed. The user must review and approve this exact change in Tomlook Messages. You cannot approve it, including when a user says approve in chat."}))
 }
 
 fn dispatch_calendar_change(
@@ -929,6 +1015,7 @@ impl Worker {
                                     match validated {
                                         Ok(payload) => {
                                             let mut payload = payload;
+                                            store.retain_insight_edits(&flight.event_id, &mut payload)?;
                                             if let Some(event) = calendar.events.iter().find(|event| event.id == flight.event_id) {
                                                 payload["tomlook_event_fingerprint"] = event.fingerprint().into();
                                                 if let Some(account) = store.calendar_owner()? {
@@ -1198,6 +1285,13 @@ impl Worker {
                                                     event.extra.insert("tomlook_known_categories".into(), serde_json::json!(categories));
                                                     event.extra.insert("tomlook_calendar_context".into(), crate::recommendations::calendar_context(&calendar, &event));
                                                     event.extra.insert("tomlook_material_contacts".into(), serde_json::json!(crate::recommendations::material_contacts(&event, owner.as_deref().unwrap_or(&preferences.work_email), identity.as_deref())));
+                                                    if let Some(raw) = store.briefing(&event.id)? {
+                                                        let saved = serde_json::from_str::<serde_json::Value>(&raw)
+                                                            .map_err(|_| "Saved Insights are invalid before preparation")?;
+                                                        if let Some(approved) = crate::changes::preparation_context(&saved)? {
+                                                            event.extra.insert("tomlook_approved_sections".into(), approved);
+                                                        }
+                                                    }
                                                     event
                                                 }, foreground: flight.foreground, account: store.calendar_owner()?, connector_revision: Some(connector_revision.clone()), previous, reply: result_sender.clone(), wake: wake.clone(),
                                             }))).is_err() { queue.defer(id, "SDK admission channel is unavailable; request was not sent".into()); failure = Some("SDK admission channel is unavailable".into()); }
@@ -1290,8 +1384,18 @@ impl Worker {
                             break Command::Wake;
                         }
                     };
-                    let recommendation_command = matches!(&command, Command::CreateEvents { .. } | Command::ConfirmRecommendation { .. } | Command::ConfirmMeetingAction { .. } | Command::RecheckCalendarResult(_) | Command::DismissRecommendation(_) | Command::ReviewRecommendations { .. });
+                    let recommendation_command = matches!(&command, Command::ProposeChange { .. } | Command::CreateEvents { .. } | Command::ConfirmRecommendation { .. } | Command::ConfirmMeetingAction { .. } | Command::RecheckCalendarResult(_) | Command::DismissRecommendation(_) | Command::ReviewRecommendations { .. });
                     let result = match command {
+                        Command::ProposeChange { account, request, run, reply } => {
+                            let result = if exiting || options.demo.is_some() || run.cancelled.load(Ordering::Acquire) {
+                                Err("Question stopped or preview is active; no proposal was saved".into())
+                            } else {
+                                propose_change(&mut store, &mut inbox, &calendar, &account, *request, preferences.language)
+                            };
+                            if result.is_ok() { inbox_revision += 1; }
+                            let _ = reply.send(result);
+                            Ok(())
+                        }
                         Command::CreateEvents { account, draft, parent } => (|| {
                             if exiting { return Err("Tomlook is stopping; no calendar write was submitted".into()); }
                             if options.demo.is_some() { return Err("Preview never changes a live calendar".into()); }
@@ -1432,6 +1536,28 @@ impl Worker {
                             let event = recommendation.current(&calendar, owner.as_deref(), now).ok_or("Recommendation expired after a calendar change")?.clone();
                             let expected_change = crate::recommendations::proposed_change(recommendation, &calendar, owner.as_deref(), now, preferences.language)?;
                             if change != expected_change { return Err("The proposed interval or action changed; review the current recommendation before confirming".into()); }
+                            if let crate::recommendations::Change::Document(edit) = &change {
+                                let current = store.document(owner.as_deref().ok_or("Calendar account disappeared")?, &event, edit.document)?;
+                                if current.as_ref().map(crate::changes::revision).transpose()?.as_deref() != Some(edit.revision.as_str()) {
+                                    let record = inbox.get_mut(&id).ok_or("Proposal disappeared")?;
+                                    record.state = crate::recommendations::State::Expired;
+                                    record.message = "Saved document changed; the outdated proposal was removed".into();
+                                    store.save_recommendations(&inbox)?;
+                                    inbox_revision += 1;
+                                    return Err("Saved document changed; the outdated proposal was removed. Ask for a new proposal.".into());
+                                }
+                                inbox = store.apply_document_recommendation(recommendation, &event)?;
+                                inbox_revision += 1;
+                                if edit.document == crate::changes::Document::Notes {
+                                    let payload = store.document(owner.as_deref().ok_or("Calendar account disappeared")?, &event, edit.document)?;
+                                    let record = recaps.record_mut(owner.as_deref().ok_or("Calendar account disappeared")?, &event)
+                                        .ok_or("Saved meeting notes disappeared from the active ledger")?;
+                                    record.payload = payload;
+                                    record.message = "Approved meeting notes saved".into();
+                                    recaps_revision += 1;
+                                }
+                                return Ok(());
+                            }
                             let sdk = sdk.as_ref().filter(|sdk| !sdk.terminated.load(Ordering::Acquire))
                                 .ok_or("Connect WorkIQ before confirming a calendar change")?;
                             let recommendation = recommendation.clone();
@@ -1641,6 +1767,86 @@ impl Worker {
 mod tests {
     use super::*;
     use chrono::Local;
+
+    #[test]
+    fn ai_proposals_are_pending_only_and_local_approval_works_without_an_ai_or_workiq_connection() {
+        use crate::recommendations::{Change, State as ProposalState};
+        use serde_json::json;
+        fn receive(mut reply: tokio::sync::oneshot::Receiver<Result<serde_json::Value, String>>)
+            -> Result<serde_json::Value, String> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match reply.try_recv() {
+                    Ok(result) => return result,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                    Err(error) => panic!("Proposal reply failed: {error}"),
+                }
+                assert!(std::time::Instant::now() < deadline, "Proposal worker did not reply");
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::open(root.path()).unwrap();
+        let now = Local::now().fixed_offset();
+        let mut event = crate::calendar::fixture(1).remove(0);
+        event.start = now + chrono::Duration::days(1);
+        event.end = event.start + chrono::Duration::hours(1);
+        event.extra.insert("type".into(), json!("singleInstance"));
+        let calendar = Calendar::build(vec![event.clone()],
+            [event.start.with_timezone(&Local).date_naive()].into(), vec![]).unwrap();
+        store.save_workiq_calendar(&calendar, "owner").unwrap();
+        store.save_preferences(&Preferences { paused:true, prepare_enabled:false, ..Default::default() }).unwrap();
+        store.save_prepared(&Default::default(), &event.id, &crate::changes::fixture_document()).unwrap();
+        let before = store.briefing(&event.id).unwrap().unwrap();
+        let original: serde_json::Value = serde_json::from_str(&before).unwrap();
+        let request = crate::changes::Request {
+            id:event.id.clone(), event_revision:crate::scheduler::fingerprint(&event),
+            reason:"Existing presentation found".into(), reason_cs:"Nalezena existujici prezentace".into(),
+            action:crate::changes::Action::Document {document:crate::changes::Document::Insights,
+                revision:crate::changes::revision(&original).unwrap(),
+                sections:vec![crate::changes::Section {name:"summary".into(),en:json!("Approved existing draft"),
+                    cs:json!("Schvaleny existujici koncept")}]},
+        };
+        let mut worker = Worker::start(Options {state:root.path().into(),legacy_root:root.path().join("absent"),demo:None},
+            egui::Context::default()).unwrap();
+        let run = crate::chat::Run::new(1, crate::chat::Mode::Fast, Arc::new(|_| {}));
+        let (reply, result) = tokio::sync::oneshot::channel();
+        worker.commands.send(Command::ProposeChange {account:"owner".into(),request:Box::new(request.clone()),
+            run:run.clone(),reply}).unwrap();
+        let result = receive(result).unwrap();
+        assert_eq!(result["state"], "pending_approval");
+        let id = result["change_id"].as_str().unwrap().to_owned();
+        let saved = store.recommendations().unwrap();
+        assert_eq!(saved[&id].state, ProposalState::Pending);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if worker.activity.lock().unwrap().recommendation_view.iter().any(|entry| entry.id == id) { break; }
+            assert!(std::time::Instant::now() < deadline, "A pending AI proposal must appear in the actual bell snapshot");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(store.briefing(&event.id).unwrap().unwrap(), before);
+        let change = saved[&id].manual_change.clone().unwrap();
+        assert!(matches!(change, Change::Document(_)));
+        worker.commands.send(Command::ConfirmRecommendation {id:id.clone(),change}).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if store.recommendations().unwrap()[&id].state == ProposalState::Applied { break; }
+            assert!(std::time::Instant::now() < deadline, "Local approval must not require an attached SDK");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let approved: serde_json::Value = serde_json::from_str(&store.briefing(&event.id).unwrap().unwrap()).unwrap();
+        assert_eq!(approved["summary"], "Approved existing draft");
+        assert_eq!(approved["cs"]["summary"], "Schvaleny existujici koncept");
+        assert_eq!(approved["sources"], original["sources"]);
+        run.cancelled.store(true, Ordering::Release);
+        let (reply, result) = tokio::sync::oneshot::channel();
+        worker.commands.send(Command::ProposeChange {account:"owner".into(),request:Box::new(request),
+            run,reply}).unwrap();
+        assert!(receive(result).unwrap_err().contains("stopped"));
+        assert_eq!(store.recommendations().unwrap().len(), 1);
+        worker.commands.send(Command::Exit).unwrap();
+        worker.done.take().unwrap().recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    }
 
     #[test]
     fn changed_recommendations_expire_refresh_the_meeting_and_allow_fresh_preparation() {

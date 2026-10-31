@@ -2504,6 +2504,10 @@ impl Tomlook {
                 }
                 ui.add_space(8.0);
                 match &mut draft.change {
+                    Change::Document(_) | Change::Text(_) => {
+                        ui.label(language.text("Review AI-proposed edits in Messages."));
+                        return;
+                    }
                     Change::Category(category) => {
                         let old = tomlook::recommendations::real_categories(&draft.event);
                         ui.label(format!("{}: {} -> {category}", language.text("Category"),
@@ -3169,6 +3173,9 @@ impl Tomlook {
         if let Some(briefing) = &self.briefing {
             let notes = briefing.get("tomlook_recap").and_then(serde_json::Value::as_bool) == Some(true);
             let narrative = language.insight(briefing);
+            if tomlook::changes::approved_context(briefing).is_some() {
+                ui.weak(language.text("Approved sections are preserved during automatic updates."));
+            }
             if briefing
                 .get("translation_only")
                 .and_then(serde_json::Value::as_bool)
@@ -3970,6 +3977,21 @@ impl Tomlook {
                 context.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
                 context.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
             }
+            ask::Action::ReviewChanges(ids) => {
+                let now = chrono::Local::now().fixed_offset();
+                self.recommendation_selected = ids.iter().find(|id|
+                    self.activity.recommendations.get(*id).is_some_and(|record|
+                        record.visible(&self.calendar, self.calendar_owner.as_deref(), now)))
+                    .cloned().or_else(|| ids.first().cloned());
+                self.messages_open = true;
+                self.recommendations_tab = true;
+                let local = self.recommendation_selected.as_ref().and_then(|id| self.activity.recommendations.get(id))
+                    .is_some_and(|record| matches!(record.manual_change, Some(tomlook::recommendations::Change::Document(_))));
+                if !local && self.ai.is_some() { self.ai_command(ai::Command::RefreshCalendarAvailability); }
+                context.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+                context.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
+                context.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+            }
             ask::Action::Hide => {
                 self.assistant = false;
                 self.focus_assistant = false;
@@ -4587,6 +4609,12 @@ impl Tomlook {
             language,
         );
         let heading = match recommendation.suggestion.kind {
+            RecommendationKind::Manual => match &recommendation.manual_change {
+                Some(Change::Document(edit)) => edit.document.label(),
+                Some(Change::Text(_)) => "Edit meeting text",
+                Some(Change::Buffer { .. }) => "Add travel buffer",
+                _ => recommendation.suggestion.kind.label(),
+            },
             RecommendationKind::Category => "Change category",
             RecommendationKind::Preparation => "Make time to prepare",
             RecommendationKind::PreparationAdvance => "Prepare in advance",
@@ -4624,6 +4652,49 @@ impl Tomlook {
                 ui.add_space(8.0);
                 if let Ok(change) = &change {
                     match change {
+                        Change::Document(edit) => {
+                            ui.weak(language.text("Updates both languages; untouched sections and original evidence stay unchanged."));
+                            for (before, after) in edit.before.iter().zip(&edit.after) {
+                                let label = match after.name.as_str() {
+                                    "summary" => "Overview", "preparation" => "Preparation",
+                                    "talking_points" => "Talking points", "open_questions" => "Open questions",
+                                    "risks" => "Risks", "gaps" => "Gaps", _ => &after.name,
+                                };
+                                egui::CollapsingHeader::new(language.text(label))
+                                    .id_salt((&recommendation.id, &after.name)).default_open(true).show(ui, |ui| {
+                                        ui.weak(language.text("Before"));
+                                        ui.label(before.text(language));
+                                        ui.add_space(6.0);
+                                        ui.strong(language.text("After"));
+                                        ui.label(after.text(language));
+                                    });
+                            }
+                            ui.weak(language.text("Approved sections are preserved during automatic updates."));
+                        }
+                        Change::Text(edit) => {
+                            if let Some(title) = &edit.title {
+                                ui.weak(language.text("Before"));
+                                if let Some(event) = event { ui.label(&event.title); }
+                                ui.strong(language.text("After"));
+                                ui.label(title);
+                            }
+                            if let Some(body) = &edit.body {
+                                if let Some(text) = &body.append {
+                                    ui.strong(language.text("Append to description"));
+                                    ui.label(text);
+                                    ui.collapsing(language.text("Current description"), |ui| { ui.label(body.before_text()); });
+                                } else if let Some(text) = &body.replacement {
+                                    ui.weak(language.text("Before"));
+                                    ui.label(body.before_text());
+                                    ui.strong(language.text("After"));
+                                    ui.label(text);
+                                }
+                            }
+                            ui.weak(language.text("This occurrence only"));
+                            if event.is_some_and(|event| event.attendee_count() > 0) {
+                                ui.label(RichText::new(language.text("Changing meeting text can notify attendees.")).strong());
+                            }
+                        }
                         Change::Category(category) => {
                             let previous = event.map(tomlook::recommendations::real_categories).unwrap_or_default();
                             ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 32.0),
@@ -4752,14 +4823,16 @@ impl Tomlook {
                     if matches!(recommendation.state, State::Pending | State::NotSent)
                         && let Ok(change) = &change {
                         let label = if recommendation.suggestion.kind == RecommendationKind::Manual {
-                            "Retry calendar change"
+                            if recommendation.state == State::Pending { "Approve change" } else { "Retry calendar change" }
                         } else if recommendation.suggestion.kind == RecommendationKind::Category {
                             "Use category"
                         } else { "Add to calendar" };
-                        if ui.add_enabled(self.ai.is_some(),
+                        let local = matches!(change, Change::Document(_));
+                        if ui.add_enabled(local || self.ai.is_some(),
                             egui::Button::new(language.text(label))).clicked() {
-                            self.ai_command(ai::Command::RefreshCalendarAvailability);
+                            if !local { self.ai_command(ai::Command::RefreshCalendarAvailability); }
                             self.command(Command::ConfirmRecommendation { id: recommendation.id.clone(), change: change.clone() });
+                            if local && let Some(event) = event { self.open_recommended_meeting(event); }
                         }
                     }
                     if recommendation.suggestion.kind == RecommendationKind::FollowUp
@@ -4926,6 +4999,21 @@ impl Tomlook {
                             });
                     }
                     let inbox = self.activity.recommendations.clone();
+                    let mut applied = inbox.values().filter(|record|
+                        record.account == self.calendar_owner.as_deref().unwrap_or("")
+                        && record.suggestion.kind == tomlook::recommendations::Kind::Manual
+                        && record.state == tomlook::recommendations::State::Applied).collect::<Vec<_>>();
+                    applied.sort_by_key(|record| std::cmp::Reverse(record.created_at));
+                    if !applied.is_empty() {
+                        egui::CollapsingHeader::new(language.text("Applied changes")).show(ui, |ui| {
+                            egui::ScrollArea::vertical().id_salt("applied-assistant-changes").max_height(140.0).show(ui, |ui| {
+                                for record in applied.iter().take(10) {
+                                    ui.strong(&record.event_title);
+                                    ui.weak(language.text(&record.message));
+                                }
+                            });
+                        });
+                    }
                     let now = chrono::Local::now().fixed_offset();
                     let recommendations = self
                         .activity
@@ -8850,6 +8938,33 @@ mod tests {
         assert_eq!(app.question, "Unsent follow-up");
         assert!(app.chat.running());
         assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn reviewing_ai_changes_focuses_the_exact_proposal_without_confirming_or_replaying_it() {
+        use tomlook::recommendations::{Change, Recommendation};
+        let (mut app, _, mut commands) = assistant_fixture();
+        let mut event = tomlook::calendar::fixture(1).remove(0);
+        event.extra.insert("type".into(), serde_json::json!("singleInstance"));
+        app.calendar = Arc::new(Calendar::build(vec![event.clone()], Default::default(), vec![]).unwrap());
+        app.calendar_owner = Some("owner".into());
+        let record = Recommendation::from_manual(&event, "owner", Change::ClearCategory,
+            Local::now().fixed_offset()).unwrap();
+        Arc::make_mut(&mut Arc::make_mut(&mut app.activity).recommendations).insert(record.id.clone(), record.clone());
+        app.assistant = true;
+        app.assistant_detached = true;
+        app.question = "Unsent follow-up".into();
+        let chat = app.chat.clone();
+        let input = app.ask_view().input(ask::Action::ReviewChanges(vec![record.id.clone()]));
+        app.apply_ask_input(input, &egui::Context::default());
+        assert!(app.messages_open);
+        assert!(app.recommendations_tab);
+        assert_eq!(app.recommendation_selected.as_deref(), Some(record.id.as_str()));
+        assert!(app.assistant_detached);
+        assert_eq!(app.question, "Unsent follow-up");
+        assert!(Arc::ptr_eq(&chat, &app.chat));
+        assert!(matches!(commands.try_recv().unwrap(), ai::Command::RefreshCalendarAvailability));
+        assert!(commands.try_recv().is_err(), "Opening the preview must never approve or submit a change");
     }
 
     #[test]

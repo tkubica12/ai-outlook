@@ -6,6 +6,7 @@ pub mod calendar;
 pub mod calendar_sync;
 pub mod chat;
 pub mod chat_cache;
+pub mod changes;
 pub mod company;
 pub mod connectors;
 pub mod context;

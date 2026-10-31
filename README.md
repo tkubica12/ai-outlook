@@ -282,6 +282,23 @@ provider call using saved findings, not a resumed provider session.
 `/travel` and `/categories` run ad-hoc checks of the next 14 days in the
 background. Travel-before/after or category proposals go to the recommendation
 bell, not just the Ask answer; no calendar write occurs without approval.
+
+In the current development build, AI can also propose edits instead of only
+describing them: add existing-material references to Insights, correct saved
+meeting notes, change a category, reserve travel before/after a timed meeting,
+or edit the title/description of an event you organize. **Review changes**
+opens the exact pending proposal in Messages; **Approve change** is required
+before anything is applied. Pending proposals survive restart. Local document
+approval needs no WorkIQ connection and preserves untouched sections and
+original evidence. Approved bilingual sections survive subsequent automatic
+preparation; other sections can still refresh. Large Insights/notes can be read
+in bounded, revision-consistent pages. Online descriptions permit appending text
+without replacing the Teams meeting blob. This does not grant the model a
+calendar, file, CRM or approval tool; uncertain calendar outcomes are never
+automatically replayed. See [AI-proposed edits](native/README.md#ai-proposed-edits)
+for limits and approval safeguards. Published v0.6.1 does not yet include this
+development feature.
+
 The SDK still owns an installed proprietary Copilot runtime child, not a Rust
 rewrite of that runtime. Preparation requires isolated authentication and
 verified calendar coverage and a matching WorkIQ account. Enter asks a question,

@@ -197,6 +197,7 @@ pub enum Action {
     DiscardResearch(String),
     Retry(u64),
     ConfigureAuto,
+    ReviewChanges(Vec<String>),
 }
 
 #[derive(Clone)]
@@ -755,6 +756,10 @@ fn turn_ui(ui: &mut egui::Ui, turn: &crate::chat::Turn, view: &View, action: &mu
             }
             if let Some(answer) = &turn.answer {
                 answer_ui(ui, answer, language);
+                if !answer.change_ids.is_empty()
+                    && ui.button(language.text("Review changes")).clicked() {
+                    *action = Some(Action::ReviewChanges(answer.change_ids.as_ref().clone()));
+                }
             }
             if let Some(error) = &turn.error {
                 ui.add_space(6.0);

@@ -274,7 +274,9 @@ impl Recommendation {
                 reason: "Manually confirmed meeting action.".into(),
                 reason_cs: "Ručně potvrzená změna schůzky.".into(),
                 category: None,
-                minutes: None,
+                minutes: if let Change::Buffer { start, end, .. } = &change {
+                    u16::try_from((*end - *start).num_minutes()).ok()
+                } else { None },
             },
             state: State::Pending,
             message: String::new(),
@@ -428,6 +430,8 @@ pub fn category_replacement(category: &str, known: &[String]) -> Result<serde_js
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Change {
+    Document(crate::changes::DocumentEdit),
+    Text(crate::changes::TextEdit),
     Follow(bool),
     Category(String),
     ClearCategory,
@@ -484,6 +488,9 @@ impl MeetingResponse {
 
 pub fn validate_manual_change(event: &Event, change: &Change) -> Result<(), String> {
     event.validate()?;
+    if let Change::Document(edit) = change {
+        return edit.validate();
+    }
     if cancelled(event) {
         return Err("Cancelled meetings cannot be changed".into());
     }
@@ -494,6 +501,23 @@ pub fn validate_manual_change(event: &Event, change: &Change) -> Result<(), Stri
         return Err("Refresh the calendar first; actions require one verified occurrence, not a whole series".into());
     }
     match change {
+        Change::Text(edit) => edit.validate(event),
+        Change::Buffer { title, start, end, category } => {
+            let seconds = (*end - *start).num_seconds();
+            if event.is_all_day || !event.accepted() || logistics_buffer(event)
+                || *start < chrono::Local::now().fixed_offset()
+                || title.trim().is_empty() || title.len() > 200 || title.chars().any(char::is_control)
+                || !(900..=10_800).contains(&seconds) || seconds % 900 != 0
+                || (*end != event.start && *start != event.end)
+                || category != &buffer_category(event) {
+                return Err("Travel requires an accepted timed meeting and an adjacent 15-180 minute buffer".into());
+            }
+            if !matches!(event.extra.get("sensitivity").and_then(serde_json::Value::as_str),
+                Some("normal" | "personal" | "private" | "confidential")) {
+                return Err("Refresh the meeting first; travel needs verified parent privacy".into());
+            }
+            Ok(())
+        }
         Change::Follow(enabled) => {
             let organizer = event.extra.get("isOrganizer").and_then(serde_json::Value::as_bool);
             if organizer == Some(true) {
@@ -575,6 +599,9 @@ pub struct Operation {
 
 impl Operation {
     pub fn validate(&self, account: &str) -> Result<(), String> {
+        if matches!(self.change, Change::Document(_)) {
+            return Err("Local document approvals cannot be sent to a calendar provider".into());
+        }
         if self.recommendation.suggestion.kind != Kind::Manual {
             self.recommendation.suggestion.validate()?;
         }
@@ -631,6 +658,7 @@ impl Operation {
                 || match self.recommendation.suggestion.kind {
                     Kind::Travel => *end != self.event.start,
                     Kind::TravelAfter => *start != self.event.end,
+                    Kind::Manual => *end != self.event.start && *start != self.event.end,
                     _ => *end > self.event.start,
                 }
                 || category
@@ -724,7 +752,7 @@ pub fn proposed_change(
     }
 }
 
-fn buffer_category(event: &Event) -> Option<String> {
+pub fn buffer_category(event: &Event) -> Option<String> {
     real_categories(event).into_iter().find(|category| {
         matches!(
             category.trim().to_lowercase().as_str(),

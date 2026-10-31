@@ -182,6 +182,7 @@ pub fn source_label<'a>(tool: &'a str, resource: Option<&str>) -> &'a str {
         crate::chat_cache::SEARCH => "Saved calendar search",
         crate::chat_cache::DETAIL => "Saved meeting",
         crate::chat_cache::INSIGHTS => "Saved Insights",
+        crate::changes::PROPOSE => "Pending change proposal",
         crate::workiq::connection::CONTEXT_TOOL => "Workplace search summary",
         crate::workiq::connection::SDK_TOOL => {
             match resource.map(|value| value.split('?').next().unwrap_or(value)) {

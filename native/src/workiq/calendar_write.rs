@@ -82,12 +82,15 @@ pub trait Api: Send + Sync {
     async fn schema(&self, create: bool) -> Result<(), String>;
     async fn capability(&self, change: &Change) -> Result<(), String> {
         match change {
-            Change::Category(_) | Change::ClearCategory | Change::Follow(_) => self.schema(false).await,
+            Change::Category(_) | Change::ClearCategory | Change::Follow(_) | Change::Text(_) => self.schema(false).await,
             Change::Buffer { .. } => self.schema(true).await,
             _ => Err("Calendar provider has no verified meeting action capability".into()),
         }
     }
     async fn event(&self, id: &str) -> Result<Event, String>;
+    async fn text_event(&self, id: &str) -> Result<Event, String> {
+        self.event(id).await
+    }
     async fn calendar(&self, range: Range) -> Result<Calendar, String>;
     async fn submit(&self, operation: &Operation) -> Result<String, SubmissionError>;
     async fn removed(&self, _id: &str) -> Result<bool, String> {
@@ -201,17 +204,25 @@ pub async fn execute(api: &impl Api, operation: &Operation) -> Outcome {
     let check = async {
         operation.validate(api.account())?;
         api.capability(&operation.change).await?;
-        let current = api.event(&operation.event.id).await?;
+        let mut current = if matches!(&operation.change, Change::Text(edit) if edit.body.is_some()) {
+            api.text_event(&operation.event.id).await?
+        } else { api.event(&operation.event.id).await? };
         if current.id != operation.event.id {
             return Err("Calendar provider returned a different meeting; no write was submitted".into());
         }
-        Ok::<Event, String>(current)
+        let body = current.extra.remove("body");
+        Ok::<_, String>((current, body))
     }.await;
-    let current = match check {
+    let (current, body) = match check {
         Ok(current) => current,
         Err(message) => return Outcome::NotSent(message),
     };
     if crate::scheduler::fingerprint(&current) != operation.recommendation.fingerprint {
+        return Outcome::Stale(Box::new(current));
+    }
+    if let Change::Text(edit) = &operation.change
+        && let Some(edit) = &edit.body
+        && !body.as_ref().is_some_and(|body| edit.matches_before(body)) {
         return Outcome::Stale(Box::new(current));
     }
     let check = async {
@@ -306,8 +317,14 @@ async fn verify_readback(api: &impl Api, operation: &Operation, id: &str) -> Out
             }
     );
     for attempt in 0..4 {
-        match api.event(id).await {
-            Ok(event) if verified(&event, operation) => return Outcome::Applied(Box::new(event)),
+        let result = if matches!(&operation.change, Change::Text(edit) if edit.body.is_some()) {
+            api.text_event(id).await
+        } else { api.event(id).await };
+        match result {
+            Ok(mut event) if verified(&event, operation) => {
+                event.extra.remove("body");
+                return Outcome::Applied(Box::new(event));
+            }
             Err(_) if may_remove && api.removed(id).await == Ok(true) => {
                 return Outcome::Removed(id.to_owned());
             }
@@ -329,6 +346,16 @@ fn verified(event: &Event, operation: &Operation) -> bool {
         original.extra.insert("type".into(), json!("exception"));
     }
     match &operation.change {
+        Change::Document(_) => false,
+        Change::Text(edit) => {
+            let mut actual = event.clone();
+            let body = actual.extra.remove("body");
+            let mut expected = original;
+            if let Some(title) = &edit.title { expected.title = title.clone(); }
+            event.id == operation.event.id
+                && edit.body.as_ref().is_none_or(|edit| body.as_ref().is_some_and(|body| edit.matches_after(body)))
+                && crate::scheduler::fingerprint(&actual) == crate::scheduler::fingerprint(&expected)
+        }
         Change::Follow(enabled) => {
             let categories = crate::recommendations::follow_categories(&original, *enabled);
             let mut expected = original;
@@ -383,6 +410,8 @@ fn verified(event: &Event, operation: &Operation) -> bool {
                 && !event.is_all_day
                 && event.extra.get("showAs").and_then(Value::as_str) == Some("busy")
                 && event.extra.get("isCancelled").and_then(Value::as_bool) != Some(true)
+                && operation.event.extra.get("sensitivity").is_none_or(|sensitivity|
+                    event.extra.get("sensitivity") == Some(sensitivity))
                 && real_categories(event) == category.iter().cloned().collect::<Vec<_>>()
         }
     }
@@ -405,6 +434,15 @@ fn request(
     action_body_is_string: bool,
 ) -> Result<CallToolRequestParams, String> {
     let (name, arguments) = match &operation.change {
+        Change::Document(_) => return Err("Local document edits never use the calendar provider".into()),
+        Change::Text(edit) => {
+            let mut body = json!({});
+            if let Some(title) = &edit.title { body["subject"] = json!(title); }
+            if let Some(edit) = &edit.body {
+                body["body"] = json!({"contentType":edit.content_type,"content":edit.after()});
+            }
+            ("update_entity", json!({"entityUrl":event_path(&operation.event.id)?, "jsonBody":body.to_string()}))
+        }
         Change::Follow(enabled) => {
             let mut body = json!({"categories": crate::recommendations::follow_categories(&operation.event, *enabled)});
             if *enabled {
@@ -468,13 +506,17 @@ fn request(
                 json!({
                 "dateTime":time.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%S%.f").to_string(),"timeZone":"UTC"})
             };
-            (
-                "create_entity",
-                json!({"parentUrl":"/me/events","jsonBody":json!({
+            let mut body = json!({
                 "subject":title,"start":utc(start),"end":utc(end),"showAs":"busy",
                 "isReminderOn":false,"categories":category.iter().cloned().collect::<Vec<_>>(),
                 "transactionId":operation.recommendation.id,
-            }).to_string()}),
+            });
+            if let Some(sensitivity) = operation.event.extra.get("sensitivity") {
+                body["sensitivity"] = sensitivity.clone();
+            }
+            (
+                "create_entity",
+                json!({"parentUrl":"/me/events","jsonBody":body.to_string()}),
             )
         }
     };
@@ -543,8 +585,23 @@ impl Api for Connection {
             .await?,
         )
     }
+    async fn text_event(&self, id: &str) -> Result<Event, String> {
+        parse_event(self.fetch_in(&format!("{}?$select={EVENT_FIELDS},body", event_path(id)?),
+            &self.admission.calendar).await?)
+    }
     async fn capability(&self, change: &Change) -> Result<(), String> {
         match change {
+            Change::Text(edit) => {
+                let schema = discover_schema(self, false).await?;
+                let schema = schema.get("data").unwrap_or(&schema);
+                let writable = |name| schema_property(schema, schema, name, 0)
+                    .is_none_or(|property| property.get("readOnly") != Some(&Value::Bool(true)));
+                if !compatible_schema(schema, false) || (edit.title.is_some() && !writable("subject"))
+                    || (edit.body.is_some() && !writable("body")) {
+                    return Err("Calendar provider has no compatible writable event text schema; nothing was submitted".into());
+                }
+                Ok(())
+            }
             Change::Category(_) | Change::ClearCategory => Api::schema(self, false).await,
             Change::Follow(_) => {
                 let schema = discover_schema(self, false).await?;
@@ -1352,6 +1409,13 @@ mod tests {
             }
             let mut event = operation.event.clone();
             match &operation.change {
+                Change::Document(_) => return Err(SubmissionError::InvalidRequest),
+                Change::Text(edit) => {
+                    if let Some(title) = &edit.title { event.title = title.clone(); }
+                    if let Some(body) = &edit.body {
+                        event.extra.insert("body".into(), json!({"contentType":body.content_type,"content":body.after()}));
+                    }
+                }
                 Change::Follow(enabled) => {
                     let categories = crate::recommendations::follow_categories(&event, *enabled);
                     event.category = categories.join(", ");
@@ -1612,6 +1676,92 @@ mod tests {
         let body: Value =
             serde_json::from_str(request.arguments.unwrap()["jsonBody"].as_str().unwrap()).unwrap();
         assert_eq!(body, json!({"categories":["Office"]}));
+    }
+
+    #[tokio::test]
+    async fn approved_text_edits_use_partial_native_requests_and_verify_full_readback() {
+        let body = crate::changes::BodyEdit {
+            content_type: "html".into(),
+            before: "<html><body>Agenda<a href=\"https://example.invalid/join\">Join</a></body></html>".into(),
+            replacement: None, append: Some("Existing draft: https://example.invalid/material".into()),
+        };
+        let operation = manual_operation(Change::Text(crate::changes::TextEdit {
+            title: Some("Reviewed workshop".into()), body: Some(body.clone()),
+        }), true);
+        let mut fake = Fake::new(&operation);
+        fake.current.extra.insert("body".into(), json!({"contentType":"html","content":body.before}));
+        let result = execute(&fake, &operation).await;
+        let Outcome::Applied(event) = result else { panic!("{result:?}"); };
+        assert_eq!(event.title, "Reviewed workshop");
+        assert!(!event.extra.contains_key("body"), "Private bodies are not added to the general calendar cache");
+        assert_eq!(fake.writes.load(Ordering::SeqCst), 1);
+        let native = request(&operation, false).unwrap();
+        let patch: Value = serde_json::from_str(
+            native.arguments.as_ref().unwrap()["jsonBody"].as_str().unwrap()).unwrap();
+        assert_eq!(patch.as_object().unwrap().len(), 2);
+        assert_eq!(patch["subject"], "Reviewed workshop");
+        assert_eq!(patch["body"]["content"], body.after());
+        assert!(patch.get("attendees").is_none());
+        assert!(matches!(verify_only(&fake, &operation).await, Outcome::Applied(_)));
+        assert_eq!(fake.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn changed_description_expires_the_exact_proposal_without_submitting_any_write() {
+        let operation = manual_operation(Change::Text(crate::changes::TextEdit {
+            title: None,
+            body: Some(crate::changes::BodyEdit { content_type: "text".into(), before: "Original description".into(),
+                replacement: None, append: Some("New reference".into()) }),
+        }), true);
+        let mut fake = Fake::new(&operation);
+        fake.current.extra.insert("body".into(), json!({"contentType":"text","content":"Edited elsewhere"}));
+        assert!(matches!(execute(&fake, &operation).await, Outcome::Stale(_)));
+        assert_eq!(fake.writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn text_write_unknown_outcomes_are_review_only_and_document_edits_never_reach_provider() {
+        let operation = manual_operation(Change::Text(crate::changes::TextEdit {
+            title: Some("New title".into()), body: None,
+        }), true);
+        let mut fake = Fake::new(&operation);
+        fake.rejection = Some(SubmissionError::Unknown);
+        assert!(matches!(execute(&fake, &operation).await, Outcome::Review(_)));
+        assert_eq!(fake.writes.load(Ordering::SeqCst), 1);
+        let document = crate::changes::fixture_document();
+        let edit = crate::changes::DocumentEdit::new(crate::changes::Document::Insights,
+            crate::changes::revision(&document).unwrap(),
+            vec![crate::changes::Section {name:"summary".into(),en:json!("New summary"),cs:json!("Novy souhrn")}],
+            &document).unwrap();
+        let operation = manual_operation(Change::Document(edit), true);
+        let fake = Fake::new(&operation);
+        assert!(matches!(execute(&fake, &operation).await, Outcome::NotSent(_)));
+        assert_eq!(fake.writes.load(Ordering::SeqCst), 0);
+        assert!(request(&operation, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_travel_proposals_keep_the_exact_side_duration_and_parent_privacy() {
+        for after in [false, true] {
+            let mut event = manual_operation(Change::ClearCategory, true).event;
+            event.extra.insert("sensitivity".into(), json!("private"));
+            let (start, end) = if after { (event.end, event.end + chrono::Duration::minutes(45)) }
+                else { (event.start - chrono::Duration::minutes(45), event.start) };
+            let change = Change::Buffer {title:"Travel buffer".into(),start,end,category:None};
+            let mut recommendation = crate::recommendations::Recommendation::from_manual(
+                &event, "owner", change.clone(), Local::now().fixed_offset()).unwrap();
+            assert_eq!(recommendation.suggestion.minutes, Some(45));
+            recommendation.state = crate::recommendations::State::Dispatching;
+            let operation = Operation { recommendation, event, change };
+            let native = request(&operation, false).unwrap();
+            let patch: Value = serde_json::from_str(
+                native.arguments.as_ref().unwrap()["jsonBody"].as_str().unwrap()).unwrap();
+            assert_eq!(patch["sensitivity"], "private");
+            assert!(patch.get("attendees").is_none());
+            let fake = Fake::new(&operation);
+            assert!(matches!(execute(&fake, &operation).await, Outcome::Applied(_)));
+            assert_eq!(fake.writes.load(Ordering::SeqCst), 1);
+        }
     }
 
     fn manual_operation(change: Change, organizer: bool) -> Operation {
