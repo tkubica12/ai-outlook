@@ -388,6 +388,7 @@ impl Tomlook {
         self.meeting_action_dialog(context);
         self.event_creation_dialog(context);
         self.assistant_dialog(context);
+        self.tasks_window(context);
         if self.messages_open {
             let calendar = self.calendar.clone();
             let mut open = true;

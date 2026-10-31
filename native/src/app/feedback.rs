@@ -707,6 +707,25 @@ impl Tomlook {
                 }
                 ready && self.demo_frames > 5
             }
+            Scene::Tasks => {
+                self.tasks_open = true;
+                let ready = self.open_task_count() > 0;
+                if !ready {
+                    self.demo_frames = 0;
+                }
+                ready && self.demo_frames > 5
+            }
+            Scene::FollowUp => {
+                let ready = self.briefing.as_ref().is_some_and(|briefing| briefing["tomlook_recap"] == true)
+                    && self.followup.editing.is_some();
+                if !ready {
+                    self.followup.focus = true;
+                    self.demo_frames = 0;
+                } else if self.demo_frames < 3 {
+                    self.followup.focus = true;
+                }
+                ready && self.demo_frames > 8
+            }
         }
     }
 }

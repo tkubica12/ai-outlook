@@ -37,9 +37,9 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The latest native Windows release is **[v0.10.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.10.0)**.
-Read the [release notes](docs/releases/v0.10.0.md) for changes since v0.9.0.
-Download **[Tomlook-v0.10.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.10.0/Tomlook-v0.10.0-win-x64.zip)**
+The latest native Windows release is **[v0.11.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.11.0)**.
+Read the [release notes](docs/releases/v0.11.0.md) for changes since v0.10.0.
+Download **[Tomlook-v0.11.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.11.0/Tomlook-v0.11.0-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable and unsigned.
 From v0.8.0, Tomlook checks GitHub Releases once a day and installs
@@ -154,6 +154,14 @@ notification such as "In 5 min · 09:15–10:45" with the meeting title, up to
 three points from saved Insights, **Join** for a Teams link and **Open** for
 the meeting details. Lead time and tentative meetings are configurable in
 Settings → Notifications; see [meeting reminders](native/README.md#meeting-reminders).
+
+After a meeting, Tomlook closes the loop locally: personal tasks from the
+post-meeting notes join a **Tasks** list on this computer (manual tasks and Ask
+task drafts too; nothing is written to To Do, Planner or Dataverse), and
+**Prepare follow-up e-mail** drafts one editable e-mail from the notes with a
+single Quick AI request. The text is only copied or opened in your e-mail app
+through a `mailto:` link; Tomlook never sends e-mail or creates Outlook drafts.
+See [follow-up and tasks](native/README.md#follow-up-and-tasks).
 
 Category keys are filled color markers. Preset views also update mini-calendar
 highlighting; the small chevron beside a week selects its five working days.

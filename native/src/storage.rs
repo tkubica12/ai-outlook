@@ -511,7 +511,20 @@ impl Store {
                    section TEXT NOT NULL,revision TEXT NOT NULL,prompt_kind TEXT NOT NULL,
                    updated_at TEXT NOT NULL,payload TEXT NOT NULL,
                    PRIMARY KEY(account,document,document_key,section,revision));
-                 CREATE INDEX IF NOT EXISTS ai_feedback_recent ON ai_feedback(account,updated_at);",
+                 CREATE INDEX IF NOT EXISTS ai_feedback_recent ON ai_feedback(account,updated_at);
+                 CREATE TABLE IF NOT EXISTS tasks(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,account TEXT NOT NULL,status TEXT NOT NULL,
+                   meeting_key TEXT,meeting_event TEXT,import_key TEXT UNIQUE,
+                   updated_at TEXT NOT NULL,payload TEXT NOT NULL);
+                 CREATE INDEX IF NOT EXISTS tasks_by_account ON tasks(account,status);
+                 CREATE INDEX IF NOT EXISTS tasks_by_meeting ON tasks(account,meeting_key);
+                 CREATE TABLE IF NOT EXISTS task_tombstones(
+                   account TEXT NOT NULL,import_key TEXT NOT NULL,meeting_key TEXT NOT NULL,
+                   meeting_event TEXT NOT NULL,hashes TEXT NOT NULL,created_at TEXT NOT NULL,
+                   PRIMARY KEY(account,import_key));
+                 CREATE TABLE IF NOT EXISTS followup_drafts(
+                   account TEXT NOT NULL,meeting_key TEXT NOT NULL,updated_at TEXT NOT NULL,
+                   payload TEXT NOT NULL,PRIMARY KEY(account,meeting_key));",
             )
             .map_err(|e| e.to_string())?;
         Ok(Self {
@@ -1264,6 +1277,421 @@ impl Store {
     }
 }
 
+/// Local tasks and follow-up e-mail drafts: indexed columns plus a validated payload per row.
+impl Store {
+    fn task_row(id: i64, account: &str, payload: &str) -> Result<crate::tasks::Task> {
+        if payload.len() > 64 * 1024 {
+            return Err("Saved task exceeds its safety limit".into());
+        }
+        let mut task: crate::tasks::Task =
+            serde_json::from_str(payload).map_err(|_| "Saved task is invalid")?;
+        task.id = id;
+        if task.account != account {
+            return Err("Saved task does not match its account".into());
+        }
+        task.validate().map_err(|_| "Saved task is invalid")?;
+        Ok(task)
+    }
+
+    fn task_payload(task: &crate::tasks::Task) -> Result<String> {
+        task.validate()?;
+        let payload = serde_json::to_string(task).map_err(|_| "Encode task failed")?;
+        if payload.len() > 64 * 1024 {
+            return Err("Task exceeds its safety limit".into());
+        }
+        Ok(payload)
+    }
+
+    /// Every saved task of an account, oldest first.
+    pub fn tasks(&self, account: &str) -> Result<Vec<crate::tasks::Task>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id,payload FROM tasks WHERE account=?1 ORDER BY id LIMIT ?2")
+            .map_err(|_| "Read tasks failed")?;
+        let rows = statement
+            .query_map(
+                params![account, crate::tasks::TASK_LIMIT as i64 + 1],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|_| "Read tasks failed")?;
+        let mut tasks = Vec::new();
+        for row in rows {
+            let (id, payload) = row.map_err(|_| "Read tasks failed")?;
+            tasks.push(Self::task_row(id, account, &payload)?);
+        }
+        if tasks.len() > crate::tasks::TASK_LIMIT {
+            return Err("Saved tasks exceed their safety limit".into());
+        }
+        Ok(tasks)
+    }
+
+    fn insert_task(
+        connection: &Connection,
+        task: &crate::tasks::Task,
+        id: Option<i64>,
+    ) -> Result<i64> {
+        let payload = Self::task_payload(task)?;
+        let count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM tasks WHERE account=?1",
+                [&task.account],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Read tasks failed")?;
+        if count >= crate::tasks::TASK_LIMIT as i64 {
+            return Err(
+                "The task list reached its limit of 5,000 tasks; delete completed tasks first"
+                    .into(),
+            );
+        }
+        connection
+            .execute(
+                "INSERT INTO tasks(id,account,status,meeting_key,meeting_event,import_key,updated_at,payload)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    id,
+                    task.account,
+                    task.status.code(),
+                    task.meeting.as_ref().map(|meeting| &meeting.key),
+                    task.meeting.as_ref().map(|meeting| &meeting.event_id),
+                    task.import_key,
+                    feedback_time(task.updated_at),
+                    payload
+                ],
+            )
+            .map_err(|_| "Save task failed")?;
+        Ok(connection.last_insert_rowid())
+    }
+
+    /// Saves a new manual or Ask task and returns it with its identity.
+    pub fn add_task(&self, task: &crate::tasks::Task) -> Result<crate::tasks::Task> {
+        if task.import_key.is_some() {
+            return Err("Tasks from meeting notes are imported, not added".into());
+        }
+        let id = Self::insert_task(&self.connection, task, None)?;
+        Ok(crate::tasks::Task {
+            id,
+            ..task.clone()
+        })
+    }
+
+    /// Adds tasks imported from meeting notes, skipping any item whose identity or text (in either
+    /// language, from any revision of the same meeting's notes) already exists as a task or as a
+    /// tombstone of a deleted task. Returns how many tasks were added.
+    pub fn import_tasks(&self, account: &str, tasks: &[crate::tasks::Task]) -> Result<usize> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| "Begin task import failed")?;
+        let mut known = std::collections::BTreeMap::<(String, String), BTreeSet<String>>::new();
+        let mut added = 0;
+        for task in tasks {
+            let (Some(key), Some(meeting)) = (&task.import_key, &task.meeting) else {
+                return Err("Imported task has no source identity".into());
+            };
+            if task.account != account {
+                return Err("Imported task belongs to a different account".into());
+            }
+            let exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE import_key=?1)
+                       OR EXISTS(SELECT 1 FROM task_tombstones WHERE account=?2 AND import_key=?1)",
+                    params![key, account],
+                    |row| row.get(0),
+                )
+                .map_err(|_| "Read imported tasks failed")?;
+            if exists {
+                continue;
+            }
+            let identity = (meeting.key.clone(), meeting.event_id.clone());
+            if !known.contains_key(&identity) {
+                let mut hashes = BTreeSet::new();
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT id,payload FROM tasks WHERE account=?1 AND (meeting_key=?2 OR meeting_event=?3)",
+                    )
+                    .map_err(|_| "Read imported tasks failed")?;
+                let rows = statement
+                    .query_map(params![account, meeting.key, meeting.event_id], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|_| "Read imported tasks failed")?;
+                for row in rows {
+                    let (id, payload) = row.map_err(|_| "Read imported tasks failed")?;
+                    hashes.extend(Self::task_row(id, account, &payload)?.hashes);
+                }
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT hashes FROM task_tombstones WHERE account=?1 AND (meeting_key=?2 OR meeting_event=?3)",
+                    )
+                    .map_err(|_| "Read deleted tasks failed")?;
+                let rows = statement
+                    .query_map(params![account, meeting.key, meeting.event_id], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(|_| "Read deleted tasks failed")?;
+                for row in rows {
+                    let saved: Vec<String> =
+                        serde_json::from_str(&row.map_err(|_| "Read deleted tasks failed")?)
+                            .map_err(|_| "Saved deleted task is invalid")?;
+                    hashes.extend(saved);
+                }
+                known.insert(identity.clone(), hashes);
+            }
+            let hashes = known.get_mut(&identity).expect("hashes loaded");
+            if task.hashes.iter().any(|hash| hashes.contains(hash)) {
+                continue;
+            }
+            Self::insert_task(&transaction, task, None)?;
+            hashes.extend(task.hashes.iter().cloned());
+            added += 1;
+        }
+        transaction
+            .commit()
+            .map_err(|_| "Commit imported tasks failed")?;
+        Ok(added)
+    }
+
+    /// Replaces an existing task's editable fields; its source and identity cannot change.
+    pub fn update_task(&self, task: &crate::tasks::Task) -> Result<()> {
+        let payload = Self::task_payload(task)?;
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| "Begin task update failed")?;
+        let current: String = transaction
+            .query_row(
+                "SELECT payload FROM tasks WHERE id=?1 AND account=?2",
+                params![task.id, task.account],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "Read task failed")?
+            .ok_or("Task no longer exists")?;
+        let current = Self::task_row(task.id, &task.account, &current)?;
+        if current.source != task.source
+            || current.import_key != task.import_key
+            || current.meeting != task.meeting
+            || current.created_at != task.created_at
+            || current.hashes != task.hashes
+        {
+            return Err("A task's source cannot be changed".into());
+        }
+        transaction
+            .execute(
+                "UPDATE tasks SET status=?1,updated_at=?2,payload=?3 WHERE id=?4 AND account=?5",
+                params![
+                    task.status.code(),
+                    feedback_time(task.updated_at),
+                    payload,
+                    task.id,
+                    task.account
+                ],
+            )
+            .map_err(|_| "Save task failed")?;
+        transaction.commit().map_err(|_| "Commit task failed".into())
+    }
+
+    /// Removes a task and returns it for undo. Deleted imports leave a tombstone so the same
+    /// item is never imported again.
+    pub fn delete_task(&self, account: &str, id: i64) -> Result<crate::tasks::Task> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| "Begin task deletion failed")?;
+        let payload: String = transaction
+            .query_row(
+                "SELECT payload FROM tasks WHERE id=?1 AND account=?2",
+                params![id, account],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "Read task failed")?
+            .ok_or("Task no longer exists")?;
+        let task = Self::task_row(id, account, &payload)?;
+        if let (Some(key), Some(meeting)) = (&task.import_key, &task.meeting) {
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO task_tombstones VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![
+                        account,
+                        key,
+                        meeting.key,
+                        meeting.event_id,
+                        serde_json::to_string(&task.hashes).map_err(|_| "Encode task failed")?,
+                        feedback_time(chrono::Utc::now())
+                    ],
+                )
+                .map_err(|_| "Save deleted task failed")?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM tasks WHERE id=?1 AND account=?2",
+                params![id, account],
+            )
+            .map_err(|_| "Delete task failed")?;
+        transaction
+            .commit()
+            .map_err(|_| "Commit task deletion failed")?;
+        Ok(task)
+    }
+
+    /// Undoes a deletion: the task returns with its identity and its tombstone is removed.
+    pub fn restore_task(&self, task: &crate::tasks::Task) -> Result<()> {
+        if task.id <= 0 {
+            return Err("Deleted task identity is invalid".into());
+        }
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| "Begin task restore failed")?;
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1)",
+                [task.id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Read task failed")?;
+        if exists {
+            return Err("Task was already restored".into());
+        }
+        Self::insert_task(&transaction, task, Some(task.id))?;
+        if let Some(key) = &task.import_key {
+            transaction
+                .execute(
+                    "DELETE FROM task_tombstones WHERE account=?1 AND import_key=?2",
+                    params![task.account, key],
+                )
+                .map_err(|_| "Restore task failed")?;
+        }
+        transaction
+            .commit()
+            .map_err(|_| "Commit task restore failed".into())
+    }
+
+    fn backfilled_accounts(&self) -> Result<BTreeSet<String>> {
+        let payload: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT payload FROM settings WHERE key='task-notes-backfill-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "Read task import state failed")?;
+        match payload {
+            Some(payload) if payload.len() <= 1024 * 1024 => {
+                serde_json::from_str(&payload).map_err(|_| "Saved task import state is invalid".into())
+            }
+            Some(_) => Err("Saved task import state exceeds its safety limit".into()),
+            None => Ok(BTreeSet::new()),
+        }
+    }
+
+    /// Whether existing meeting notes were already imported once for this account.
+    pub fn tasks_backfilled(&self, account: &str) -> Result<bool> {
+        Ok(self.backfilled_accounts()?.contains(account))
+    }
+
+    pub fn mark_tasks_backfilled(&self, account: &str) -> Result<()> {
+        let mut accounts = self.backfilled_accounts()?;
+        if accounts.len() >= 1000 {
+            accounts.clear();
+        }
+        accounts.insert(account.to_owned());
+        let payload =
+            serde_json::to_string(&accounts).map_err(|_| "Encode task import state failed")?;
+        self.connection
+            .execute(
+                "INSERT INTO settings VALUES('task-notes-backfill-v1',?1)
+                 ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                [payload],
+            )
+            .map_err(|_| "Save task import state failed")?;
+        Ok(())
+    }
+
+    /// Saved follow-up e-mails of an account by meeting occurrence key, newest first.
+    pub fn followups(
+        &self,
+        account: &str,
+    ) -> Result<std::collections::BTreeMap<String, crate::followup::Saved>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT meeting_key,payload FROM followup_drafts WHERE account=?1
+                 ORDER BY updated_at DESC LIMIT ?2",
+            )
+            .map_err(|_| "Read follow-up e-mails failed")?;
+        let rows = statement
+            .query_map(
+                params![account, crate::followup::SAVED_LIMIT as i64],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|_| "Read follow-up e-mails failed")?;
+        let mut drafts = std::collections::BTreeMap::new();
+        for row in rows {
+            let (key, payload) = row.map_err(|_| "Read follow-up e-mails failed")?;
+            if payload.len() > 256 * 1024 {
+                return Err("Saved follow-up e-mail exceeds its safety limit".into());
+            }
+            let saved: crate::followup::Saved =
+                serde_json::from_str(&payload).map_err(|_| "Saved follow-up e-mail is invalid")?;
+            saved.validate()?;
+            if saved.account != account || saved.key != key {
+                return Err("Saved follow-up e-mail does not match its meeting".into());
+            }
+            drafts.insert(key, saved);
+        }
+        Ok(drafts)
+    }
+
+    /// Saves the latest follow-up e-mail of a meeting occurrence; the oldest drafts beyond the
+    /// limit are removed.
+    pub fn save_followup(&self, saved: &crate::followup::Saved) -> Result<()> {
+        saved.validate()?;
+        let payload =
+            serde_json::to_string(saved).map_err(|_| "Encode follow-up e-mail failed")?;
+        if payload.len() > 256 * 1024 {
+            return Err("Follow-up e-mail exceeds its safety limit".into());
+        }
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| "Begin follow-up e-mail storage failed")?;
+        transaction
+            .execute(
+                "INSERT INTO followup_drafts VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(account,meeting_key) DO UPDATE SET
+                   updated_at=excluded.updated_at,payload=excluded.payload",
+                params![saved.account, saved.key, feedback_time(saved.updated_at), payload],
+            )
+            .map_err(|_| "Save follow-up e-mail failed")?;
+        transaction
+            .execute(
+                "DELETE FROM followup_drafts WHERE account=?1 AND meeting_key NOT IN (
+                   SELECT meeting_key FROM followup_drafts WHERE account=?1
+                   ORDER BY updated_at DESC LIMIT ?2)",
+                params![saved.account, crate::followup::SAVED_LIMIT as i64],
+            )
+            .map_err(|_| "Save follow-up e-mail failed")?;
+        transaction
+            .commit()
+            .map_err(|_| "Commit follow-up e-mail failed".into())
+    }
+
+    /// Discards a meeting's follow-up e-mail; returns whether one existed.
+    pub fn delete_followup(&self, account: &str, key: &str) -> Result<bool> {
+        self.connection
+            .execute(
+                "DELETE FROM followup_drafts WHERE account=?1 AND meeting_key=?2",
+                params![account, key],
+            )
+            .map(|count| count > 0)
+            .map_err(|_| "Discard follow-up e-mail failed".into())
+    }
+}
+
 #[cfg(test)]
 mod document_edit_tests {
     use super::*;
@@ -1515,5 +1943,166 @@ mod feedback_tests {
         drop(store);
         let store = Store::open(root.path()).unwrap();
         assert_eq!(store.feedback_for_document(&output.id).unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod task_tests {
+    use super::*;
+    use crate::{i18n::Language, tasks::{New, Status}};
+    use serde_json::json;
+
+    const ACCOUNT: &str = "owner@example.com";
+
+    fn import(store: &Store, event: &Event, payload: &serde_json::Value, language: Language) -> usize {
+        let tasks = crate::tasks::from_notes(ACCOUNT, event, payload, language, chrono::Utc::now()).unwrap();
+        store.import_tasks(ACCOUNT, &tasks).unwrap()
+    }
+
+    #[test]
+    fn manual_tasks_round_trip_edit_complete_reopen_delete_and_restore_across_restarts() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let now = chrono::Utc::now();
+        let task = store.add_task(&New::manual("Send the pilot plan", None, Language::En).unwrap()
+            .task(ACCOUNT, now).unwrap()).unwrap();
+        assert!(task.id > 0);
+        store.add_task(&New::manual("Another account", None, Language::En).unwrap()
+            .task("other@example.com", now).unwrap()).unwrap();
+        assert_eq!(store.tasks(ACCOUNT).unwrap(), vec![task.clone()]);
+        let due = chrono::NaiveDate::from_ymd_opt(2026, 11, 4);
+        let edited = task.edited("Send the final pilot plan", "Include the budget", due, now).unwrap();
+        store.update_task(&edited).unwrap();
+        let done = edited.completed(true, now);
+        store.update_task(&done).unwrap();
+        drop(store);
+        let store = Store::open(root.path()).unwrap();
+        let saved = store.tasks(ACCOUNT).unwrap().remove(0);
+        assert_eq!((saved.title.as_str(), saved.note.as_str(), saved.due, saved.status),
+            ("Send the final pilot plan", "Include the budget", due, Status::Done));
+        store.update_task(&saved.completed(false, now)).unwrap();
+        assert_eq!(store.tasks(ACCOUNT).unwrap()[0].status, Status::Open);
+        let mut moved = saved.clone();
+        moved.source = crate::tasks::Source::AskDraft;
+        assert!(store.update_task(&moved).is_err(), "The source of a task is fixed");
+        let mut foreign = saved.clone();
+        foreign.account = "other@example.com".into();
+        assert!(store.update_task(&foreign).is_err());
+        let deleted = store.delete_task(ACCOUNT, saved.id).unwrap();
+        assert!(store.tasks(ACCOUNT).unwrap().is_empty());
+        assert!(store.delete_task(ACCOUNT, saved.id).is_err());
+        store.restore_task(&deleted).unwrap();
+        assert_eq!(store.tasks(ACCOUNT).unwrap()[0].id, saved.id, "Undo keeps the identity");
+        assert!(store.restore_task(&deleted).is_err());
+        assert_eq!(store.tasks("other@example.com").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn note_imports_are_deduplicated_across_restarts_revisions_languages_and_tombstones() {
+        let root = tempfile::tempdir().unwrap();
+        let mut event = crate::tasks::tests::meeting();
+        let payload = crate::tasks::tests::notes();
+        let store = Store::open(root.path()).unwrap();
+        assert_eq!(import(&store, &event, &payload, Language::En), 3);
+        assert_eq!(import(&store, &event, &payload, Language::En), 0);
+        assert_eq!(import(&store, &event, &payload, Language::Cs), 0, "Language does not duplicate tasks");
+        drop(store);
+        let store = Store::open(root.path()).unwrap();
+        assert_eq!(import(&store, &event, &payload, Language::En), 0, "Restart does not duplicate tasks");
+        let tasks = store.tasks(ACCOUNT).unwrap();
+        assert_eq!(tasks.iter().map(|task| task.item).collect::<Vec<_>>(), vec![Some(0), Some(1), Some(3)]);
+        store.update_task(&tasks[0].completed(true, chrono::Utc::now())).unwrap();
+        let deleted = store.delete_task(ACCOUNT, tasks[1].id).unwrap();
+        assert_eq!(import(&store, &event, &payload, Language::En), 0, "Completed and deleted items stay handled");
+        let mut revised = payload.clone();
+        revised["preparation"][2] = json!("My task: share the recording");
+        revised["cs"]["preparation"][2] = json!("Můj úkol: nasdílet záznam");
+        revised["summary"] = json!("Edited summary");
+        assert_eq!(import(&store, &event, &revised, Language::En), 1, "Only the new item of a new revision is added");
+        let titles = store.tasks(ACCOUNT).unwrap().into_iter().map(|task| task.title).collect::<Vec<_>>();
+        assert!(titles.contains(&"Share the recording".to_owned()));
+        assert!(!titles.contains(&deleted.title), "A deleted item never returns in another revision");
+        event.extra.insert("iCalUId".into(), json!("metadata-enriched-later"));
+        assert_eq!(import(&store, &event, &revised, Language::En), 0, "The event identity still matches");
+        store.restore_task(&deleted).unwrap();
+        assert_eq!(import(&store, &event, &payload, Language::En), 0);
+        assert_eq!(store.tasks(ACCOUNT).unwrap().len(), 4);
+        let other = crate::tasks::from_notes("other@example.com", &event, &payload, Language::En, chrono::Utc::now()).unwrap();
+        assert!(store.import_tasks(ACCOUNT, &other).is_err(), "Imports are bound to their account");
+    }
+
+    #[test]
+    fn ask_drafts_become_linked_tasks_and_imports_cannot_be_added_directly() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let event = crate::tasks::tests::meeting();
+        let proposal = crate::proposals::Proposal {
+            kind: crate::proposals::Kind::Task,
+            target: "Pilot checklist".into(),
+            title: "Prepare the checklist".into(),
+            body: "Three success criteria".into(),
+        };
+        let meeting = crate::tasks::Meeting::new(ACCOUNT, &event);
+        let task = New::from_draft(&proposal, Some(meeting), Language::En).unwrap()
+            .task(ACCOUNT, chrono::Utc::now()).unwrap();
+        let saved = store.add_task(&task).unwrap();
+        assert_eq!(crate::tasks::for_meeting(&store.tasks(ACCOUNT).unwrap(), ACCOUNT, &event)[0].id, saved.id);
+        let imported = crate::tasks::from_notes(ACCOUNT, &event, &crate::tasks::tests::notes(), Language::En, chrono::Utc::now()).unwrap();
+        assert!(store.add_task(&imported[0]).is_err());
+    }
+
+    #[test]
+    fn follow_up_drafts_are_saved_per_occurrence_survive_restart_and_can_be_discarded() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let event = crate::tasks::tests::meeting();
+        let request = crate::followup::Request::new(1, ACCOUNT, &event, &crate::tasks::tests::notes(),
+            Language::En, &[ACCOUNT.into()], None).unwrap();
+        let draft = crate::followup::Draft { subject: "Follow-up".into(), body: "Thanks, all.".into() };
+        let mut saved = crate::followup::Saved::new(&request, draft, chrono::Utc::now());
+        store.save_followup(&saved).unwrap();
+        saved.body = "Thanks, all. Edited.".into();
+        saved.updated_at = chrono::Utc::now();
+        store.save_followup(&saved).unwrap();
+        drop(store);
+        let store = Store::open(root.path()).unwrap();
+        let drafts = store.followups(ACCOUNT).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[&saved.key], saved);
+        assert!(store.followups("other@example.com").unwrap().is_empty());
+        let mut invalid = saved.clone();
+        invalid.subject.clear();
+        assert!(store.save_followup(&invalid).is_err());
+        assert!(store.delete_followup(ACCOUNT, &saved.key).unwrap());
+        assert!(!store.delete_followup(ACCOUNT, &saved.key).unwrap());
+        assert!(store.followups(ACCOUNT).unwrap().is_empty());
+        for index in 0..crate::followup::SAVED_LIMIT + 3 {
+            let mut other = saved.clone();
+            other.key = format!("{index:064x}");
+            other.updated_at = chrono::Utc::now() + chrono::Duration::seconds(index as i64);
+            store.save_followup(&other).unwrap();
+        }
+        let kept = store.followups(ACCOUNT).unwrap();
+        assert_eq!(kept.len(), crate::followup::SAVED_LIMIT);
+        assert!(!kept.contains_key(&format!("{:064x}", 0)), "The oldest drafts are removed first");
+    }
+
+    #[test]
+    fn existing_profiles_gain_task_tables_and_backfill_runs_once_per_account() {
+        let root = tempfile::tempdir().unwrap();
+        {
+            let connection = Connection::open(root.path().join("tomlook.db")).unwrap();
+            connection.execute_batch("CREATE TABLE settings(key TEXT PRIMARY KEY,payload TEXT NOT NULL);
+                INSERT INTO settings VALUES('preferences','{\"dark\":false}');").unwrap();
+        }
+        let store = Store::open(root.path()).unwrap();
+        assert!(!store.preferences().unwrap().dark);
+        assert!(store.tasks(ACCOUNT).unwrap().is_empty());
+        assert!(!store.tasks_backfilled(ACCOUNT).unwrap());
+        store.mark_tasks_backfilled(ACCOUNT).unwrap();
+        drop(store);
+        let store = Store::open(root.path()).unwrap();
+        assert!(store.tasks_backfilled(ACCOUNT).unwrap());
+        assert!(!store.tasks_backfilled("other@example.com").unwrap());
     }
 }

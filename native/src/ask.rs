@@ -198,6 +198,10 @@ pub enum Action {
     Retry(u64),
     ConfigureAuto,
     ReviewChanges(Vec<String>),
+    /// Adds a local task draft to the Tasks list.
+    AddTask(Box<crate::proposals::Proposal>),
+    /// Opens a local e-mail draft in the user's e-mail app through a `mailto:` link.
+    OpenEmail(Box<crate::proposals::Proposal>),
 }
 
 #[derive(Clone)]
@@ -221,6 +225,8 @@ pub struct View {
     pub recoveries: Arc<Vec<crate::chat::Checkpoint>>,
     pub mode: crate::chat::Mode,
     pub auto_status: crate::decision::Status,
+    /// Task drafts already added to the local task list in this session.
+    pub added_tasks: Arc<std::collections::BTreeSet<String>>,
 }
 
 pub struct Input {
@@ -255,6 +261,7 @@ impl Default for View {
             recoveries: Default::default(),
             mode: Default::default(),
             auto_status: Default::default(),
+            added_tasks: Default::default(),
         }
     }
 }
@@ -648,7 +655,7 @@ pub fn draw(ui: &mut egui::Ui, view: &mut View, detached: bool) -> Option<Action
                 });
             }
             if view.chat.turns.is_empty() && let Some(answer) = &view.answer {
-                answer_ui(ui,answer,language);
+                answer_ui(ui,answer,view,&mut action);
             }
             for saved in view.recoveries.iter() {
                 ui.push_id(&saved.key,|ui| {
@@ -755,7 +762,7 @@ fn turn_ui(ui: &mut egui::Ui, turn: &crate::chat::Turn, view: &View, action: &mu
                 });
             }
             if let Some(answer) = &turn.answer {
-                answer_ui(ui, answer, language);
+                answer_ui(ui, answer, view, action);
                 if !answer.change_ids.is_empty()
                     && ui.button(language.text("Review changes")).clicked() {
                     *action = Some(Action::ReviewChanges(answer.change_ids.as_ref().clone()));
@@ -805,12 +812,78 @@ fn turn_ui(ui: &mut egui::Ui, turn: &crate::chat::Turn, view: &View, action: &mu
         });
 }
 
-fn answer_ui(ui: &mut egui::Ui, answer: &ai::Answer, language: Language) {
+/// Local drafts proposed with an answer: task drafts can join the task list, e-mail drafts can be
+/// copied or opened in the user's e-mail app. Nothing is sent or saved remotely.
+fn drafts_ui(ui: &mut egui::Ui, answer: &ai::Answer, view: &View, action: &mut Option<Action>) {
+    if answer.proposals.is_empty() {
+        return;
+    }
+    let language = view.language;
+    ui.add_space(8.0);
+    ui.weak(language.text("Drafts stay local until you use them; nothing is sent."));
+    for (index, proposal) in answer.proposals.iter().enumerate() {
+        ui.push_id(("ask-draft", index), |ui| {
+            egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.weak(language.text(proposal.kind.label()));
+                ui.strong(&proposal.title);
+                ui.weak(language.text(&format!("Proposed target: {}", proposal.target)));
+                ui.add(egui::Label::new(&proposal.body).wrap());
+                ui.horizontal_wrapped(|ui| match proposal.kind {
+                    crate::proposals::Kind::Task => {
+                        let added = view.added_tasks.contains(&crate::tasks::draft_key(proposal));
+                        if ui
+                            .add_enabled(
+                                !added,
+                                egui::Button::new(language.text(if added {
+                                    "Added to tasks"
+                                } else {
+                                    "Add to tasks"
+                                })),
+                            )
+                            .clicked()
+                        {
+                            *action = Some(Action::AddTask(Box::new(proposal.clone())));
+                        }
+                    }
+                    crate::proposals::Kind::Email => {
+                        if ui.button(language.text("Copy")).clicked() {
+                            ui.ctx().copy_text(crate::followup::clipboard_text(
+                                &proposal.title,
+                                &proposal.body,
+                                language,
+                            ));
+                        }
+                        if ui
+                            .button(language.text("Open in Outlook"))
+                            .on_hover_text(language.text(
+                                "Opens a new message in your default e-mail app. Nothing is sent automatically.",
+                            ))
+                            .clicked()
+                        {
+                            *action = Some(Action::OpenEmail(Box::new(proposal.clone())));
+                        }
+                    }
+                    crate::proposals::Kind::Calendar => {
+                        if ui.button(language.text("Copy")).clicked() {
+                            ui.ctx()
+                                .copy_text(format!("{}\n\n{}", proposal.title, proposal.body));
+                        }
+                    }
+                });
+            });
+        });
+    }
+}
+
+fn answer_ui(ui: &mut egui::Ui, answer: &ai::Answer, view: &View, action: &mut Option<Action>) {
+    let language = view.language;
     answer.markdown.show(ui);
     ui.add_space(8.0);
     if ui.small_button(language.text("Copy answer")).clicked() {
         ui.ctx().copy_text(answer.text.as_ref().clone());
     }
+    drafts_ui(ui, answer, view, action);
     if !answer.evidence.records.is_empty() {
         ui.collapsing(
             language.text(&format!("Sources ({})", answer.evidence.records.len())),

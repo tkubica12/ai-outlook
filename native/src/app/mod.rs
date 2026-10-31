@@ -18,10 +18,12 @@ mod calendar;
 mod connections;
 mod event_editor;
 mod feedback;
+mod followup;
 mod meeting;
 mod palette;
 mod recommendations;
 mod settings;
+mod tasks;
 
 use connections::status_text;
 use event_editor::EventDraft;
@@ -176,6 +178,9 @@ pub struct Tomlook {
     activity_filter: ActivityFilter,
     insights_expanded: bool,
     feedback: FeedbackUi,
+    tasks_open: bool,
+    tasks: tasks::TasksUi,
+    followup: followup::FollowUpUi,
     preview: bool,
     demo_screenshot: Option<std::path::PathBuf>,
     demo_scene: tomlook::showcase::Scene,
@@ -463,6 +468,9 @@ impl Tomlook {
             activity_filter: ActivityFilter::All,
             insights_expanded: false,
             feedback: FeedbackUi::default(),
+            tasks_open: false,
+            tasks: Default::default(),
+            followup: Default::default(),
             preview: false,
             demo_screenshot: None,
             demo_scene: Default::default(),
@@ -952,8 +960,10 @@ impl Tomlook {
                 ai::Notice::PromptSuggestion { id, result } => {
                     self.receive_prompt_suggestion(id, result)
                 }
+                ai::Notice::FollowUp { id, result } => self.receive_followup(id, result),
                 ai::Notice::Stopped => {
                     self.stop_prompt_suggestion();
+                    self.stop_followup();
                     if !self.ai_ready && self.connection != "Not connected" {
                         self.error = Some(format!("AI stopped: {}", self.connection));
                     }
@@ -1042,6 +1052,7 @@ impl Tomlook {
     }
 
     fn select(&mut self, index: usize) {
+        self.flush_followup();
         self.selected = Some(index);
         self.insights_expanded = false;
         self.detail_revision += 1;
@@ -1321,12 +1332,16 @@ impl eframe::App for Tomlook {
                 }
             } else if !self.loading {
                 if self.selected.is_none() {
+                    let title = self.demo_scene.meeting();
                     if let Some(index) = self
                         .calendar
                         .events
                         .iter()
-                        .position(|event| event.title == "Northstar / Architecture workshop")
+                        .position(|event| event.title == title)
                     {
+                        if self.demo_scene.meeting() == tomlook::showcase::ENDED_MEETING {
+                            self.anchor = self.calendar.events[index].calendar_dates().0;
+                        }
                         self.select(index);
                     }
                 } else if self.briefing.is_some() {

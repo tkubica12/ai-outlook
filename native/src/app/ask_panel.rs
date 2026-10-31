@@ -507,6 +507,7 @@ impl Tomlook {
             recoveries: self.research_recoveries.clone(),
             mode: self.ask_mode,
             auto_status: self.auto_status.clone(),
+            added_tasks: self.tasks.added_drafts.clone(),
             ..Default::default()
         }
     }
@@ -579,6 +580,8 @@ impl Tomlook {
                 }
             }
             ask::Action::Retry(id) => self.retry_chat_question(id),
+            ask::Action::AddTask(proposal) => self.add_draft_task(&proposal),
+            ask::Action::OpenEmail(proposal) => self.open_email_draft(&proposal, context),
             ask::Action::ConfigureAuto => {
                 self.open_ai_connection();
                 context.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
@@ -701,6 +704,7 @@ impl Tomlook {
             || shared.view.busy != desired.busy
             || shared.view.language != desired.language
             || shared.view.accent != desired.accent
+            || !Arc::ptr_eq(&shared.view.added_tasks, &desired.added_tasks)
             || desired.focus;
         if shared.synced_question != desired.question || context_changed {
             shared.view.question = desired.question.clone();
@@ -723,6 +727,7 @@ impl Tomlook {
         shared.view.busy = desired.busy;
         shared.view.language = desired.language;
         shared.view.accent = desired.accent;
+        shared.view.added_tasks = desired.added_tasks;
         shared.view.focus |= desired.focus;
         self.focus_assistant = false;
         if changed {

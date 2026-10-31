@@ -637,6 +637,9 @@ impl Tomlook {
             }
         }
         self.render_insights(ui, false);
+        if ended {
+            self.followup_section(ui, &event);
+        }
     }
 
     pub(super) fn render_insights(&mut self, ui: &mut egui::Ui, expanded: bool) {
@@ -735,6 +738,10 @@ impl Tomlook {
                     for (field, label) in [("preparation", "My tasks"), ("open_questions", "Mentions of me")] {
                         if let Some(items) = narrative.and_then(|value| value[field].as_array()).filter(|items| !items.is_empty()) {
                             insight_section(ui, &language.text(label), items, self.accent(), |_, _| {});
+                        }
+                        if field == "preparation" {
+                            ui.add_space(6.0);
+                            self.meeting_tasks(ui);
                         }
                     }
                 }

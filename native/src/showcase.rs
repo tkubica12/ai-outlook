@@ -1,5 +1,5 @@
 use crate::calendar::Event;
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, Utc};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -13,6 +13,10 @@ pub enum Scene {
     Feedback,
     /// Settings > AI prompts summarizing fictional sample feedback.
     Prompts,
+    /// The local task list next to the ended sample meeting, whose notes created some of the tasks.
+    Tasks,
+    /// Details of the ended sample meeting: notes, its tasks and a saved follow-up e-mail.
+    FollowUp,
 }
 
 impl Scene {
@@ -21,10 +25,24 @@ impl Scene {
             "details" => Ok(Self::Details),
             "feedback" => Ok(Self::Feedback),
             "prompts" => Ok(Self::Prompts),
-            _ => Err("--demo-scene must be details, feedback or prompts".into()),
+            "tasks" => Ok(Self::Tasks),
+            "followup" => Ok(Self::FollowUp),
+            _ => Err("--demo-scene must be details, feedback, prompts, tasks or followup".into()),
+        }
+    }
+
+    /// The sample meeting whose details the scene shows.
+    pub fn meeting(self) -> &'static str {
+        if matches!(self, Self::Tasks | Self::FollowUp) {
+            ENDED_MEETING
+        } else {
+            "Northstar / Architecture workshop"
         }
     }
 }
+
+/// The fictional preview meeting that already ended and has sample notes, tasks and a follow-up.
+pub const ENDED_MEETING: &str = "Northstar / Pilot planning";
 
 /// Fictional ratings of sample Insights, saved only by the `prompts` screenshot scene.
 pub fn sample_feedback(
@@ -430,6 +448,167 @@ pub fn insights(event: &Event) -> Result<Value, String> {
     Ok(value)
 }
 
+/// The offline preview calendar: `count` meetings, the last of which is the fictional
+/// [`ENDED_MEETING`] that ended yesterday and has sample notes, tasks and a follow-up e-mail.
+pub fn preview_events(now: DateTime<Local>, count: usize) -> Vec<Event> {
+    let mut events = events(now, count.saturating_sub(1));
+    if count > 0 {
+        let start = (now.date_naive() - Duration::days(1))
+            .and_hms_opt(14, 0, 0)
+            .expect("valid demo time")
+            .and_local_timezone(Local)
+            .earliest()
+            .expect("demo daytime exists")
+            .fixed_offset();
+        events.push(Event {
+            id: format!("synthetic-{}", count - 1),
+            title: ENDED_MEETING.into(),
+            start,
+            end: start + Duration::minutes(60),
+            category: "Customer".into(),
+            attendees: vec![
+                "Alex Rivers <alex@example.invalid>".into(),
+                "Jamie Brooks <jamie@example.invalid>".into(),
+                "Morgan Lee <morgan@example.invalid>".into(),
+                "Riley Chen <riley@example.invalid>".into(),
+            ],
+            organizer: "Taylor Quinn <taylor@example.invalid>".into(),
+            location: "Online".into(),
+            status: "accepted".into(),
+            briefing_status: "ready".into(),
+            is_all_day: false,
+            source_url: None,
+            extra: BTreeMap::from([
+                ("synthetic".into(), json!(true)),
+                ("type".into(), json!("singleInstance")),
+                ("isOrganizer".into(), json!(false)),
+                ("categories".into(), json!(["Customer"])),
+            ]),
+        });
+    }
+    events
+}
+
+/// The saved document a preview meeting shows: sample notes for the ended meeting, otherwise
+/// sample Insights.
+pub fn detail(event: &Event) -> Result<Value, String> {
+    if event.title == ENDED_MEETING {
+        notes(event)
+    } else {
+        insights(event)
+    }
+}
+
+/// Fictional bilingual post-meeting notes of [`ENDED_MEETING`]; the first personal task contains
+/// an explicit date so the import shows a due date.
+pub fn notes(event: &Event) -> Result<Value, String> {
+    if event.extra.get("synthetic") != Some(&json!(true)) || event.title != ENDED_MEETING {
+        return Err("Demo notes require the explicitly synthetic ended meeting".into());
+    }
+    let due = event.start.date_naive() + Duration::days(3);
+    let raw = json!({
+        "summary": "Northstar agreed to a two-week pilot of the intake workflow. The pilot owner and the second-phase budget still need confirmation.",
+        "preparation": [
+            format!("My task: send the one-page architecture comparison to Alex by {}", due.format("%Y-%m-%d")),
+            "My task: confirm who owns the pilot on the Northstar side",
+            "My task: share the prototype recording with the team"
+        ],
+        "talking_points": [
+            "Shared material: pilot plan draft (fictional link) https://example.com/northstar/pilot-plan",
+            "Takeaway: start with the intake workflow; reporting comes in a later phase"
+        ],
+        "open_questions": ["Mention of me: Jamie asked you to walk through the trade-offs again at the pilot review"],
+        "risks": [
+            "Decision: the pilot runs for two weeks with three success criteria",
+            "Unresolved: the budget for the second phase is not approved yet"
+        ],
+        "gaps": ["All names, meetings and context in this preview are fictional."],
+        "sources": [{"title": "Pilot plan draft (fictional)", "url": "https://example.com/northstar/pilot-plan"}],
+        "cs": {
+            "summary": "Northstar souhlasil s dvoutýdenním pilotem příjmu požadavků. Vlastníka pilotu a rozpočet druhé fáze je ještě potřeba potvrdit.",
+            "preparation": [
+                format!("Můj úkol: poslat Alexovi jednostránkové porovnání architektury do {}. {}. {}", due.day(), due.month(), due.year()),
+                "Můj úkol: ověřit, kdo za Northstar převezme odpovědnost za pilot",
+                "Můj úkol: nasdílet týmu záznam ukázky prototypu"
+            ],
+            "talking_points": [
+                "Sdílený materiál: návrh plánu pilotu (smyšlený odkaz) https://example.com/northstar/pilot-plan",
+                "Poznatek: začít příjmem požadavků; reporting přijde v pozdější fázi"
+            ],
+            "open_questions": ["Zmínka o vás: Jamie vás požádal, abyste na revizi pilotu znovu prošli kompromisy"],
+            "risks": [
+                "Rozhodnutí: pilot poběží dva týdny se třemi kritérii úspěchu",
+                "Otevřené: rozpočet druhé fáze zatím není schválený"
+            ],
+            "gaps": ["Všechna jména, schůzky i souvislosti v tomto náhledu jsou smyšlené."]
+        }
+    });
+    let mut value = crate::worker::validate_prepared(&raw.to_string(), &event.fingerprint())?;
+    value["tomlook_recap"] = json!(true);
+    value["synthetic"] = json!(true);
+    value["evidence_status"] = json!("Sample meeting notes - not generated by AI");
+    Ok(value)
+}
+
+/// Fictional manual tasks of the preview: overdue, due today, upcoming and one completed task.
+pub fn sample_tasks(
+    account: &str,
+    event: &Event,
+    language: crate::i18n::Language,
+    now: DateTime<Utc>,
+) -> Result<Vec<crate::tasks::Task>, String> {
+    use crate::{i18n::Language, tasks::New};
+    let today = Local::now().date_naive();
+    let samples: [(&str, &str, Option<i64>, bool, bool); 4] = [
+        ("Review the Cedar solution proposal", "Projít návrh řešení pro Cedar", Some(-1), false, false),
+        ("Book the room for the Orbit hands-on lab", "Zarezervovat místnost na praktický workshop Orbit", Some(0), false, false),
+        ("Prepare the pilot success criteria", "Připravit kritéria úspěchu pilotu", Some(4), true, false),
+        ("Send the workshop agenda", "Poslat agendu workshopu", None, false, true),
+    ];
+    samples
+        .into_iter()
+        .map(|(english, czech, due, linked, done)| {
+            let title = if language == Language::Cs { czech } else { english };
+            let mut new = New::manual(title, due.map(|days| today + Duration::days(days)), language)?;
+            if linked {
+                new.meeting = Some(crate::tasks::Meeting::new(account, event));
+            }
+            let task = new.task(account, now)?;
+            Ok(if done { task.completed(true, now) } else { task })
+        })
+        .collect()
+}
+
+/// A fictional saved follow-up e-mail of [`ENDED_MEETING`]; it was never generated by AI.
+pub fn sample_followup(
+    account: &str,
+    event: &Event,
+    language: crate::i18n::Language,
+    now: DateTime<Utc>,
+) -> Result<crate::followup::Saved, String> {
+    let request = crate::followup::Request::new(0, account, event, &notes(event)?, language, &[], None)?;
+    let (subject, body) = match language {
+        crate::i18n::Language::En => (
+            "Follow-up: Northstar pilot planning",
+            "Hi all,\n\nthank you for today's pilot planning. A short summary:\n\n- We start a two-week pilot of the intake workflow with three success criteria.\n- Reporting comes in a later phase.\n- The budget for the second phase is not approved yet [to confirm].\n\nNext steps:\n- I will send the one-page architecture comparison.\n- I will confirm who owns the pilot on the Northstar side.\n- I will share the prototype recording.\n\nPilot plan draft: https://example.com/northstar/pilot-plan\n\nBest regards",
+        ),
+        crate::i18n::Language::Cs => (
+            "Shrnutí: plánování pilotu Northstar",
+            "Dobrý den všem,\n\nděkuji za dnešní plánování pilotu. Krátké shrnutí:\n\n- Spouštíme dvoutýdenní pilot příjmu požadavků se třemi kritérii úspěchu.\n- Reporting přijde v pozdější fázi.\n- Rozpočet druhé fáze zatím není schválený [ověřit].\n\nDalší kroky:\n- Pošlu jednostránkové porovnání architektury.\n- Ověřím, kdo za Northstar převezme odpovědnost za pilot.\n- Nasdílím záznam ukázky prototypu.\n\nNávrh plánu pilotu: https://example.com/northstar/pilot-plan\n\nS pozdravem",
+        ),
+    };
+    let saved = crate::followup::Saved::new(
+        &request,
+        crate::followup::Draft {
+            subject: subject.into(),
+            body: body.into(),
+        },
+        now,
+    );
+    saved.validate()?;
+    Ok(saved)
+}
+
 pub fn save_screenshot(
     path: &std::path::Path,
     image: &eframe::egui::ColorImage,
@@ -516,10 +695,43 @@ mod tests {
         assert_eq!((summary.preparation.up, summary.preparation.down), (3, 4));
         assert_eq!(summary.preparation.hot_spots[0], ("talking_points".into(), 2));
         assert_eq!(summary.preparation.reasons[0], (crate::feedback::Reason::TooVague, 2));
-        for (value, scene) in [("details", Scene::Details), ("feedback", Scene::Feedback), ("prompts", Scene::Prompts)] {
+        for (value, scene) in [("details", Scene::Details), ("feedback", Scene::Feedback), ("prompts", Scene::Prompts),
+            ("tasks", Scene::Tasks), ("followup", Scene::FollowUp)] {
             assert_eq!(Scene::parse(value).unwrap(), scene);
         }
         assert!(Scene::parse("settings").is_err());
+        assert_eq!(Scene::FollowUp.meeting(), ENDED_MEETING);
+    }
+
+    #[test]
+    fn preview_has_an_ended_meeting_with_fictional_notes_tasks_and_a_follow_up() {
+        use crate::i18n::Language;
+        let now = Local::now();
+        let events = preview_events(now, 200);
+        assert_eq!(events.len(), 200);
+        let ended = events.iter().find(|event| event.title == ENDED_MEETING).unwrap();
+        assert!(ended.end < now.fixed_offset() && ended.end > now.fixed_offset() - Duration::days(7));
+        assert!(ended.attendees.iter().chain([&ended.organizer]).all(|person| person.ends_with("@example.invalid>")));
+        crate::calendar::Calendar::build(events.clone(), Default::default(), vec![]).unwrap();
+        let saved = detail(ended).unwrap();
+        assert_eq!(saved["tomlook_recap"], true);
+        assert_eq!(saved["evidence_status"], "Sample meeting notes - not generated by AI");
+        assert!(detail(events.iter().find(|event| event.title == "Weekly planning").unwrap()).unwrap()["tomlook_recap"].is_null());
+        for language in [Language::En, Language::Cs] {
+            let imported = crate::tasks::from_notes(crate::feedback::PREVIEW_ACCOUNT, ended, &saved, language, Utc::now()).unwrap();
+            assert_eq!(imported.len(), 3);
+            assert_eq!(imported[0].due, Some(ended.start.date_naive() + Duration::days(3)), "The explicit date is parsed");
+            assert!(imported[1..].iter().all(|task| task.due.is_none()));
+            let samples = sample_tasks(crate::feedback::PREVIEW_ACCOUNT, ended, language, Utc::now()).unwrap();
+            assert_eq!(samples.iter().filter(|task| task.status == crate::tasks::Status::Done).count(), 1);
+            let followup = sample_followup(crate::feedback::PREVIEW_ACCOUNT, ended, language, Utc::now()).unwrap();
+            assert_eq!(followup.language, language);
+            assert_eq!(followup.recipients.len(), 5);
+            assert!(followup.mailto().unwrap().uri.starts_with("mailto:taylor@example.invalid,alex@example.invalid"));
+        }
+        let mut real = ended.clone();
+        real.extra.remove("synthetic");
+        assert!(notes(&real).is_err());
     }
 
     #[test]

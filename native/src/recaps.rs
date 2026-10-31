@@ -366,7 +366,8 @@ mod tests {
             assert!(!matches!(command, ai::Command::Cancel(id) if id == (request.id | (1 << 63))),
                 "A manual transcript check must remain active while automatic processing is paused");
         }
-        let payload = serde_json::json!({"tomlook_recap":true,"summary":"Saved notes"});
+        let payload = serde_json::json!({"tomlook_recap":true,"summary":"Saved notes",
+            "preparation":["My task: send the deck"],"cs":{"preparation":["Můj úkol: poslat prezentaci"]}});
         request.reply.blocking_send(Outcome {
             id:request.id,key:request.key.clone(),account:request.account.clone(),
             fingerprint:crate::scheduler::fingerprint(&request.event),quota_day:None,result:Ok(Some(payload.clone())),
@@ -377,6 +378,17 @@ mod tests {
             let activity = worker.activity.lock().unwrap().clone();
             if activity.recaps.record(account, &event).is_some_and(|record| record.payload.is_some()) { break; }
             assert!(Instant::now() < until);
+            std::thread::sleep(Wait::from_millis(2));
+        }
+        let until = Instant::now() + Wait::from_secs(5);
+        loop {
+            let activity = worker.activity.lock().unwrap().clone();
+            if activity.tasks.len() == 1 {
+                assert_eq!(activity.tasks[0].title, "Send the deck", "Ready notes add the personal task once");
+                assert_eq!(activity.tasks[0].note, "Poslat prezentaci");
+                break;
+            }
+            assert!(Instant::now() < until, "Tasks were not imported when the notes became ready");
             std::thread::sleep(Wait::from_millis(2));
         }
         event.extra.insert("iCalUId".into(), "metadata-enriched-after-success".into());

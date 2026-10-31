@@ -334,6 +334,16 @@ impl Tomlook {
                         && ui.button(language.text("Draft follow-up")).clicked() {
                         self.prepare_follow_up(recommendation);
                     }
+                    if recommendation.suggestion.kind == RecommendationKind::FollowUp
+                        && let Some(event) = event
+                        && self.calendar_owner.as_deref()
+                            .and_then(|account| self.activity.recaps.record(account, event))
+                            .is_some_and(|record| record.payload.is_some())
+                        && ui.button(language.text("Open follow-up e-mail"))
+                            .on_hover_text(language.text("Meeting notes are ready; prepare the follow-up e-mail from them in the meeting details."))
+                            .clicked() {
+                        self.open_followup(event);
+                    }
                 });
                 if reason.chars().count() > 320 || change.is_ok() || recommendation.source_url.is_some()
                     || recommendation.suggestion.kind == RecommendationKind::PriorityConflict {

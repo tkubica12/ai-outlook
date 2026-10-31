@@ -987,9 +987,8 @@ impl SessionHooks for ObservedPolicy {
     }
 }
 
-/// Prompt suggestions use the Thorough model and effort with no tools, MCP servers or permissions.
-fn prompt_review_config() -> SessionConfig {
-    let mode = crate::chat::Mode::Deep;
+/// Tool-free session of one chat profile: no tools, MCP servers, permissions or config discovery.
+fn tool_free_config(mode: crate::chat::Mode, system: &str) -> SessionConfig {
     let mut config = SessionConfig::default().approve_permissions_if(|_| false);
     config.model = Some(mode.model().into());
     config.allowed_models = Some(vec![mode.model().into()]);
@@ -1002,9 +1001,19 @@ fn prompt_review_config() -> SessionConfig {
     config.system_message = Some(
         SystemMessageConfig::new()
             .with_mode("replace")
-            .with_content(crate::feedback::SYSTEM_MESSAGE),
+            .with_content(system),
     );
     config
+}
+
+/// Prompt suggestions use the Thorough model and effort with no tools, MCP servers or permissions.
+fn prompt_review_config() -> SessionConfig {
+    tool_free_config(crate::chat::Mode::Deep, crate::feedback::SYSTEM_MESSAGE)
+}
+
+/// Follow-up e-mails use the Quick model and effort with no tools, MCP servers or permissions.
+fn followup_config() -> SessionConfig {
+    tool_free_config(crate::chat::Mode::Fast, crate::followup::SYSTEM_MESSAGE)
 }
 
 pub struct Harness {
@@ -1574,6 +1583,18 @@ impl Harness {
             })
     }
 
+    /// Tool-free Quick-profile session that only drafts a follow-up e-mail from meeting notes.
+    pub async fn followup_session(&self) -> Result<Session, String> {
+        self.verify_profile(crate::chat::Mode::Fast).await?;
+        self.client
+            .create_session(followup_config())
+            .await
+            .map_err(|e| {
+                self.redactor
+                    .text(&format!("Create isolated follow-up e-mail session: {e}"))
+            })
+    }
+
     async fn data_session(&self, instructions: &str) -> Result<(Session, Arc<Recorder>), String> {
         let mut config = SessionConfig::default().approve_permissions_if(|_| false);
         config.model = Some(self.config.model.clone());
@@ -1800,6 +1821,19 @@ mod tests {
         assert!(config.tools.is_none());
         assert!(config.mcp_servers.as_ref().is_some_and(IndexMap::is_empty));
         assert_eq!(config.enable_config_discovery, Some(false));
+    }
+
+    #[test]
+    fn follow_up_emails_use_the_quick_profile_without_tools() {
+        let config = followup_config();
+        assert_eq!(config.model.as_deref(), Some(crate::chat::FAST_MODEL));
+        assert_eq!(config.allowed_models, Some(vec![crate::chat::FAST_MODEL.to_owned()]));
+        assert_eq!(config.reasoning_effort.as_deref(), Some(crate::chat::Mode::Fast.effort()));
+        assert_eq!(config.available_tools, Some(Vec::new()));
+        assert!(config.tools.is_none());
+        assert!(config.mcp_servers.as_ref().is_some_and(IndexMap::is_empty));
+        assert_eq!(config.enable_config_discovery, Some(false));
+        assert!(crate::followup::SYSTEM_MESSAGE.contains("Do not use tools"));
     }
     use github_copilot_sdk::tool::ToolHandler;
 

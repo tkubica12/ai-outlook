@@ -84,10 +84,13 @@ impl Tomlook {
                 || self.meeting_action.take().is_some()
                 || self.meeting_menu.take().is_some()
                 || self.date_drag.take().is_some()
+                || self.tasks.editing.take().is_some()
             {
                 context.request_repaint();
             } else if self.palette {
                 self.close_palette(context);
+            } else if self.tasks_open {
+                self.tasks_open = false;
             } else if self.insights_expanded {
                 self.insights_expanded = false;
             } else if self.messages_open {
@@ -116,6 +119,7 @@ impl Tomlook {
                     "workiq-account",
                     "context-folders",
                     "command-search",
+                    "task-quick-add",
                 ]
                 .into_iter()
                 .any(|name| id == Id::new(name))
@@ -127,6 +131,7 @@ impl Tomlook {
             || self.palette
             || self.settings
             || self.messages_open
+            || self.tasks_open
             || self.meeting_action.is_some()
             || self.event_draft.is_some()
             || self.meeting_menu.is_some()
@@ -326,6 +331,23 @@ impl Tomlook {
                         "Thinking..."
                     } else if self.ask_unread { "Answer ready" } else { "Ctrl+Space" })).clicked() {
                     self.toggle_assistant(ui.ctx());
+                }
+                let open = self.open_task_count();
+                let tasks = header_icon(ui, "Tasks", HeaderIcon::Tasks, language, false);
+                if open > 0 {
+                    count_badge(ui, tasks.rect, open);
+                }
+                let tasks = if open > 0 {
+                    tasks.on_hover_text(language.text(&format!("{open} open tasks")))
+                } else {
+                    tasks
+                };
+                if tasks.clicked() {
+                    if self.tasks_open {
+                        self.tasks_open = false;
+                    } else {
+                        self.open_tasks(false);
+                    }
                 }
             });
         });
@@ -1159,7 +1181,17 @@ impl Tomlook {
 }
 
 #[derive(Clone, Copy)]
-enum HeaderIcon { Settings, Ask, Commands }
+enum HeaderIcon { Settings, Ask, Commands, Tasks }
+
+/// Number of open tasks on a header icon; text uses the panel color for contrast with the accent.
+fn count_badge(ui: &egui::Ui, rect: egui::Rect, count: usize) {
+    let text = if count > 99 { "99+".to_owned() } else { count.to_string() };
+    let galley = ui.painter().layout_no_wrap(text, egui::FontId::proportional(9.5), ui.visuals().panel_fill);
+    let size = Vec2::new((galley.size().x + 6.0).max(14.0), 14.0);
+    let badge = egui::Rect::from_center_size(rect.right_top() + Vec2::new(-4.0, 5.0), size);
+    ui.painter().rect_filled(badge, 7.0, ui.visuals().selection.stroke.color);
+    ui.painter().galley(badge.center() - galley.size() / 2.0, galley, ui.visuals().panel_fill);
+}
 
 fn header_icon(ui: &mut egui::Ui, label: &str, icon: HeaderIcon,
     language: tomlook::i18n::Language, attention: bool) -> egui::Response {
@@ -1191,6 +1223,15 @@ fn header_icon(ui: &mut egui::Ui, label: &str, icon: HeaderIcon,
             ui.painter().line_segment([point(0.22, 0.3), point(0.42, 0.5)], stroke);
             ui.painter().line_segment([point(0.42, 0.5), point(0.22, 0.7)], stroke);
             ui.painter().line_segment([point(0.55, 0.7), point(0.8, 0.7)], stroke);
+        }
+        HeaderIcon::Tasks => {
+            ui.painter().rect_stroke(egui::Rect::from_min_max(point(0.08, 0.12), point(0.42, 0.46)),
+                2, stroke, egui::StrokeKind::Inside);
+            ui.painter().line_segment([point(0.14, 0.29), point(0.23, 0.38)], stroke);
+            ui.painter().line_segment([point(0.23, 0.38), point(0.38, 0.18)], stroke);
+            ui.painter().rect_stroke(egui::Rect::from_min_max(point(0.08, 0.58), point(0.42, 0.92)),
+                2, stroke, egui::StrokeKind::Inside);
+            for y in [0.29, 0.75] { ui.painter().line_segment([point(0.55, y), point(0.94, y)], stroke); }
         }
     }
     if attention { ui.painter().circle_filled(response.rect.right_top() + Vec2::new(-3.0, 4.0), 3.0, ui.visuals().selection.stroke.color); }

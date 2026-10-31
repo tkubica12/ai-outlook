@@ -113,6 +113,7 @@ pub enum Command {
     Photos(Vec<String>),
     Companies(Vec<String>),
     SuggestPrompt(Box<crate::feedback::SuggestionRequest>),
+    FollowUp(Box<crate::followup::Request>),
     Stop,
 }
 
@@ -232,6 +233,10 @@ pub enum Notice {
         id: u64,
         result: Result<crate::feedback::Suggestion, String>,
     },
+    FollowUp {
+        id: u64,
+        result: Result<crate::followup::Draft, String>,
+    },
     Stopped,
 }
 
@@ -276,6 +281,7 @@ struct Pending {
     photos: Option<Notice>,
     companies: Option<Notice>,
     prompt_suggestion: Option<Notice>,
+    followup: Option<Notice>,
     stopped: bool,
 }
 
@@ -294,6 +300,7 @@ impl Pending {
             .or_else(|| self.photos.take())
             .or_else(|| self.companies.take())
             .or_else(|| self.prompt_suggestion.take())
+            .or_else(|| self.followup.take())
             .or_else(|| self.sources.take())
             .or_else(|| self.usage.take())
             .or_else(|| self.diagnostic.take())
@@ -343,6 +350,7 @@ impl Notices {
             Notice::Photos(_) => pending.photos = Some(notice),
             Notice::Companies(_) => pending.companies = Some(notice),
             Notice::PromptSuggestion { .. } => pending.prompt_suggestion = Some(notice),
+            Notice::FollowUp { .. } => pending.followup = Some(notice),
         }
         drop(pending);
         self.changed.notify_all();
@@ -469,6 +477,10 @@ enum Completion {
     PromptSuggestion {
         id: u64,
         result: Result<crate::feedback::Suggestion, String>,
+    },
+    FollowUp {
+        id: u64,
+        result: Result<crate::followup::Draft, String>,
     },
 }
 
@@ -1365,6 +1377,26 @@ impl Engine {
                                         });
                                     }
                                 }
+                                Some(Command::FollowUp(request)) => {
+                                    let key = request.id | FOLLOWUP_BIT;
+                                    let denied = if stopping { Some("AI is stopping; nothing was submitted") }
+                                        else if demo { Some("Offline demo never sends AI requests.") }
+                                        else if harness.is_none() { Some("Connect GitHub Copilot first. No AI request was made.") }
+                                        else if cancellations.keys().any(|id| id & FOLLOWUP_BIT != 0 && id & (1 << 63) == 0) || cancellations.len() >= 3 {
+                                            Some("AI execution capacity is busy; nothing was submitted")
+                                        } else { None };
+                                    if let Some(reason) = denied {
+                                        notify(Notice::FollowUp { id: request.id, result: Err(reason.into()) });
+                                    } else if let Some(harness) = harness.clone() {
+                                        let (cancel, cancelled) = watch::channel(false);
+                                        cancellations.insert(key, (cancel, false));
+                                        let telemetry = telemetry.clone();
+                                        tasks.spawn(async move {
+                                            let result = draft_followup(harness, &request, cancelled, telemetry).await;
+                                            Completion::FollowUp { id: request.id, result }
+                                        });
+                                    }
+                                }
                                 Some(Command::Prepare(request)) => {
                                     let id = request.id | (1 << 63);
                                     let denied = if stopping { Some("AI is stopping; nothing was submitted") }
@@ -1675,6 +1707,14 @@ impl Engine {
                                     active.store(cancellations.len(), Ordering::Release);
                                     if let Some(wake) = &wake { let _ = wake.try_send(crate::worker::Command::Wake); }
                                     notify(Notice::PromptSuggestion { id, result });
+                                }
+                                Some(Ok(Completion::FollowUp { id, result })) => {
+                                    if let Err(error) = &result { telemetry.failure("followup_email", error, Some(id | FOLLOWUP_BIT)); }
+                                    next_usage = Instant::now();
+                                    let result = finish_request(id | FOLLOWUP_BIT, &mut cancellations, "", "", stopping, result);
+                                    active.store(cancellations.len(), Ordering::Release);
+                                    if let Some(wake) = &wake { let _ = wake.try_send(crate::worker::Command::Wake); }
+                                    notify(Notice::FollowUp { id, result });
                                 }
                                 Some(Ok(Completion::Prepared { request, connector_revision, result, quota_day })) => {
                                     if let Err(error) = &result { telemetry.failure("preparation", error, Some(request.id)); }
@@ -2641,6 +2681,128 @@ async fn suggest_prompt(
         (Ok(text), Ok(()), Ok(())) => {
             crate::feedback::parse_suggestion(request, &harness.redactor.text(&text))
         }
+        (result, aborted, disconnected) => {
+            let errors = [result.err(), aborted.err(), disconnected.err()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            Err(harness.redactor.text(&errors.join("; ")))
+        }
+    }
+}
+
+/// Cancellation and accounting identity bit of follow-up e-mail requests.
+pub const FOLLOWUP_BIT: u64 = 1 << 61;
+const FOLLOWUP_QUOTA: &str = "Daily AI request limit reached; no follow-up e-mail was requested.";
+
+/// One bounded, tool-free Quick-profile request that drafts a follow-up e-mail from saved
+/// meeting notes. The validated text is returned for review only; nothing is sent or saved here.
+async fn draft_followup(
+    harness: Arc<Harness>,
+    request: &crate::followup::Request,
+    mut cancel: watch::Receiver<bool>,
+    telemetry: Arc<crate::telemetry::Service>,
+) -> Result<crate::followup::Draft, String> {
+    let prompt = request.prompt()?;
+    if harness.redactor.contains(&prompt) {
+        return Err("The meeting notes contain an app credential; nothing was submitted".into());
+    }
+    let key = request.id | FOLLOWUP_BIT;
+    if *cancel.borrow() {
+        return Err("Cancelled before the follow-up e-mail was requested".into());
+    }
+    if !telemetry.reserve(key).await? {
+        telemetry.record("accounting", "daily_limit_reached", Some(key), 0);
+        return Err(FOLLOWUP_QUOTA.into());
+    }
+    telemetry.record("request", "followup_email_admitted", Some(key), 0);
+    let session = tokio::select! {
+        _ = cancel.changed() => return Err("Cancelled before the follow-up e-mail was requested".into()),
+        result = tokio::time::timeout(Duration::from_secs(30), harness.followup_session()) =>
+            result.map_err(|_| "Creating the follow-up e-mail session timed out".to_owned())??,
+    };
+    let mut subscription = session.subscribe();
+    let result: Result<String, String> = async {
+        tokio::select! {
+            _ = cancel.changed() => {
+                return Err("Cancelled while requesting the follow-up e-mail; provider outcome may be unknown".into());
+            }
+            sent = tokio::time::timeout(Duration::from_secs(30), session.send(MessageOptions::new(prompt))) => {
+                sent.map_err(|_| "Sending the SDK request timed out".to_string())?
+                    .map_err(|e| format!("SDK request failed: {e}"))?;
+            }
+        }
+        let timeout = tokio::time::sleep(Duration::from_secs(crate::followup::SECONDS));
+        tokio::pin!(timeout);
+        let mut answer = None;
+        loop {
+            tokio::select! {
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        return Err("Follow-up e-mail cancelled; nothing was saved.".into());
+                    }
+                }
+                _ = &mut timeout => return Err("The follow-up e-mail took too long; try again".into()),
+                event = subscription.recv() => {
+                    let event = event.map_err(|e| format!("SDK event stream failed: {e}"))?;
+                    match event.event_type.as_str() {
+                        "assistant.usage" => match crate::telemetry::Metrics::from_sdk(&event.data) {
+                            Ok(metrics) => {
+                                if telemetry.observe(key, &event.id, metrics).await.is_err() { telemetry.usage_failure(); }
+                            }
+                            Err(_) => telemetry.usage_failure(),
+                        },
+                        "assistant.message" => {
+                            if let Some(text) = event.data.get("content").and_then(|v| v.as_str()) {
+                                if text.len() > crate::followup::OUTPUT_LIMIT {
+                                    return Err("AI returned an oversized follow-up e-mail; nothing was saved.".into());
+                                }
+                                answer = Some(text.to_owned());
+                            }
+                        }
+                        "session.error" => return Err("Copilot reported a session error; no follow-up e-mail was produced.".into()),
+                        "session.idle" => {
+                            return answer.filter(|text| !text.trim().is_empty())
+                                .ok_or_else(|| "AI returned an empty follow-up e-mail; nothing was saved.".into());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    .await;
+    let aborted = if result.is_err() {
+        tokio::time::timeout(Duration::from_secs(5), session.abort())
+            .await
+            .map_err(|_| "Cancel SDK session timed out".to_string())
+            .and_then(|r| r.map_err(|e| format!("Cancel SDK session: {e}")))
+    } else {
+        Ok(())
+    };
+    let until = Instant::now() + Duration::from_millis(100);
+    for _ in 0..64 {
+        match tokio::time::timeout_at(until.into(), subscription.recv()).await {
+            Ok(Ok(event)) if event.event_type == "assistant.usage" => {
+                match crate::telemetry::Metrics::from_sdk(&event.data) {
+                    Ok(metrics) => {
+                        if telemetry.observe(key, &event.id, metrics).await.is_err() {
+                            telemetry.usage_failure();
+                        }
+                    }
+                    Err(_) => telemetry.usage_failure(),
+                }
+            }
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    let disconnected = tokio::time::timeout(Duration::from_secs(5), session.disconnect())
+        .await
+        .map_err(|_| "Detach SDK session timed out".to_string())
+        .and_then(|r| r.map_err(|e| format!("Detach SDK session: {e}")));
+    match (result, aborted, disconnected) {
+        (Ok(text), Ok(()), Ok(())) => crate::followup::parse(&harness.redactor.text(&text)),
         (result, aborted, disconnected) => {
             let errors = [result.err(), aborted.err(), disconnected.err()]
                 .into_iter()

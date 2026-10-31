@@ -2442,6 +2442,207 @@ pub const TEXTS: &[(&str, &str)] = &[
         "The prompt or feedback contains an app credential; nothing was submitted",
         "Prompt nebo zpětná vazba obsahuje přihlašovací údaj aplikace; nic nebylo odesláno.",
     ),
+    ("Tasks", "Úkoly"),
+    ("Task", "Úkol"),
+    ("Open tasks", "Otevřít úkoly"),
+    ("Add task", "Přidat úkol"),
+    ("Add", "Přidat"),
+    ("Add a task and press Enter", "Napište úkol a stiskněte Enter"),
+    (
+        "A local list on this computer. Nothing is sent to To Do, Planner or Dataverse.",
+        "Místní seznam v tomto počítači. Nic se neodesílá do To Do, Planneru ani Dataverse.",
+    ),
+    (
+        "Tasks are available once the calendar account is known.",
+        "Úkoly budou k dispozici, jakmile bude znám účet kalendáře.",
+    ),
+    ("Task deleted", "Úkol smazán"),
+    ("Undo", "Vrátit zpět"),
+    (
+        "No open tasks. Tasks from meeting notes appear here automatically.",
+        "Žádné otevřené úkoly. Úkoly ze zápisů ze schůzek se tu objeví automaticky.",
+    ),
+    ("Overdue", "Po termínu"),
+    ("Due today", "Termín dnes"),
+    ("Upcoming", "Nadcházející"),
+    ("No due date", "Bez termínu"),
+    ("Done", "Hotovo"),
+    ("Done in the last 30 days", "Hotovo za posledních 30 dní"),
+    ("Added manually", "Přidáno ručně"),
+    ("From meeting notes", "Ze zápisu ze schůzky"),
+    ("From Ask", "Z odpovědi AI"),
+    ("Mark as done", "Označit jako hotové"),
+    ("Mark as not done", "Označit jako nehotové"),
+    ("Tomorrow", "Zítra"),
+    ("Yesterday", "Včera"),
+    ("Next week", "Příští týden"),
+    ("Set due date", "Nastavit termín"),
+    ("Due", "Termín"),
+    ("Due date", "Termín splnění"),
+    ("Edit", "Upravit"),
+    ("Delete the task; you can undo it", "Smazat úkol (lze vrátit zpět)"),
+    ("Note (optional)", "Poznámka (nepovinná)"),
+    ("In my task list", "V mém seznamu úkolů"),
+    ("Open meeting details", "Otevřít podrobnosti schůzky"),
+    (
+        "Task title must have 1-300 characters on one line",
+        "Název úkolu musí mít 1–300 znaků na jednom řádku",
+    ),
+    (
+        "Task note can have at most 2,000 characters",
+        "Poznámka k úkolu může mít nejvýše 2 000 znaků",
+    ),
+    ("Task no longer exists", "Úkol už neexistuje"),
+    (
+        "The task list reached its limit of 5,000 tasks; delete completed tasks first",
+        "Seznam úkolů dosáhl limitu 5 000 úkolů; nejprve smažte hotové úkoly",
+    ),
+    (
+        "This belongs to a different calendar account; nothing was changed",
+        "Patří k jinému účtu kalendáře; nic se nezměnilo",
+    ),
+    ("Task was already restored", "Úkol už byl obnoven"),
+    (
+        "Only task drafts can be added to tasks",
+        "Do úkolů lze přidat jen koncepty úkolů",
+    ),
+    ("Follow-up e-mail", "Follow-up e-mail"),
+    ("Prepare follow-up e-mail", "Připravit follow-up e-mail"),
+    ("Preparing the follow-up e-mail...", "Připravuji follow-up e-mail…"),
+    ("Open follow-up e-mail", "Otevřít follow-up e-mail"),
+    (
+        "Tomlook recommends a follow-up for this meeting.",
+        "Tomlook u této schůzky doporučuje follow-up.",
+    ),
+    (
+        "Local text only: Tomlook never sends e-mail or creates Outlook drafts.",
+        "Jen místní text: Tomlook nikdy neodesílá e-maily ani nevytváří koncepty v Outlooku.",
+    ),
+    (
+        "Drafts the e-mail from these notes with one Quick AI request. Nothing is sent.",
+        "Připraví e-mail z tohoto zápisu jedním rychlým dotazem na AI. Nic se neodesílá.",
+    ),
+    (
+        "No participant has an e-mail address; add recipients in your e-mail app.",
+        "Žádný účastník nemá e-mailovou adresu; příjemce doplňte v e-mailové aplikaci.",
+    ),
+    ("Subject", "Předmět"),
+    ("Message", "Zpráva"),
+    ("External", "Externí"),
+    ("Copy", "Kopírovat"),
+    ("Open in Outlook", "Otevřít v Outlooku"),
+    ("Regenerate", "Vygenerovat znovu"),
+    (
+        "Copies the subject and message to the clipboard",
+        "Zkopíruje předmět a zprávu do schránky",
+    ),
+    (
+        "Opens a new message in your default e-mail app. Nothing is sent automatically.",
+        "Otevře novou zprávu ve vaší výchozí e-mailové aplikaci. Nic se neodešle automaticky.",
+    ),
+    (
+        "Replaces this text with a new AI draft",
+        "Nahradí tento text novým návrhem od AI",
+    ),
+    ("Copied to the clipboard.", "Zkopírováno do schránky."),
+    (
+        "Opened in your e-mail app. Nothing was sent.",
+        "Otevřeno v e-mailové aplikaci. Nic nebylo odesláno.",
+    ),
+    (
+        "The message is too long for an e-mail link. The body was copied to the clipboard; paste it into the new message.",
+        "Zpráva je pro e-mailový odkaz příliš dlouhá. Text byl zkopírován do schránky; vložte ho do nové zprávy.",
+    ),
+    (
+        "Follow-up e-mail cancelled; nothing was saved.",
+        "Příprava follow-up e-mailu byla zrušena; nic nebylo uloženo.",
+    ),
+    (
+        "Meeting notes are ready; prepare the follow-up e-mail from them in the meeting details.",
+        "Zápis ze schůzky je hotový; follow-up e-mail z něj připravíte v podrobnostech schůzky.",
+    ),
+    (
+        "Drafts stay local until you use them; nothing is sent.",
+        "Koncepty zůstávají jen v tomto počítači, dokud je nepoužijete; nic se neodesílá.",
+    ),
+    ("Add to tasks", "Přidat do úkolů"),
+    ("Added to tasks", "Přidáno do úkolů"),
+    (
+        "A follow-up e-mail needs saved meeting notes",
+        "Follow-up e-mail vyžaduje uložený zápis ze schůzky",
+    ),
+    (
+        "Meeting notes exceed the follow-up e-mail input limit; nothing was submitted",
+        "Zápis ze schůzky překračuje vstupní limit follow-up e-mailu; nic nebylo odesláno",
+    ),
+    (
+        "The e-mail subject must have 1-200 characters on one line",
+        "Předmět e-mailu musí mít 1–200 znaků na jednom řádku",
+    ),
+    (
+        "The e-mail body must have 1-4,000 characters",
+        "Text e-mailu musí mít 1–4 000 znaků",
+    ),
+    (
+        "Saved follow-up e-mail is invalid",
+        "Uložený follow-up e-mail je neplatný",
+    ),
+    (
+        "Only plain e-mail addresses can be used in an e-mail link",
+        "V e-mailovém odkazu lze použít jen samotné e-mailové adresy",
+    ),
+    (
+        "Too many recipients for an e-mail link; use Copy instead",
+        "Příliš mnoho příjemců pro e-mailový odkaz; použijte raději Kopírovat",
+    ),
+    (
+        "Only e-mail links with plain addresses, a subject and a body can be opened",
+        "Otevřít lze jen e-mailové odkazy s adresami, předmětem a textem",
+    ),
+    (
+        "AI returned an oversized follow-up e-mail; nothing was saved.",
+        "AI vrátila příliš dlouhý follow-up e-mail; nic nebylo uloženo.",
+    ),
+    (
+        "AI returned an invalid follow-up e-mail; nothing was saved.",
+        "AI vrátila neplatný follow-up e-mail; nic nebylo uloženo.",
+    ),
+    (
+        "AI returned an empty follow-up e-mail; nothing was saved.",
+        "AI vrátila prázdný follow-up e-mail; nic nebylo uloženo.",
+    ),
+    (
+        "Copilot reported a session error; no follow-up e-mail was produced.",
+        "Copilot nahlásil chybu relace; follow-up e-mail nevznikl.",
+    ),
+    (
+        "Daily AI request limit reached; no follow-up e-mail was requested.",
+        "Denní limit požadavků na AI je vyčerpán; follow-up e-mail nebyl vyžádán.",
+    ),
+    (
+        "Cancelled before the follow-up e-mail was requested",
+        "Zrušeno před vyžádáním follow-up e-mailu",
+    ),
+    (
+        "Cancelled while requesting the follow-up e-mail; provider outcome may be unknown",
+        "Zrušeno během vyžádání follow-up e-mailu; výsledek u poskytovatele nemusí být známý",
+    ),
+    (
+        "The follow-up e-mail took too long; try again",
+        "Příprava follow-up e-mailu trvala příliš dlouho; zkuste to znovu",
+    ),
+    (
+        "Creating the follow-up e-mail session timed out",
+        "Vytvoření relace pro follow-up e-mail vypršelo",
+    ),
+    (
+        "The meeting notes contain an app credential; nothing was submitted",
+        "Zápis ze schůzky obsahuje přihlašovací údaj aplikace; nic nebylo odesláno",
+    ),
+    (
+        "AI is stopping; nothing was submitted",
+        "AI se zastavuje; nic nebylo odesláno",
+    ),
 ];
 
 const PATTERNS: &[(&str, &str)] = &[
@@ -2615,6 +2816,17 @@ const PATTERNS: &[(&str, &str)] = &[
         "Set the Windows notification identity: {}",
         "Identitu pro oznámení Windows nelze nastavit: {0}",
     ),
+    ("{} open tasks", "Otevřené úkoly: {0}"),
+    ("Recipients ({} of {})", "Příjemci ({0} z {1})"),
+    ("Tasks could not be loaded: {}", "Úkoly se nepodařilo načíst: {0}"),
+    (
+        "Tasks from meeting notes could not be added: {}",
+        "Úkoly ze zápisu ze schůzky se nepodařilo přidat: {0}",
+    ),
+    (
+        "Could not open the e-mail app (code {})",
+        "E-mailovou aplikaci se nepodařilo otevřít (kód {0})",
+    ),
 ];
 
 #[cfg(test)]
@@ -2630,10 +2842,12 @@ mod tests {
             include_str!("app/connections.rs"),
             include_str!("app/event_editor.rs"),
             include_str!("app/feedback.rs"),
+            include_str!("app/followup.rs"),
             include_str!("app/meeting.rs"),
             include_str!("app/palette.rs"),
             include_str!("app/recommendations.rs"),
             include_str!("app/settings.rs"),
+            include_str!("app/tasks.rs"),
             include_str!("ask.rs"),
         ];
         for source in sources {

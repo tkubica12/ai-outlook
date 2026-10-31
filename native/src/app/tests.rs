@@ -5072,3 +5072,387 @@ fn prompt_feedback_summary_and_suggestion_review_never_save_prompts() {
             "Feedback is collected for the Before the meeting and After the meeting prompts.").as_ref()));
     }
 }
+fn task_fixture(language: tomlook::i18n::Language) -> (
+    Tomlook,
+    mpsc::Receiver<Command>,
+    tokio::sync::mpsc::Receiver<ai::Command>,
+    Arc<ai::Notices>,
+) {
+    let (mut app, notices, ai_commands) = assistant_fixture();
+    let (sender, receiver) = mpsc::sync_channel(64);
+    app.worker = Some(Worker {
+        commands: sender, notices: Arc::new(Default::default()),
+        activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+        stop: Arc::new(Default::default()), done: None,
+    });
+    app.preferences.language = language;
+    app.calendar_owner = Some("owner@example.com".into());
+    app.loading = false;
+    (app, receiver, ai_commands, notices)
+}
+
+fn ended_meeting() -> Event {
+    let now = Local::now().fixed_offset();
+    let mut event = tomlook::calendar::fixture(1).remove(0);
+    event.id = "ended-meeting".into();
+    event.title = "Pilot planning".into();
+    event.start = now - chrono::Duration::hours(3);
+    event.end = now - chrono::Duration::hours(2);
+    event.is_all_day = false;
+    event.organizer = "Taylor Quinn <taylor@contoso.example>".into();
+    event.attendees = vec![
+        "Owner <owner@example.com>".into(),
+        "Alex Rivers <alex@contoso.example>".into(),
+        "Riley Chen <riley@northstar.example>".into(),
+    ];
+    event
+}
+
+fn notes_payload() -> serde_json::Value {
+    serde_json::json!({
+        "tomlook_recap": true, "summary": "Pilot agreed.",
+        "preparation": ["My task: send the comparison to Alex", "My task: confirm the pilot owner"],
+        "talking_points": ["Shared deck https://example.com/deck"],
+        "open_questions": ["Mention of me: Jamie asked about the budget"],
+        "risks": ["Decision: two-week pilot"], "gaps": [], "sources": [],
+        "cs": {"summary": "Pilot dohodnut.",
+            "preparation": ["Můj úkol: poslat Alexovi porovnání", "Můj úkol: potvrdit vlastníka pilotu"],
+            "talking_points": ["Sdílená prezentace https://example.com/deck"],
+            "open_questions": ["Zmínka: Jamie se ptal na rozpočet"],
+            "risks": ["Rozhodnutí: dvoutýdenní pilot"], "gaps": []}
+    })
+}
+
+type Show<'a> = &'a dyn Fn(&mut Tomlook, &mut egui::Ui);
+
+fn draw_with(context: &egui::Context, app: &mut Tomlook, events: Vec<egui::Event>, show: Show) -> egui::FullOutput {
+    let mut output = context.run_ui(egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 2400.0))),
+        events, ..Default::default()
+    }, |ui| show(app, ui));
+    output.textures_delta.clear();
+    output
+}
+
+fn output_text(output: &egui::FullOutput) -> String {
+    let mut text = String::new();
+    for shape in &output.shapes {
+        append_shape_text(&shape.shape, &mut text);
+    }
+    text
+}
+
+fn click_text(context: &egui::Context, app: &mut Tomlook, show: Show, label: &str) -> egui::FullOutput {
+    draw_with(context, app, vec![], show);
+    let output = draw_with(context, app, vec![], show);
+    let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::epaint::Shape::Text(text) if text.galley.job.text == label =>
+            Some(text.pos + text.galley.size() * 0.5),
+        _ => None,
+    }).unwrap_or_else(|| panic!("Missing control: {label}\n{}", output_text(&output)));
+    let mut last = None;
+    for pressed in [true, false] {
+        last = Some(draw_with(context, app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+        }], show));
+    }
+    last.unwrap()
+}
+
+fn copied(output: &egui::FullOutput) -> Vec<String> {
+    output.platform_output.commands.iter().filter_map(|command| match command {
+        egui::OutputCommand::CopyText(text) => Some(text.clone()),
+        _ => None,
+    }).collect()
+}
+
+#[test]
+fn tasks_panel_orders_by_urgency_and_completes_edits_deletes_undoes_and_adds_locally() {
+    use tomlook::tasks::New;
+    use tomlook::worker::TaskCommand;
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, mut ai_commands, _) = task_fixture(language);
+        let account = "owner@example.com";
+        let now = chrono::Utc::now();
+        let today = Local::now().date_naive();
+        let event = ended_meeting();
+        app.calendar = Arc::new(Calendar::build(vec![event.clone()], Default::default(), vec![]).unwrap());
+        let mut tasks = Vec::new();
+        for (id, title, due) in [
+            (1, "Undated fixture", None),
+            (2, "Upcoming fixture", Some(today + chrono::Duration::days(5))),
+            (3, "Today fixture", Some(today)),
+            (4, "Overdue fixture", Some(today - chrono::Duration::days(2))),
+        ] {
+            let mut task = New::manual(title, due, language).unwrap().task(account, now).unwrap();
+            task.id = id;
+            tasks.push(task);
+        }
+        let mut done = New::manual("Done fixture", None, language).unwrap().task(account, now).unwrap().completed(true, now);
+        done.id = 5;
+        tasks.push(done);
+        let mut imported = tomlook::tasks::from_notes(account, &event, &notes_payload(), language, now).unwrap().remove(0);
+        imported.id = 6;
+        tasks.push(imported.clone());
+        let mut foreign = New::manual("Foreign fixture", None, language).unwrap().task("other@example.com", now).unwrap();
+        foreign.id = 7;
+        tasks.push(foreign);
+        app.activity = Arc::new(tomlook::worker::Activity {
+            task_account: Some(account.into()), tasks: Arc::new(tasks), ..Default::default()
+        });
+        assert_eq!(app.open_task_count(), 5);
+        let context = egui::Context::default();
+        let show: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| app.tasks_panel(ui);
+        draw_with(&context, &mut app, vec![], show);
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        for group in ["Overdue", "Due today", "Upcoming", "No due date"] {
+            assert!(text.contains(language.text(group).as_ref()), "{group}: {text}");
+        }
+        if language == tomlook::i18n::Language::Cs {
+            assert!(text.contains("Po termínu") && text.contains("Bez termínu") && text.contains("Přidáno ručně"), "{text}");
+        }
+        assert!(text.contains(&format!("{} (1)", language.text("Done in the last 30 days"))));
+        assert!(text.contains(&imported.title) && text.contains("Pilot planning ·"), "Imported task links its meeting");
+        assert!(!text.contains("Foreign fixture"), "Other accounts' tasks are hidden");
+        let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(at("Overdue fixture") < at("Today fixture") && at("Today fixture") < at("Upcoming fixture")
+            && at("Upcoming fixture") < at("Undated fixture"));
+        click_text(&context, &mut app, show, "Today fixture");
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Task(TaskCommand::SetDone { account, id: 3, done: true })
+            if account == "owner@example.com"));
+        click_text(&context, &mut app, show, language.text("Delete").as_ref());
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Task(TaskCommand::Delete { id: 4, .. })));
+        assert!(output_text(&draw_with(&context, &mut app, vec![], show)).contains(language.text("Task deleted").as_ref()));
+        click_text(&context, &mut app, show, language.text("Undo").as_ref());
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Task(TaskCommand::Restore { task, .. }) if task.id == 4));
+        click_text(&context, &mut app, show, language.text("Edit").as_ref());
+        app.tasks.editing.as_mut().unwrap().title = "Renamed fixture".into();
+        click_text(&context, &mut app, show, language.text("Save").as_ref());
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Task(TaskCommand::Edit { id: 4, title, due, .. })
+            if title == "Renamed fixture" && due == Some(today - chrono::Duration::days(2))));
+        assert!(app.tasks.editing.is_none());
+        app.tasks.quick = "Write the summary".into();
+        click_text(&context, &mut app, show, language.text("Add").as_ref());
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Task(TaskCommand::Add { account, task })
+            if account == "owner@example.com" && task.title == "Write the summary"
+                && task.source == tomlook::tasks::Source::Manual && task.meeting.is_none()));
+        assert!(app.tasks.quick.is_empty());
+        assert!(receiver.try_recv().is_err());
+        assert!(ai_commands.try_recv().is_err(), "Tasks never use AI");
+    }
+}
+
+#[test]
+fn tasks_header_badge_palette_and_escape_open_and_close_the_local_list() {
+    use tomlook::tasks::New;
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, _, mut ai_commands, _) = task_fixture(language);
+        let now = chrono::Utc::now();
+        let tasks = (1..=3).map(|id| {
+            let mut task = New::manual(&format!("Fixture {id}"), None, language).unwrap().task("owner@example.com", now).unwrap();
+            task.id = id;
+            if id == 3 { task.completed(true, now) } else { task }
+        }).collect();
+        app.activity = Arc::new(tomlook::worker::Activity {
+            task_account: Some("owner@example.com".into()), tasks: Arc::new(tasks), ..Default::default()
+        });
+        let context = egui::Context::default();
+        let mut output = context.run_ui(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1400.0, 200.0))),
+            ..Default::default()
+        }, |ui| app.header(ui));
+        output.textures_delta.clear();
+        let badge = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.job.text == "2" => Some(text.pos),
+            _ => None,
+        });
+        assert!(badge.is_some_and(|pos| pos.x > 1200.0), "Two open tasks are counted in the header");
+        let matches = command_matches_in(if language == tomlook::i18n::Language::Cs { "úkol" } else { "task" }, language);
+        assert!(matches.contains(&PaletteCommand::Tasks) && matches.contains(&PaletteCommand::AddTask));
+        app.run_palette_command(PaletteCommand::AddTask, &context);
+        assert!(app.tasks_open && app.tasks.focus_quick);
+        let mut output = context.run_ui(egui::RawInput {
+            events: vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }],
+            ..Default::default()
+        }, |ui| app.shortcuts(ui.ctx()));
+        output.textures_delta.clear();
+        assert!(!app.tasks_open, "Escape closes the task list");
+        assert!(ai_commands.try_recv().is_err());
+    }
+}
+
+#[test]
+fn ended_meeting_details_show_its_tasks_and_a_saved_local_follow_up_with_copy_open_and_discard() {
+    use tomlook::worker::TaskCommand;
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, mut ai_commands, _) = task_fixture(language);
+        let account = "owner@example.com";
+        let event = ended_meeting();
+        let payload = notes_payload();
+        app.calendar = Arc::new(Calendar::build(vec![event.clone()], Default::default(), vec![]).unwrap());
+        app.selected = Some(0);
+        app.briefing = Some(payload.clone());
+        let now = chrono::Utc::now();
+        let mut tasks = tomlook::tasks::from_notes(account, &event, &payload, language, now).unwrap();
+        for (index, task) in tasks.iter_mut().enumerate() {
+            task.id = index as i64 + 1;
+        }
+        let request = tomlook::followup::Request::new(1, account, &event, &payload, language,
+            &[account.to_owned()], None).unwrap();
+        let saved = tomlook::followup::Saved::new(&request, tomlook::followup::Draft {
+            subject: "Follow-up: Pilot planning".into(), body: "Hi all,\n\nthanks for today.".into(),
+        }, now);
+        app.activity = Arc::new(tomlook::worker::Activity {
+            task_account: Some(account.into()), tasks: Arc::new(tasks.clone()),
+            followups: Arc::new([(saved.key.clone(), saved.clone())].into()), ..Default::default()
+        });
+        let context = egui::Context::default();
+        let show: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| {
+            let event = app.calendar.events[0].clone();
+            app.details(ui, event);
+        };
+        draw_with(&context, &mut app, vec![], show);
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        assert!(receiver.try_iter().all(|command| matches!(command, Command::LoadFeedback(_))));
+        for expected in [
+            language.text("In my task list").into_owned(), tasks[0].title.clone(), tasks[1].title.clone(),
+            language.text("Follow-up e-mail").into_owned(), "Follow-up: Pilot planning".into(),
+            language.text("Recipients (3 of 3)").into_owned(),
+            "Taylor Quinn <taylor@contoso.example>".into(), "Riley Chen <riley@northstar.example>".into(),
+            language.text("Copy").into_owned(), language.text("Open in Outlook").into_owned(),
+            language.text("Regenerate").into_owned(), language.text("Discard").into_owned(),
+        ] {
+            assert!(text.contains(&expected), "Missing {expected}: {text}");
+        }
+        assert!(!text.contains("<owner@example.com>"), "The signed-in user is never a recipient");
+        click_text(&context, &mut app, show, &tasks[1].title);
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Task(TaskCommand::SetDone { id: 2, done: true, .. })));
+        let output = click_text(&context, &mut app, show, language.text("Copy").as_ref());
+        assert_eq!(copied(&output), vec![saved.clipboard()]);
+        assert!(saved.clipboard().starts_with(if language == tomlook::i18n::Language::Cs { "Předmět: " } else { "Subject: " }));
+        click_text(&context, &mut app, show, language.text("Open in Outlook").as_ref());
+        let link = super::followup::OPENED_LINKS.with(|links| links.borrow().last().cloned()).unwrap();
+        assert!(link.starts_with(
+            "mailto:taylor@contoso.example,alex@contoso.example,riley@northstar.example?subject=Follow-up%3A%20Pilot%20planning&body=Hi%20all%2C%0D%0A%0D%0Athanks"),
+            "{link}");
+        click_text(&context, &mut app, show, &format!("Alex Rivers <alex@contoso.example> · {}", language.text("External")));
+        let Ok(Command::SaveFollowUp(updated)) = receiver.try_recv() else { panic!("Recipient choice is saved") };
+        assert_eq!(updated.selected(), vec!["taylor@contoso.example", "riley@northstar.example"]);
+        assert!(output_text(&draw_with(&context, &mut app, vec![], show)).contains(language.text("Recipients (2 of 3)").as_ref()));
+        click_text(&context, &mut app, show, language.text("Discard").as_ref());
+        assert!(matches!(receiver.try_recv().unwrap(), Command::DiscardFollowUp { account, key }
+            if account == "owner@example.com" && key == saved.key));
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        assert!(text.contains(language.text("Prepare follow-up e-mail").as_ref()) && !text.contains("Follow-up: Pilot planning"),
+            "A discarded draft does not reappear while the deletion is saved");
+        assert!(receiver.try_iter().all(|command| matches!(command, Command::LoadFeedback(_))));
+        while let Ok(command) = ai_commands.try_recv() {
+            assert!(!matches!(command, ai::Command::FollowUp(_)), "Opening details never drafts an e-mail");
+        }
+    }
+}
+
+#[test]
+fn preparing_a_follow_up_sends_one_explicit_request_and_saves_only_validated_text() {
+    let language = tomlook::i18n::Language::En;
+    let (mut app, receiver, mut ai_commands, notices) = task_fixture(language);
+    let account = "owner@example.com";
+    let event = ended_meeting();
+    app.calendar = Arc::new(Calendar::build(vec![event.clone()], Default::default(), vec![]).unwrap());
+    app.selected = Some(0);
+    app.briefing = Some(notes_payload());
+    app.activity = Arc::new(tomlook::worker::Activity { task_account: Some(account.into()), ..Default::default() });
+    let context = egui::Context::default();
+    let show: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| {
+        let event = app.calendar.events[0].clone();
+        app.details(ui, event);
+    };
+    let follow_ups = |commands: &mut tokio::sync::mpsc::Receiver<ai::Command>| {
+        let mut found = Vec::new();
+        while let Ok(command) = commands.try_recv() {
+            if let ai::Command::FollowUp(request) = command { found.push(request); }
+        }
+        found
+    };
+    draw_with(&context, &mut app, vec![], show);
+    assert!(follow_ups(&mut ai_commands).is_empty(), "Follow-up e-mails are never automatic");
+    assert!(receiver.try_iter().all(|command| matches!(command, Command::LoadFeedback(_))));
+    click_text(&context, &mut app, show, "Prepare follow-up e-mail");
+    let mut requests = follow_ups(&mut ai_commands);
+    assert_eq!(requests.len(), 1);
+    let request = requests.remove(0);
+    assert_eq!(request.key, tomlook::recaps::key(account, &event));
+    assert_eq!(request.language, language);
+    assert_eq!(request.recipients.iter().map(|recipient| recipient.email.as_str()).collect::<Vec<_>>(),
+        vec!["taylor@contoso.example", "alex@contoso.example", "riley@northstar.example"]);
+    assert_eq!(request.notes.my_tasks.len(), 2);
+    assert!(request.prompt().unwrap().len() <= tomlook::followup::INPUT_LIMIT);
+    assert!(output_text(&draw_with(&context, &mut app, vec![], show)).contains("Preparing the follow-up e-mail..."));
+    notices.send(ai::Notice::FollowUp { id: request.id + 100, result: Ok(tomlook::followup::Draft {
+        subject: "Stale".into(), body: "Stale".into() }) }).unwrap();
+    app.receive();
+    assert!(app.followup.editing.is_none(), "Unknown results are ignored");
+    notices.send(ai::Notice::FollowUp { id: request.id, result: Ok(tomlook::followup::Draft {
+        subject: "Follow-up: Pilot planning".into(), body: "Hi all,\n\n- Two-week pilot [to confirm]".into() }) }).unwrap();
+    app.receive();
+    let Ok(Command::SaveFollowUp(saved)) = receiver.try_recv() else { panic!("The validated draft is saved locally") };
+    assert_eq!((saved.subject.as_str(), saved.key.as_str()), ("Follow-up: Pilot planning", request.key.as_str()));
+    assert_eq!(app.followup.editing.as_ref(), Some(saved.as_ref()));
+    let text = output_text(&draw_with(&context, &mut app, vec![], show));
+    assert!(text.contains("Follow-up: Pilot planning") && text.contains("- Two-week pilot [to confirm]"));
+    click_text(&context, &mut app, show, "Regenerate");
+    let request = follow_ups(&mut ai_commands).remove(0);
+    notices.send(ai::Notice::FollowUp { id: request.id,
+        result: Err("Daily AI request limit reached; no follow-up e-mail was requested.".into()) }).unwrap();
+    app.receive();
+    let text = output_text(&draw_with(&context, &mut app, vec![], show));
+    assert!(text.contains("Daily AI request limit reached; no follow-up e-mail was requested."));
+    assert!(text.contains("Follow-up: Pilot planning"), "A failed regeneration keeps the previous text");
+    assert!(receiver.try_iter().all(|command| matches!(command, Command::LoadFeedback(_))));
+    app.preview = true;
+    app.followup = Default::default();
+    app.activity = Arc::new(tomlook::worker::Activity { task_account: Some(tomlook::feedback::PREVIEW_ACCOUNT.into()), ..Default::default() });
+    click_text(&context, &mut app, show, "Prepare follow-up e-mail");
+    assert!(follow_ups(&mut ai_commands).is_empty(), "The offline demo never requests AI");
+}
+
+#[test]
+fn ask_task_and_email_drafts_add_linked_local_tasks_and_open_only_validated_mail_links() {
+    use tomlook::worker::TaskCommand;
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, mut ai_commands, _) = task_fixture(language);
+        let event = ended_meeting();
+        app.calendar = Arc::new(Calendar::build(vec![event.clone()], Default::default(), vec![]).unwrap());
+        app.assistant = true;
+        app.assistant_context = Some(event.clone());
+        app.assistant_revision = Some(event.fingerprint());
+        let task = Proposal { kind: Kind::Task, target: "Local pilot checklist".into(),
+            title: "Prepare the pilot checklist".into(), body: "Three success criteria".into() };
+        let email = Proposal { kind: Kind::Email, target: "Alex <alex@contoso.example>".into(),
+            title: "Pilot next steps".into(), body: "Hi Alex,\nthe next steps.".into() };
+        let mut answer = fixture_answer("Two local drafts");
+        answer.proposals = Arc::new(vec![task.clone(), email.clone()]);
+        app.answer = Some(answer);
+        let context = egui::Context::default();
+        let show: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| app.assistant_panel(ui);
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        for expected in [language.text("Task note"), language.text("Email draft"), language.text("Add to tasks"),
+            language.text("Open in Outlook"), language.text("Drafts stay local until you use them; nothing is sent.")] {
+            assert!(text.contains(expected.as_ref()), "Missing {expected}: {text}");
+        }
+        click_text(&context, &mut app, show, language.text("Add to tasks").as_ref());
+        let Ok(Command::Task(TaskCommand::Add { account, task: added })) = receiver.try_recv() else { panic!("Task draft was not added") };
+        assert_eq!(account, "owner@example.com");
+        assert_eq!((added.title.as_str(), added.source), ("Prepare the pilot checklist", tomlook::tasks::Source::AskDraft));
+        assert_eq!(added.meeting.as_ref().unwrap().event_id, event.id, "The Ask meeting context links the task");
+        assert!(added.note.contains("Three success criteria") && added.note.contains("Local pilot checklist"));
+        assert!(output_text(&draw_with(&context, &mut app, vec![], show)).contains(language.text("Added to tasks").as_ref()));
+        click_text(&context, &mut app, show, language.text("Open in Outlook").as_ref());
+        let link = super::followup::OPENED_LINKS.with(|links| links.borrow().last().cloned()).unwrap();
+        assert_eq!(link, "mailto:alex@contoso.example?subject=Pilot%20next%20steps&body=Hi%20Alex%2C%0D%0Athe%20next%20steps.");
+        let output = click_text(&context, &mut app, show, language.text("Copy").as_ref());
+        assert_eq!(copied(&output), vec![tomlook::followup::clipboard_text("Pilot next steps", "Hi Alex,\nthe next steps.", language)]);
+        assert!(receiver.try_recv().is_err());
+        assert!(ai_commands.try_recv().is_err(), "Local drafts never send AI requests");
+    }
+}

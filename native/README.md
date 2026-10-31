@@ -48,10 +48,14 @@ have loaded. It cannot be used in production or combined with measurements.
 Only the demo window content is captured, not other desktop windows or the
 Windows title bar. PNG encoding and exclusive-create file output run on the
 bounded storage worker. Existing images are never overwritten.
-`--demo-scene <details|feedback|prompts>` chooses what that screenshot shows:
+`--demo-scene <details|feedback|prompts|tasks|followup>` chooses what that screenshot shows:
 the default details pane, expanded Insights with a saved rating and an open
-reason panel, or **Settings > AI prompts** after fictional sample feedback is
-saved into the isolated demo profile through the normal storage path.
+reason panel, **Settings > AI prompts** after fictional sample feedback is
+saved into the isolated demo profile through the normal storage path, the
+**Tasks** list, or the saved follow-up e-mail of the fictional meeting that
+ended yesterday. The preview seeds fictional tasks (including tasks imported
+from that meeting's sample notes) and a fictional follow-up draft into the
+isolated profile; it never requests AI or opens an e-mail link by itself.
 
 ## Native interaction measurement
 
@@ -375,6 +379,57 @@ short rationale; malformed, empty, unchanged or oversized answers are rejected.
 The draft shows the rationale, a sentence/line diff and the full new text.
 **Use draft** only copies it into the editor, where **Save prompts** is still
 required; **Discard** drops it. No prompt is ever saved automatically.
+
+### Follow-up and tasks
+
+**Tasks** (header icon with an open-task badge; command palette **Open tasks** /
+**Add task**) is a local list in `tomlook.db`; nothing is written to To Do,
+Planner, Dataverse or any other service. Each task stores the calendar owner,
+a single-line title (1-300 characters), an optional note (at most 2,000
+characters), an optional local due date, open/done state with completion time,
+created/updated times, its source (manual, meeting notes or Ask draft), the
+meeting occurrence key with a title/start snapshot, the imported item index and
+notes revision, and the title language. The list shows overdue, due today,
+upcoming and undated open tasks, then a collapsed list of tasks completed in the
+last 30 days. Rows have a completion checkbox, inline editing (title, note, due
+date via a small month picker), a meeting chip that opens the meeting details,
+and delete with **Undo**. Escape closes the list; all storage work runs on the
+storage worker.
+
+When post-meeting notes become ready (and, once per account on the first run of
+this version, for saved notes of meetings that ended in the last seven days),
+every item of the notes' personal task list (`preparation`) becomes an open task.
+The title uses the current UI language and the note keeps the other language.
+Mentions and talking points are never imported. A due date is set only when the
+item contains exactly one explicit date with a year (`2026-11-04` or
+`4. 11. 2026`); nothing is guessed. Imports are deduplicated by account,
+occurrence, notes revision and item index, and by the normalized item text of
+the same meeting, so restarts, language switches and edited notes do not create
+duplicates. Completed tasks stay in the list and deleted imported tasks leave a
+tombstone, so they never return. Meeting details of an ended meeting list that
+meeting's tasks with checkboxes right below **My tasks**. Ask task drafts offer
+**Add to tasks** (linked to the Ask meeting context); Ask e-mail drafts offer
+**Copy** and **Open in Outlook**.
+
+Ended meetings with saved notes offer **Prepare follow-up e-mail**. It sends one
+explicit, tool-free request with the Quick profile through the isolated
+executor, counted against the daily AI limit and never sent automatically. The
+request carries the meeting title and time, organizer and attendee names and
+addresses (without the signed-in user, the user's mailboxes or rooms), the notes
+summary, decisions, technical takeaways, my tasks, open questions and shared
+links in the UI language, bounded to 32 KB. The answer must be JSON with exactly
+a one-line subject (at most 200 characters) and a body (at most 4,000
+characters); uncertain items are marked rather than invented. The editable draft
+is saved per meeting occurrence (the newest 200 drafts per account) until
+**Discard**. Recipient checkboxes default to the organizer and every other
+attendee. **Copy** puts `Subject: …`, an empty line and the body on the
+clipboard. **Open in Outlook** opens an RFC 6068 `mailto:` link (UTF-8
+percent-encoding, CRLF line breaks) in the default e-mail app; only plain
+addresses, a subject and a body are accepted by the validated opener. Links
+longer than 2,000 characters carry only recipients and subject, and the body is
+copied to the clipboard instead. Tomlook never sends e-mail, creates Outlook
+drafts or writes mail through Graph. A pending follow-up recommendation in
+Messages links to this action.
 
 ### AI-proposed edits
 

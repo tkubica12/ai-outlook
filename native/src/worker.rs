@@ -91,6 +91,12 @@ pub enum Command {
     ResumeQueued,
     Wake,
     ConnectorRevision(String),
+    Task(TaskCommand),
+    SaveFollowUp(Box<crate::followup::Saved>),
+    DiscardFollowUp {
+        account: String,
+        key: String,
+    },
     AttachAi {
         commands: tokio::sync::mpsc::Sender<ai::Command>,
         ready: Arc<AtomicBool>,
@@ -100,6 +106,46 @@ pub enum Command {
         workiq_ready: Arc<AtomicBool>,
     },
     Exit,
+}
+
+/// Local task list changes; each is bound to the calendar owner (the fixed demo account in previews).
+pub enum TaskCommand {
+    Add {
+        account: String,
+        task: Box<crate::tasks::New>,
+    },
+    Edit {
+        account: String,
+        id: i64,
+        title: String,
+        note: String,
+        due: Option<chrono::NaiveDate>,
+    },
+    SetDone {
+        account: String,
+        id: i64,
+        done: bool,
+    },
+    Delete {
+        account: String,
+        id: i64,
+    },
+    Restore {
+        account: String,
+        task: Box<crate::tasks::Task>,
+    },
+}
+
+impl TaskCommand {
+    fn account(&self) -> &str {
+        match self {
+            Self::Add { account, .. }
+            | Self::Edit { account, .. }
+            | Self::SetDone { account, .. }
+            | Self::Delete { account, .. }
+            | Self::Restore { account, .. } => account,
+        }
+    }
 }
 
 pub enum Notice {
@@ -291,6 +337,10 @@ pub struct Activity {
     pub identity: Option<Arc<crate::workiq::connection::Identity>>,
     pub event_creations: Arc<std::collections::BTreeMap<String, crate::event_creation::Record>>,
     pub recaps: Arc<crate::recaps::Ledger>,
+    /// Account of `tasks` and `followups`: the calendar owner, or the demo account in previews.
+    pub task_account: Option<String>,
+    pub tasks: Arc<Vec<crate::tasks::Task>>,
+    pub followups: Arc<std::collections::BTreeMap<String, crate::followup::Saved>>,
 }
 
 pub struct Shutdown {
@@ -319,6 +369,99 @@ fn feedback_owner(store: &Store, demo: bool, account: &str) -> Result<(), String
     } else {
         Err("Feedback belongs to a different calendar account; nothing was saved".into())
     }
+}
+
+/// Tasks and follow-up e-mails belong to the calendar owner; previews use their fixed account.
+fn task_owner(store: &Store, demo: bool, account: &str) -> Result<(), String> {
+    let owner = if demo {
+        Some(crate::feedback::PREVIEW_ACCOUNT.to_owned())
+    } else {
+        store.calendar_owner()?
+    };
+    if owner.as_deref() == Some(account) {
+        Ok(())
+    } else {
+        Err("This belongs to a different calendar account; nothing was changed".into())
+    }
+}
+
+type TaskViews = (
+    Arc<Vec<crate::tasks::Task>>,
+    Arc<std::collections::BTreeMap<String, crate::followup::Saved>>,
+);
+
+fn import_note_tasks(
+    store: &Store,
+    account: &str,
+    event: &calendar::Event,
+    payload: &serde_json::Value,
+    language: crate::i18n::Language,
+) -> Result<usize, String> {
+    let tasks = crate::tasks::from_notes(account, event, payload, language, chrono::Utc::now())?;
+    store.import_tasks(account, &tasks)
+}
+
+/// Loads an account's tasks and follow-up e-mails. The first time an account is seen by this
+/// version, personal tasks of saved notes that ended within the last seven days are imported
+/// once; the offline preview instead seeds its fictional sample tasks and follow-up e-mail.
+fn load_tasks(
+    store: &Store,
+    account: &str,
+    calendar: &Calendar,
+    recaps: &crate::recaps::Ledger,
+    language: crate::i18n::Language,
+    demo: bool,
+) -> Result<TaskViews, String> {
+    if !store.tasks_backfilled(account)? {
+        let now = chrono::Local::now().fixed_offset();
+        if demo {
+            if let Some(event) = calendar
+                .events
+                .iter()
+                .find(|event| event.title == crate::showcase::ENDED_MEETING)
+            {
+                let created = chrono::Utc::now();
+                for task in crate::showcase::sample_tasks(account, event, language, created)? {
+                    store.add_task(&task)?;
+                }
+                import_note_tasks(store, account, event, &crate::showcase::notes(event)?, language)?;
+                store.save_followup(&crate::showcase::sample_followup(
+                    account, event, language, created,
+                )?)?;
+            }
+        } else {
+            for record in recaps.records.values().filter(|record| record.account == account) {
+                let (Some(payload), Some(index)) =
+                    (&record.payload, calendar.event_index(&record.event_id))
+                else {
+                    continue;
+                };
+                let event = &calendar.events[index];
+                if event.end <= now
+                    && event.end > now - chrono::Duration::days(7)
+                    && let Err(error) = import_note_tasks(store, account, event, payload, language)
+                {
+                    eprintln!("Tomlook: tasks from saved meeting notes were not imported: {error}");
+                }
+            }
+        }
+        store.mark_tasks_backfilled(account)?;
+    }
+    Ok((
+        Arc::new(store.tasks(account)?),
+        Arc::new(store.followups(account)?),
+    ))
+}
+
+fn reload_tasks(store: &Store, account: Option<&str>, views: &mut TaskViews) -> Result<(), String> {
+    *views = match account {
+        Some(account) => (
+            Arc::new(store.tasks(account)?),
+            Arc::new(store.followups(account)?),
+        ),
+        None => Default::default(),
+    };
+    Ok(())
 }
 
 fn propose_change(
@@ -801,7 +944,7 @@ fn load(store: &mut Store, options: &Options) -> Result<(Arc<Calendar>, Preferen
             .map(|i| calendar::monday(now.date_naive()) + chrono::Duration::days(i))
             .collect();
         Calendar::build(
-            crate::showcase::events(now, count),
+            crate::showcase::preview_events(now, count),
             coverage,
             vec!["Synthetic preview - no live AI or work data".into()],
         )?
@@ -867,6 +1010,10 @@ impl Worker {
                 let mut last_was_recap = false;
                 let mut recaps_revision = 0_u64;
                 let mut published_recaps_revision = u64::MAX;
+                let mut task_account: Option<String> = None;
+                let mut task_views: TaskViews = Default::default();
+                let mut tasks_revision = 0_u64;
+                let mut published_tasks_revision = u64::MAX;
                 let mut inbox = store.recommendations()?;
                 let stale_events: std::collections::BTreeSet<_> = inbox.values_mut().filter(|record|
                     record.state == crate::recommendations::State::NotSent
@@ -938,6 +1085,22 @@ impl Worker {
                     }
                     let now = chrono::Local::now().fixed_offset();
                     let current_owner = store.calendar_owner()?;
+                    let owner_of_tasks = if options.demo.is_some() {
+                        Some(crate::feedback::PREVIEW_ACCOUNT.to_owned())
+                    } else { current_owner.clone() };
+                    if owner_of_tasks != task_account {
+                        task_account = owner_of_tasks;
+                        task_views = match task_account.as_deref()
+                            .map(|account| load_tasks(&store, account, &calendar, &recaps, preferences.language, options.demo.is_some()))
+                            .transpose() {
+                            Ok(views) => views.unwrap_or_default(),
+                            Err(error) => {
+                                notify(Notice::Error(format!("Tasks could not be loaded: {error}")));
+                                Default::default()
+                            }
+                        };
+                        tasks_revision += 1;
+                    }
                     if let Some((id, key, _)) = &recap_flight
                         && let Some(sdk) = &sdk
                         && (recap_started.is_some_and(|started: std::time::Instant| started.elapsed() > Duration::from_secs(1800))
@@ -1148,6 +1311,22 @@ impl Worker {
                             }, now);
                             store.save_recaps(&recaps)?;
                             recaps_revision += 1;
+                            if current
+                                && let Some(record) = recaps.records.get(&outcome.key)
+                                && let Some(payload) = &record.payload
+                                && let Some(index) = calendar.event_index(&record.event_id)
+                            {
+                                match import_note_tasks(&store, &outcome.account, &calendar.events[index], payload, preferences.language) {
+                                    Ok(0) => {}
+                                    Ok(_) => {
+                                        if let Err(error) = reload_tasks(&store, task_account.as_deref(), &mut task_views) {
+                                            notify(Notice::Error(error));
+                                        }
+                                        tasks_revision += 1;
+                                    }
+                                    Err(error) => { notify(Notice::Error(format!("Tasks from meeting notes could not be added: {error}"))); }
+                                }
+                            }
                         }
                     }
                     if sdk_terminated && let Some((_, key, _)) = recap_flight.take() {
@@ -1353,7 +1532,7 @@ impl Worker {
                         published_owner = owner;
                         published_minute = Some(now.timestamp() / 60);
                     }
-                    if view_changed || queue_changed || previous.identity != identity || previous.enabled != preferences.prepare_enabled || previous.paused != preferences.paused || previous.error != failure || previous.sync != sync || inbox_revision != published_inbox_revision || recaps_revision != published_recaps_revision {
+                    if view_changed || queue_changed || previous.identity != identity || previous.enabled != preferences.prepare_enabled || previous.paused != preferences.paused || previous.error != failure || previous.sync != sync || inbox_revision != published_inbox_revision || recaps_revision != published_recaps_revision || tasks_revision != published_tasks_revision {
                         if inbox_revision != published_inbox_revision { store.save_recommendations(&inbox)?; }
                         let index = if queue_changed {
                             Arc::new(ActivityIndex::new(&queue))
@@ -1363,11 +1542,13 @@ impl Worker {
                         revision += 1;
                         let recap_snapshot = if recaps_revision != published_recaps_revision { Arc::new(recaps.clone()) } else { previous.recaps.clone() };
                         let next = Activity { revision, queue: queue.clone(), index, enabled: preferences.prepare_enabled, paused: preferences.paused, error: failure.clone(), sync, recommendations: Arc::new(inbox.clone()), recommendation_view: recommendation_view.clone(), identity: identity.clone(), event_creations: Arc::new(event_creations.clone()), recaps: recap_snapshot,
+                            task_account: task_account.clone(), tasks: task_views.0.clone(), followups: task_views.1.clone(),
                             queued: queue.jobs.values().filter(|job| job.state == crate::scheduler::State::Queued).count(),
                             deferred: queue.jobs.values().filter(|job| job.state == crate::scheduler::State::Deferred).count() };
                         *state.lock().map_err(|_| "Preparation state is unavailable")? = Arc::new(next);
                         published_inbox_revision = inbox_revision;
                         published_recaps_revision = recaps_revision;
+                        published_tasks_revision = tasks_revision;
                         context.request_repaint();
                     }
                     let command = loop {
@@ -1393,7 +1574,7 @@ impl Worker {
                         let detail = if options.demo.is_some() {
                             calendar.events.iter().find(|event| event.id == id)
                                 .ok_or_else(|| "Synthetic meeting is no longer available".to_owned())
-                                .and_then(crate::showcase::insights).map(Some)
+                                .and_then(crate::showcase::detail).map(Some)
                         } else if let Some(event) = calendar.event_index(&id).map(|index| &calendar.events[index])
                             && event.end <= chrono::Local::now().fixed_offset() {
                             Ok(store.calendar_owner()?.as_deref().and_then(|account| recaps.record(account, event))
@@ -1580,12 +1761,25 @@ impl Worker {
                                 inbox = store.apply_document_recommendation(recommendation, &event)?;
                                 inbox_revision += 1;
                                 if edit.document == crate::changes::Document::Notes {
-                                    let payload = store.document(owner.as_deref().ok_or("Calendar account disappeared")?, &event, edit.document)?;
-                                    let record = recaps.record_mut(owner.as_deref().ok_or("Calendar account disappeared")?, &event)
+                                    let account = owner.as_deref().ok_or("Calendar account disappeared")?;
+                                    let payload = store.document(account, &event, edit.document)?;
+                                    let record = recaps.record_mut(account, &event)
                                         .ok_or("Saved meeting notes disappeared from the active ledger")?;
-                                    record.payload = payload;
+                                    record.payload = payload.clone();
                                     record.message = "Approved meeting notes saved".into();
                                     recaps_revision += 1;
+                                    if let Some(payload) = &payload {
+                                        match import_note_tasks(&store, account, &event, payload, preferences.language) {
+                                            Ok(0) => {}
+                                            Ok(_) => {
+                                                if let Err(error) = reload_tasks(&store, task_account.as_deref(), &mut task_views) {
+                                                    notify(Notice::Error(error));
+                                                }
+                                                tasks_revision += 1;
+                                            }
+                                            Err(error) => { notify(Notice::Error(format!("Tasks from meeting notes could not be added: {error}"))); }
+                                        }
+                                    }
                                 }
                                 return Ok(());
                             }
@@ -1787,6 +1981,57 @@ impl Worker {
                             if !revision.is_empty() && (revision.len() != 64 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())) {
                                 Err("Invalid connector configuration identity; preparation stopped".into())
                             } else { connector_revision = revision; dirty = true; Ok(()) }
+                        }
+                        // Task and follow-up failures are reported but never stop preparation.
+                        Command::Task(command) => {
+                            let outcome = (|| -> Result<(), String> {
+                                task_owner(&store, options.demo.is_some(), command.account())?;
+                                let now = chrono::Utc::now();
+                                let current = |id: i64| task_views.0.iter()
+                                    .find(|task| task.id == id && task.account == command.account())
+                                    .cloned().ok_or_else(|| "Task no longer exists".to_owned());
+                                match &command {
+                                    TaskCommand::Add { account, task } => { store.add_task(&task.task(account, now)?)?; }
+                                    TaskCommand::Edit { id, title, note, due, .. } =>
+                                        store.update_task(&current(*id)?.edited(title, note, *due, now)?)?,
+                                    TaskCommand::SetDone { id, done, .. } =>
+                                        store.update_task(&current(*id)?.completed(*done, now))?,
+                                    TaskCommand::Delete { account, id } => { store.delete_task(account, *id)?; }
+                                    TaskCommand::Restore { account, task } => {
+                                        if &task.account != account {
+                                            return Err("This belongs to a different calendar account; nothing was changed".into());
+                                        }
+                                        store.restore_task(task)?;
+                                    }
+                                }
+                                Ok(())
+                            })();
+                            if let Err(error) = reload_tasks(&store, task_account.as_deref(), &mut task_views) {
+                                notify(Notice::Error(error));
+                            }
+                            tasks_revision += 1;
+                            if let Err(error) = outcome { notify(Notice::Error(error)); }
+                            Ok(())
+                        }
+                        Command::SaveFollowUp(saved) => {
+                            let outcome = task_owner(&store, options.demo.is_some(), &saved.account)
+                                .and_then(|()| store.save_followup(&saved));
+                            if let Err(error) = reload_tasks(&store, task_account.as_deref(), &mut task_views) {
+                                notify(Notice::Error(error));
+                            }
+                            tasks_revision += 1;
+                            if let Err(error) = outcome { notify(Notice::Error(error)); }
+                            Ok(())
+                        }
+                        Command::DiscardFollowUp { account, key } => {
+                            let outcome = task_owner(&store, options.demo.is_some(), &account)
+                                .and_then(|()| store.delete_followup(&account, &key));
+                            if let Err(error) = reload_tasks(&store, task_account.as_deref(), &mut task_views) {
+                                notify(Notice::Error(error));
+                            }
+                            tasks_revision += 1;
+                            if let Err(error) = outcome { notify(Notice::Error(error)); }
+                            Ok(())
                         }
                         Command::AttachAi { commands, ready, occupied, terminated, analysis_revision, workiq_ready } => {
                             commands.try_send(ai::Command::DailyAiLimit(preferences.daily_ai_limit)).map_err(|_| "AI budget could not reach the executor")?;
@@ -2454,5 +2699,94 @@ mod tests {
             outcomes[0].result,
             ai::PreparationResult::Cancelled(_)
         ));
+    }
+
+    #[test]
+    fn saved_notes_import_tasks_once_and_task_commands_stay_local_owner_bound_and_persistent() {
+        use crate::tasks::{New, Source, Status};
+        let root = tempfile::tempdir().unwrap();
+        let account = "owner@example.com";
+        let now = Local::now().fixed_offset();
+        let mut event = crate::tasks::tests::meeting();
+        event.start = now - chrono::Duration::hours(3);
+        event.end = now - chrono::Duration::hours(2);
+        event.is_all_day = false;
+        let calendar = Calendar::build(vec![event.clone()],
+            [event.start.with_timezone(&Local).date_naive()].into(), vec![]).unwrap();
+        {
+            let mut store = Store::open(root.path()).unwrap();
+            store.save_workiq_calendar(&calendar, account).unwrap();
+            let mut ledger = crate::recaps::Ledger::default();
+            let key = ledger.begin(account, &event, now);
+            ledger.finish(&key, Ok(Some(crate::tasks::tests::notes())), now);
+            store.save_recaps(&ledger).unwrap();
+        }
+        let start = || Worker::start(Options {state:root.path().into(), legacy_root:root.path().join("absent"), demo:None},
+            egui::Context::default()).unwrap();
+        let wait = |worker: &Worker, expected: &dyn Fn(&Activity) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let activity = worker.activity.lock().unwrap().clone();
+                if expected(&activity) { return activity; }
+                assert!(std::time::Instant::now() < deadline, "Tasks were not published");
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let mut worker = start();
+        let activity = wait(&worker, &|activity| activity.task_account.as_deref() == Some(account) && activity.tasks.len() == 3);
+        assert!(activity.tasks.iter().all(|task| task.source == Source::MeetingNotes && task.status == Status::Open));
+        let ids = activity.tasks.iter().map(|task| task.id).collect::<Vec<_>>();
+        worker.commands.send(Command::Task(TaskCommand::SetDone { account: account.into(), id: ids[0], done: true })).unwrap();
+        worker.commands.send(Command::Task(TaskCommand::Delete { account: account.into(), id: ids[1] })).unwrap();
+        worker.commands.send(Command::Task(TaskCommand::Add { account: account.into(),
+            task: Box::new(New::manual("Manual fixture", None, crate::i18n::Language::En).unwrap()) })).unwrap();
+        worker.commands.send(Command::Task(TaskCommand::Add { account: "intruder@example.com".into(),
+            task: Box::new(New::manual("Foreign fixture", None, crate::i18n::Language::En).unwrap()) })).unwrap();
+        let activity = wait(&worker, &|activity| activity.tasks.len() == 3
+            && activity.tasks.iter().any(|task| task.title == "Manual fixture"));
+        assert!(activity.tasks.iter().any(|task| task.id == ids[0] && task.status == Status::Done));
+        assert!(!activity.tasks.iter().any(|task| task.id == ids[1] || task.title == "Foreign fixture"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(Notice::Error(error)) = worker.notices.try_recv() && error.contains("different calendar account") { break; }
+            assert!(std::time::Instant::now() < deadline, "A foreign task must be refused");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let request = crate::followup::Request::new(1, account, &event, &crate::tasks::tests::notes(),
+            crate::i18n::Language::En, &[account.into()], None).unwrap();
+        let saved = crate::followup::Saved::new(&request, crate::followup::Draft { subject: "S".into(), body: "B".into() }, chrono::Utc::now());
+        worker.commands.send(Command::SaveFollowUp(Box::new(saved.clone()))).unwrap();
+        wait(&worker, &|activity| activity.followups.get(&saved.key) == Some(&saved));
+        assert!(activity.error.is_none(), "Task commands never stop preparation");
+        worker.commands.send(Command::Exit).unwrap();
+        worker.done.take().unwrap().recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        let mut worker = start();
+        let activity = wait(&worker, &|activity| activity.task_account.as_deref() == Some(account) && !activity.tasks.is_empty());
+        assert_eq!(activity.tasks.len(), 3, "Restart neither re-imports deleted or completed tasks nor loses manual ones");
+        assert_eq!(activity.followups.get(&saved.key), Some(&saved));
+        worker.commands.send(Command::DiscardFollowUp { account: account.into(), key: saved.key.clone() }).unwrap();
+        wait(&worker, &|activity| activity.followups.is_empty());
+        worker.commands.send(Command::Exit).unwrap();
+        worker.done.take().unwrap().recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    }
+
+    #[test]
+    fn offline_preview_seeds_fictional_tasks_and_a_follow_up_without_ai() {
+        let root = tempfile::tempdir().unwrap();
+        let mut worker = Worker::start(Options {state:root.path().join("demo"), legacy_root:root.path().join("absent"), demo:Some(200)},
+            egui::Context::default()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let activity = loop {
+            let activity = worker.activity.lock().unwrap().clone();
+            if !activity.tasks.is_empty() && !activity.followups.is_empty() { break activity; }
+            assert!(std::time::Instant::now() < deadline, "Preview tasks were not seeded");
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(activity.task_account.as_deref(), Some(crate::feedback::PREVIEW_ACCOUNT));
+        assert_eq!(activity.tasks.len(), 7, "Four sample tasks and three tasks imported from the sample notes");
+        assert_eq!(activity.tasks.iter().filter(|task| task.source == crate::tasks::Source::MeetingNotes).count(), 3);
+        assert!(activity.followups.values().all(|saved| saved.title == crate::showcase::ENDED_MEETING));
+        worker.commands.send(Command::Exit).unwrap();
+        worker.done.take().unwrap().recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
     }
 }
