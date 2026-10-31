@@ -348,8 +348,7 @@ impl Tomlook {
         if event.extra.get("sensitivity").and_then(serde_json::Value::as_str) == Some("private") {
             ui.weak(language.text("Private event"));
         }
-        if !ended && let Some(url) = event.extra.get("onlineMeeting")
-            .and_then(|meeting| meeting["joinUrl"].as_str()).filter(|url| safe_url(url))
+        if !ended && let Some(url) = event.join_url()
             && ui.button(language.text("Join Teams meeting")).clicked()
             && let Err(error) = tomlook::browser::open(url) {
                 self.error = Some(error);

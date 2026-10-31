@@ -37,9 +37,9 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The latest native Windows release is **[v0.8.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.8.0)**.
-Read the [release notes](docs/releases/v0.8.0.md) for changes since v0.7.0.
-Download **[Tomlook-v0.8.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.8.0/Tomlook-v0.8.0-win-x64.zip)**
+The latest native Windows release is **[v0.9.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.9.0)**.
+Read the [release notes](docs/releases/v0.9.0.md) for changes since v0.8.0.
+Download **[Tomlook-v0.9.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.9.0/Tomlook-v0.9.0-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable and unsigned.
 From v0.8.0, Tomlook checks GitHub Releases once a day and installs
@@ -127,7 +127,8 @@ Run native checks from `native\` with `cargo test --locked --offline` and
 `cargo clippy --locked --offline --all-targets -- -D warnings`.
 
 The gear opens a larger **Settings** window with left-hand navigation:
-**Display** contains language, theme and accent; **AI prompts** contains five
+**Display** contains language, theme and accent; **Notifications** contains
+meeting reminders and a test notification; **AI prompts** contains five
 editable guidance prompts with per-prompt default restoration; **Updates** shows
 the version, update checks and a verified update ready to install.
 Save prompt edits explicitly; source boundaries, structured output and write
@@ -141,6 +142,13 @@ are not rewritten. Older unchanged Insights in the automatic preparation horizon
 can gain Czech on a tool-free background translation; the original English and
 evidence remain intact, and the UI explicitly identifies translation-only results.
 Changed meetings and manually requested research get fresh bilingual research.
+
+Meeting reminders: by default 5 minutes before each timed meeting you organize
+or accepted, Tomlook (also while hidden in the tray) shows a native Windows
+notification such as "In 5 min · 09:15–10:45" with the meeting title, up to
+three points from saved Insights, **Join** for a Teams link and **Open** for
+the meeting details. Lead time and tentative meetings are configurable in
+Settings → Notifications; see [meeting reminders](native/README.md#meeting-reminders).
 
 Category keys are filled color markers. Preset views also update mini-calendar
 highlighting; the small chevron beside a week selects its five working days.

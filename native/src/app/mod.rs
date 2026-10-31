@@ -250,6 +250,9 @@ pub struct Tomlook {
     updater: Option<tomlook::updater::Updater>,
     update_status: tomlook::updater::Status,
     update_configured: bool,
+    reminders: Option<tomlook::reminders::Reminders>,
+    reminder_status: tomlook::reminders::Status,
+    reminder_open: Option<mpsc::Receiver<Option<String>>>,
 }
 
 impl Tomlook {
@@ -263,12 +266,13 @@ impl Tomlook {
         demo_screenshot: Option<std::path::PathBuf>,
     ) -> Self {
         let preview = options.demo.is_some();
+        let measurement = startup.is_some()
+            || interaction_trace.is_some()
+            || env!("CARGO_BIN_NAME") != "tomlook";
+        let reminder_state = options.state.clone();
         let update_disabled = if preview {
             Some("Updates are disabled in the offline demo.")
-        } else if startup.is_some()
-            || interaction_trace.is_some()
-            || env!("CARGO_BIN_NAME") != "tomlook"
-        {
+        } else if measurement {
             Some("Updates are disabled in measurement and diagnostic modes.")
         } else {
             None
@@ -350,6 +354,41 @@ impl Tomlook {
         app.preview = preview;
         app.demo_screenshot = demo_screenshot;
         app.tray = tray;
+        if measurement {
+            app.reminder_status.disabled =
+                Some("Notifications are disabled in measurement and diagnostic modes.".into());
+        } else {
+            let mode = if preview {
+                tomlook::reminders::Mode::Preview
+            } else {
+                tomlook::reminders::Mode::Live
+            };
+            let (opened, reminder_open) = mpsc::sync_channel(8);
+            let repaint = creation.egui_ctx.clone();
+            let restore = creation.egui_ctx.clone();
+            match tomlook::reminders::Reminders::start(
+                reminder_state,
+                mode,
+                move || repaint.request_repaint(),
+                move |meeting| {
+                    // Runs on a Windows notification thread; the UI applies it in `logic`.
+                    let _ = opened.try_send(meeting);
+                    crate::tray::restore(&restore);
+                },
+            ) {
+                Ok(mut reminders) => {
+                    if let Some(handle) = reminders.shutdown()
+                        && let Ok(mut lifecycle) = shutdown.lock()
+                    {
+                        lifecycle.reminders = Some(handle);
+                    }
+                    app.reminder_status = Default::default();
+                    app.reminders = Some(reminders);
+                    app.reminder_open = Some(reminder_open);
+                }
+                Err(problem) => app.reminder_status.error = Some(problem),
+            }
+        }
         app.update_status.disabled = update_disabled.map(Into::into);
         if update_disabled.is_none() {
             let context = creation.egui_ctx.clone();
@@ -494,6 +533,12 @@ impl Tomlook {
                 ..Default::default()
             },
             update_configured: false,
+            reminders: None,
+            reminder_status: tomlook::reminders::Status {
+                disabled: Some("Notifications are not available in this session.".into()),
+                ..Default::default()
+            },
+            reminder_open: None,
         }
     }
 
@@ -636,6 +681,7 @@ impl Tomlook {
                     }
                     self.preferences = *preferences;
                     self.loading = false;
+                    self.sync_reminders();
                     if let Some(trace) = &mut self.startup
                         && !self.startup_built
                     {
@@ -1065,6 +1111,51 @@ impl Tomlook {
 
     fn save_preferences(&mut self) {
         self.command(Command::Preferences(self.preferences.clone()));
+        self.sync_reminders();
+    }
+
+    /// Hands the cached calendar and reminder preferences to the reminder thread.
+    fn sync_reminders(&self) {
+        if let Some(reminders) = &self.reminders
+            && !self.loading
+        {
+            reminders.update(
+                &self.calendar,
+                tomlook::reminders::Settings::from_preferences(&self.preferences),
+            );
+        }
+    }
+
+    fn receive_reminders(&mut self) {
+        if let Some(status) = self
+            .reminders
+            .as_ref()
+            .and_then(|reminders| reminders.status(self.reminder_status.revision))
+        {
+            self.reminder_status = status;
+        }
+        let opened: Vec<Option<String>> = self
+            .reminder_open
+            .as_ref()
+            .map(|opened| opened.try_iter().take(8).collect())
+            .unwrap_or_default();
+        for meeting in opened.into_iter().flatten() {
+            self.open_reminder_meeting(&meeting);
+        }
+    }
+
+    /// Opens a meeting's details after its reminder was clicked; the window is already restored.
+    fn open_reminder_meeting(&mut self, id: &str) {
+        let Some(index) = self.calendar.event_index(id) else {
+            self.error = Some("Meeting is no longer in the current calendar.".into());
+            return;
+        };
+        let event = self.calendar.events[index].clone();
+        self.open_recommended_meeting(&event);
+        self.insights_expanded = false;
+        if !self.assistant_detached {
+            self.assistant = false;
+        }
     }
 
     fn exit(&self, context: &egui::Context) {
@@ -1080,6 +1171,7 @@ impl eframe::App for Tomlook {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive();
         self.receive_update();
+        self.receive_reminders();
         self.receive_ask_inputs(context);
         self.sync_detached_ask(context);
         if let Some(trace) = &self.startup

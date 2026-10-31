@@ -10,6 +10,7 @@ struct Lifecycle {
     activation: Option<tomlook::instance::Listener>,
     ai: Option<tomlook::ai::Shutdown>,
     storage: Option<tomlook::worker::Shutdown>,
+    reminders: Option<tomlook::reminders::Shutdown>,
     startup: Option<serde_json::Value>,
     update: Option<tomlook::updater::ExitHandle>,
 }
@@ -284,6 +285,8 @@ fn main() -> eframe::Result {
         }
     };
     let normal_launch = trace.is_none() && interactions.is_none() && options.demo.is_none();
+    let notifications =
+        trace.is_none() && interactions.is_none() && env!("CARGO_BIN_NAME") == "tomlook";
     let _ownership = match if let Some(previous) = after_update {
         // A relaunch after an update waits for the old process instead of restoring it.
         tomlook::instance::acquire_after_update(
@@ -327,6 +330,16 @@ fn main() -> eframe::Result {
             "Calendar preload could not start",
         )))
     })?;
+    // Before the window exists, so its taskbar button and toasts share one identity.
+    if notifications
+        && let Err(error) = tomlook::reminders::set_process_identity(if options.demo.is_some() {
+            tomlook::reminders::Mode::Preview
+        } else {
+            tomlook::reminders::Mode::Live
+        })
+    {
+        eprintln!("Tomlook: {error}");
+    }
     let mut native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_icon(egui::IconData {
@@ -436,6 +449,11 @@ fn main() -> eframe::Result {
         #[cfg(windows)]
         if let Some(mut listener) = coordinator.activation.take()
             && let Err(error) = listener.shutdown()
+        {
+            errors.push(error);
+        }
+        if let Some(reminders) = coordinator.reminders.take()
+            && let Err(error) = reminders.stop(std::time::Duration::from_secs(5))
         {
             errors.push(error);
         }

@@ -1590,6 +1590,77 @@ Acceptance still requires the full cold/warm/interaction/DPI/input matrix,
 saturated live AI comparison, actual isolation/tray observations and owner
 approval. A small test corpus or one idle measurement is not that acceptance.
 
+## Meeting reminders
+
+Shortly before a meeting starts Tomlook shows a native Windows notification
+(default 5 minutes; 1, 2, 5, 10 or 15 in **Settings → Notifications**). The
+title is `In 5 min · 09:15–10:45` (`Za 5 min · …` in Czech) in local time;
+when shown late it uses the actual remaining minutes, and from the start
+`Now` / `Právě začíná`. The body is the original meeting title with the
+location as attribution, plus up to three points from the meeting's saved
+Insights in the UI language: next steps first, then talking points, then open
+questions, each at most 80 characters (Czech falls back to the English
+narrative when no Czech is saved). Without saved Insights there are no
+points; a reminder never starts AI research.
+
+- **Join** (green) appears only for a safe http(s) online-meeting join link and
+  uses protocol activation, so Windows opens the link directly.
+- **Open** restores Tomlook from the tray and opens the meeting's details;
+  clicking the notification body does the same.
+- System **Snooze** offers 1–15 minutes. `scenario="reminder"` keeps the
+  notification on screen until handled. **Dismiss** is shown when there is no
+  join link; otherwise the notification's own × dismisses it, keeping three
+  readable buttons.
+
+Eligible meetings are timed (not all-day), not cancelled, and organized or
+accepted by you. Tentative ones (tentatively accepted, shown as tentative, or
+categorized `nejisté`) remind only with **Also remind me of tentatively
+accepted meetings** (off by default). Unanswered, declined, followed (`Follow`
+category or `isFollowing`) and `showAs: free` items never remind.
+
+A dedicated `tomlook-reminders` thread owns all notification work. The UI only
+hands it calendar snapshots and preferences after each load, sync, change or
+preference save. The thread computes the next due reminder and waits on its
+channel with `recv_timeout`; there is no repaint or disk polling. Windows wait
+timeouts stop during sleep, so the wait is capped at 30 seconds: a reminder
+whose time passed while the PC slept is shown once on wake if the meeting has
+not started more than 2 minutes ago, and is skipped otherwise. Each occurrence
+(event id + start) is shown at most once, also across restarts: its SHA-256 key
+is saved in the `meeting-reminders-fired-v1` setting before the notification is
+shown, and entries older than 48 hours are pruned (at most 4,096). A moved
+meeting is a new occurrence and its earlier notification is removed; each
+notification uses a stable per-occurrence tag and expires when the meeting ends.
+Exit stops the thread and waits for it.
+
+Identity: the process sets the AppUserModelID `Tomlook.Calendar` before its
+window is created and registers it for the current user under
+`HKCU\Software\Classes\AppUserModelId\Tomlook.Calendar` with `DisplayName`
+`Tomlook`, `IconUri` pointing to `notification-icon.png` (the brand mark,
+written into the profile directory) and `CustomActivator`
+`{4B0F56E6-AACA-47CF-8521-CEF0E3AAFDB0}`. Values are written only when they
+differ; no Start-menu shortcut is created. Delete that key to remove the
+registration. While Tomlook runs, clicks on a notification popup arrive through
+the in-process `Activated` event and clicks in the notification center through
+a COM activator registered with `CoRegisterClassObject`; no `LocalServer32` is
+registered, so after Tomlook exits **Open** does nothing. Because the window
+uses an explicit AppUserModelID, a taskbar pin created for an older version may
+appear as a separate button; pin the running window again.
+
+Turn reminders off with **Remind me before meetings**, or for all Tomlook
+notifications in **Windows Settings → System → Notifications → Tomlook**, which
+also controls banners and sounds. The Notifications section reports whether
+Windows allows Tomlook notifications (`ToastNotifier.Setting`), the next
+reminder, the last reminder and the last error. Windows suppresses banners
+under Do not disturb, Focus or on the lock screen; the notification is still
+kept in the notification center.
+
+Reminders never run in `--demo`, `--stress`, startup/idle/interaction
+measurements or the acceptance executable. **Send test notification** shows a
+clearly labelled sample with fictional content and still works in `--demo` and
+`--stress`; previews use the separate identity `Tomlook.Calendar.Demo`
+("Tomlook (demo)"), whose registration and notifications are removed on exit.
+Measurement modes do no notification work at all.
+
 ## Updates
 
 Tomlook checks the public GitHub Releases of `tkubica12/ai-outlook` from a

@@ -24,6 +24,7 @@ pub mod proposals;
 pub mod prompts;
 pub mod recaps;
 pub mod recommendations;
+pub mod reminders;
 pub mod retry;
 pub mod scheduler;
 mod search;

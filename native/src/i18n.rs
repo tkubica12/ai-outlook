@@ -2181,6 +2181,119 @@ pub const TEXTS: &[(&str, &str)] = &[
         "The update checker could not start.",
         "Kontrolu aktualizací nelze spustit.",
     ),
+    ("Notifications", "Oznámení"),
+    ("Meeting reminders", "Připomínky schůzek"),
+    ("Remind me before meetings", "Připomínat schůzky předem"),
+    ("Minutes before the start", "Kolik minut před začátkem"),
+    (
+        "Also remind me of tentatively accepted meetings",
+        "Připomínat i nezávazně přijaté schůzky",
+    ),
+    (
+        "Reminders cover timed meetings you organize or have accepted. Unanswered, declined, cancelled, free and followed meetings are skipped.",
+        "Připomínky se týkají schůzek s časem, které pořádáte nebo jste přijali. Nezodpovězené, odmítnuté, zrušené, sledované a jako volno označené schůzky se přeskakují.",
+    ),
+    (
+        "A reminder shows up to three points from saved Insights and never starts AI research.",
+        "Připomínka ukáže až tři body z uloženého přehledu a nikdy nespouští zjišťování pomocí AI.",
+    ),
+    ("Send test notification", "Odeslat zkušební oznámení"),
+    (
+        "Shows a sample reminder with fictional content.",
+        "Zobrazí ukázkovou připomínku se smyšleným obsahem.",
+    ),
+    (
+        "Tomlook is listed in Windows Settings > System > Notifications, where you can turn its notifications off or change how they appear.",
+        "Tomlook najdete v Nastavení Windows > Systém > Oznámení, kde můžete jeho oznámení vypnout nebo změnit, jak se zobrazují.",
+    ),
+    ("Meeting reminders are turned off.", "Připomínky schůzek jsou vypnuté."),
+    ("No upcoming reminders.", "Žádné nadcházející připomínky."),
+    (
+        "Windows notifications are on for Tomlook.",
+        "Oznámení Windows jsou pro Tomlook zapnutá.",
+    ),
+    (
+        "Windows notifications are turned off for Tomlook. Turn them on in Windows Settings > System > Notifications.",
+        "Oznámení Windows jsou pro Tomlook vypnutá. Zapněte je v Nastavení Windows > Systém > Oznámení.",
+    ),
+    (
+        "Windows notifications are turned off for this user.",
+        "Oznámení Windows jsou pro tohoto uživatele vypnutá.",
+    ),
+    (
+        "Windows notifications are blocked by group policy.",
+        "Oznámení Windows blokují zásady skupiny.",
+    ),
+    (
+        "Windows does not allow notifications for Tomlook.",
+        "Windows Tomlooku oznámení nepovoluje.",
+    ),
+    (
+        "Windows reported an unknown notification setting.",
+        "Windows hlásí neznámé nastavení oznámení.",
+    ),
+    (
+        "Meeting reminders are disabled in the offline demo; the test notification uses fictional content.",
+        "Připomínky schůzek jsou v offline ukázce vypnuté; zkušební oznámení používá smyšlený obsah.",
+    ),
+    (
+        "Notifications are disabled in measurement and diagnostic modes.",
+        "Oznámení jsou v režimech měření a diagnostiky vypnutá.",
+    ),
+    (
+        "Notifications are not available in this session.",
+        "Oznámení nejsou v této relaci k dispozici.",
+    ),
+    (
+        "Meeting reminder shutdown could not be verified",
+        "Ukončení připomínek schůzek nelze ověřit",
+    ),
+    (
+        "Meeting reminders stopped unexpectedly",
+        "Připomínky schůzek se neočekávaně zastavily",
+    ),
+    (
+        "Read meeting reminder history failed",
+        "Načtení historie připomínek se nezdařilo",
+    ),
+    (
+        "Saved meeting reminder history is invalid",
+        "Uložená historie připomínek je neplatná",
+    ),
+    (
+        "Meeting reminder history exceeds its safety limit",
+        "Historie připomínek překročila bezpečnostní limit",
+    ),
+    (
+        "Save meeting reminder history failed",
+        "Uložení historie připomínek se nezdařilo",
+    ),
+    (
+        "Encode meeting reminder history failed",
+        "Zakódování historie připomínek se nezdařilo",
+    ),
+    ("Join", "Připojit"),
+    ("Open", "Otevřít"),
+    ("1 minute", "1 minuta"),
+    ("2 minutes", "2 minuty"),
+    ("5 minutes", "5 minut"),
+    ("10 minutes", "10 minut"),
+    ("15 minutes", "15 minut"),
+    ("Test notification", "Zkušební oznámení"),
+    ("Sample meeting (fictional)", "Ukázková schůzka (smyšlená)"),
+    ("Room 2 (sample)", "Místnost 2 (ukázka)"),
+    (
+        "Prepare: Review the sample agenda",
+        "Příprava: Projděte ukázkový program",
+    ),
+    (
+        "Talking point: Confirm the next step",
+        "Téma: Potvrďte další krok",
+    ),
+    (
+        "Question: Who owns the follow-up?",
+        "Otázka: Kdo převezme navazující úkol?",
+    ),
 ];
 
 const PATTERNS: &[(&str, &str)] = &[
@@ -2310,6 +2423,46 @@ const PATTERNS: &[(&str, &str)] = &[
     ),
     ("Tomlook {} is available.", "K dispozici je Tomlook {0}."),
     ("GitHub returned HTTP {}.", "GitHub vrátil HTTP {0}."),
+    ("In {} min · {}", "Za {0} min · {1}"),
+    ("Now · {}", "Právě začíná · {0}"),
+    ("{} min", "{0} min"),
+    ("Next reminder: {}", "Další připomínka: {0}"),
+    (
+        "Last reminder shown at {}.",
+        "Poslední připomínka zobrazena v {0}.",
+    ),
+    (
+        "Test notification sent at {}.",
+        "Zkušební oznámení odesláno v {0}.",
+    ),
+    (
+        "Windows notification failed: {}",
+        "Oznámení Windows se nezdařilo: {0}",
+    ),
+    (
+        "Show the Windows notification: {}",
+        "Oznámení Windows nelze zobrazit: {0}",
+    ),
+    (
+        "Register Tomlook for Windows notifications: {}",
+        "Registrace Tomlooku pro oznámení Windows se nezdařila: {0}",
+    ),
+    (
+        "Meeting reminder history is unavailable: {}",
+        "Historie připomínek není k dispozici: {0}",
+    ),
+    (
+        "Meeting reminder history could not be saved: {}",
+        "Historii připomínek nelze uložit: {0}",
+    ),
+    (
+        "Start meeting reminders: {}",
+        "Připomínky schůzek nelze spustit: {0}",
+    ),
+    (
+        "Set the Windows notification identity: {}",
+        "Identitu pro oznámení Windows nelze nastavit: {0}",
+    ),
 ];
 
 #[cfg(test)]

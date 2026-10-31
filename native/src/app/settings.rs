@@ -65,6 +65,7 @@ pub(super) fn activity_row(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum PreferencesSection {
     Display,
+    Notifications,
     Prompts,
     Updates,
 }
@@ -88,6 +89,7 @@ impl Tomlook {
                         ui.spacing_mut().item_spacing.y = 8.0;
                         for (section, label) in [
                             (PreferencesSection::Display, "Display"),
+                            (PreferencesSection::Notifications, "Notifications"),
                             (PreferencesSection::Prompts, "AI prompts"),
                             (PreferencesSection::Updates, "Updates"),
                         ] {
@@ -95,6 +97,10 @@ impl Tomlook {
                                 egui::Button::new(language.text(label))
                                     .selected(self.preferences_section == section)).clicked() {
                                 self.preferences_section = section;
+                                if section == PreferencesSection::Notifications
+                                    && let Some(reminders) = &self.reminders {
+                                    reminders.refresh();
+                                }
                             }
                         }
                         ui.separator();
@@ -164,12 +170,100 @@ impl Tomlook {
                                 });
                                 ui.weak(language.text("Saved notes are not reprocessed when prompts change."));
                             }
+                            PreferencesSection::Notifications => self.notification_preferences(ui),
                             PreferencesSection::Updates => self.update_preferences(ui),
                         }
                     });
                 });
             });
         self.preferences_open = open;
+    }
+
+    fn notification_preferences(&mut self, ui: &mut egui::Ui) {
+        let language = self.preferences.language;
+        let status = self.reminder_status.clone();
+        let time = |at: chrono::DateTime<chrono::Utc>| {
+            at.with_timezone(&Local).format("%d.%m.%Y %H:%M").to_string()
+        };
+        ui.heading(language.text("Notifications"));
+        ui.add_space(16.0);
+        ui.strong(language.text("Meeting reminders"));
+        let mut changed = ui
+            .checkbox(
+                &mut self.preferences.meeting_reminders,
+                language.text("Remind me before meetings"),
+            )
+            .changed();
+        ui.add_enabled_ui(self.preferences.meeting_reminders, |ui| {
+            ui.add_space(8.0);
+            ui.label(language.text("Minutes before the start"));
+            ui.horizontal(|ui| {
+                for minutes in tomlook::reminders::MINUTES {
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.preferences.reminder_minutes,
+                            minutes,
+                            language.text(&format!("{minutes} min")),
+                        )
+                        .changed();
+                }
+            });
+            ui.add_space(4.0);
+            changed |= ui
+                .checkbox(
+                    &mut self.preferences.remind_tentative,
+                    language.text("Also remind me of tentatively accepted meetings"),
+                )
+                .changed();
+        });
+        if changed {
+            self.save_preferences();
+        }
+        ui.add_space(8.0);
+        ui.weak(language.text("Reminders cover timed meetings you organize or have accepted. Unanswered, declined, cancelled, free and followed meetings are skipped."));
+        ui.weak(language.text("A reminder shows up to three points from saved Insights and never starts AI research."));
+        ui.add_space(16.0);
+        if let Some(reason) = &status.disabled {
+            ui.weak(language.text(reason));
+        } else if !self.preferences.meeting_reminders {
+            ui.weak(language.text("Meeting reminders are turned off."));
+        } else if let Some(next) = status.next {
+            ui.label(language.text(&format!("Next reminder: {}", time(next))));
+        } else {
+            ui.weak(language.text("No upcoming reminders."));
+        }
+        match status.windows.map(tomlook::reminders::WindowsSetting::message) {
+            Some(Some(message)) => {
+                ui.colored_label(ui.visuals().warn_fg_color, language.text(message));
+            }
+            Some(None) => {
+                ui.weak(language.text("Windows notifications are on for Tomlook."));
+            }
+            None => {}
+        }
+        if let Some(at) = status.last_reminder {
+            ui.weak(language.text(&format!("Last reminder shown at {}.", time(at))));
+        }
+        ui.add_space(12.0);
+        if ui
+            .add_enabled(
+                self.reminders.is_some(),
+                egui::Button::new(language.text("Send test notification")),
+            )
+            .clicked()
+            && let Some(reminders) = &self.reminders
+        {
+            reminders.test(language);
+        }
+        ui.weak(language.text("Shows a sample reminder with fictional content."));
+        if let Some(at) = status.last_test {
+            ui.weak(language.text(&format!("Test notification sent at {}.", time(at))));
+        }
+        if let Some(error) = &status.error {
+            ui.colored_label(ui.visuals().error_fg_color, language.text(error));
+        }
+        ui.add_space(20.0);
+        ui.weak(language.text("Tomlook is listed in Windows Settings > System > Notifications, where you can turn its notifications off or change how they appear."));
     }
 
     fn update_preferences(&mut self, ui: &mut egui::Ui) {

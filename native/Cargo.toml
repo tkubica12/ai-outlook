@@ -1,6 +1,6 @@
 [package]
 name = "tomlook"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -42,6 +42,10 @@ pulldown-cmark = { version = "=0.13.4", default-features = false }
 ring = "=0.17.14"
 semver = "=1.0.28"
 zip = { version = "=7.2.0", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = ["Data_Xml_Dom", "Foundation", "UI_Notifications", "Win32_System_Com", "Win32_System_Registry", "Win32_UI_Notifications", "Win32_UI_Shell"] }
+windows-core = "=0.62.2"
 
 [dev-dependencies]
 tempfile = "=3.27.0"

@@ -2,7 +2,7 @@
 fn settings_content_has_clear_padding_from_navigation_in_both_sections_and_themes() {
     for dark in [true, false] {
         for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
-            for section in [PreferencesSection::Display, PreferencesSection::Prompts, PreferencesSection::Updates] {
+            for section in [PreferencesSection::Display, PreferencesSection::Notifications, PreferencesSection::Prompts, PreferencesSection::Updates] {
                 let mut app = Tomlook::initial(None, None, None);
                 app.preferences.dark = dark;
                 app.preferences.language = language;
@@ -28,6 +28,7 @@ fn settings_content_has_clear_padding_from_navigation_in_both_sections_and_theme
                 }).expect("Settings navigation must have a vertical divider");
                 let heading = language.text(match section {
                     PreferencesSection::Display => "Display",
+                    PreferencesSection::Notifications => "Notifications",
                     PreferencesSection::Prompts => "AI prompts",
                     PreferencesSection::Updates => "Updates",
                 });
@@ -4709,4 +4710,105 @@ fn update_settings_offer_restart_only_for_verified_staged_updates() {
         assert!(text.contains(language.text("Open release page").as_ref()));
         assert!(!text.contains(language.text("Restart now").as_ref()));
     }
+}
+
+#[test]
+fn notification_settings_save_reminder_preferences_and_report_status_in_both_languages() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let mut app = Tomlook::initial(None, None, None);
+        let (sender, receiver) = mpsc::sync_channel(16);
+        app.worker = Some(Worker {
+            commands: sender, notices: Arc::new(Default::default()),
+            activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+            stop: Arc::new(Default::default()), done: None,
+        });
+        app.loading = false;
+        app.preferences.language = language;
+        app.preferences_open = true;
+        app.preferences_section = PreferencesSection::Notifications;
+        let context = egui::Context::default();
+        let draw = |app: &mut Tomlook, events| {
+            let mut output = context.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                events, ..Default::default()
+            }, |ui| app.preferences_dialog(ui.ctx()));
+            output.textures_delta.clear();
+            output
+        };
+        let text = |app: &mut Tomlook| {
+            draw(app, vec![]);
+            let output = draw(app, vec![]);
+            let mut text = String::new();
+            for shape in &output.shapes {
+                append_shape_text(&shape.shape, &mut text);
+            }
+            text
+        };
+        let click = |app: &mut Tomlook, label: &str| {
+            draw(app, vec![]);
+            let output = draw(app, vec![]);
+            let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == label =>
+                    Some(text.pos + text.galley.size() * 0.5),
+                _ => None,
+            }).unwrap_or_else(|| panic!("Missing notification control: {label}"));
+            for pressed in [true, false] {
+                draw(app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                    pos,button:egui::PointerButton::Primary,pressed,modifiers:Modifiers::NONE,
+                }]);
+            }
+        };
+        let rendered = text(&mut app);
+        for expected in ["Notifications", "Send test notification", "Notifications are not available in this session.",
+            "Reminders cover timed meetings you organize or have accepted. Unanswered, declined, cancelled, free and followed meetings are skipped."] {
+            assert!(rendered.contains(language.text(expected).as_ref()), "{language:?}: {expected}");
+        }
+        click(&mut app, "10 min");
+        assert_eq!(app.preferences.reminder_minutes, 10);
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Preferences(preferences)
+            if preferences.reminder_minutes == 10 && preferences.meeting_reminders));
+        click(&mut app, language.text("Also remind me of tentatively accepted meetings").as_ref());
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Preferences(preferences) if preferences.remind_tentative));
+        click(&mut app, language.text("Remind me before meetings").as_ref());
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Preferences(preferences) if !preferences.meeting_reminders));
+        app.reminder_status = tomlook::reminders::Status {
+            windows: Some(tomlook::reminders::WindowsSetting::DisabledForApplication),
+            error: Some("Show the Windows notification: Access is denied.".into()),
+            ..Default::default()
+        };
+        let rendered = text(&mut app);
+        assert!(rendered.contains(language.text("Meeting reminders are turned off.").as_ref()));
+        assert!(rendered.contains(language.text(tomlook::reminders::WindowsSetting::DisabledForApplication.message().unwrap()).as_ref()));
+        assert!(rendered.contains(language.text("Show the Windows notification: Access is denied.").as_ref()));
+        assert!(receiver.try_recv().is_err());
+    }
+}
+
+#[test]
+fn reminder_activation_opens_meeting_details_without_ai_or_calendar_writes() {
+    let (mut app, _, mut ai_commands) = assistant_fixture();
+    let (sender, receiver) = mpsc::sync_channel(16);
+    app.worker = Some(Worker {
+        commands: sender, notices: Arc::new(Default::default()),
+        activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+        stop: Arc::new(Default::default()), done: None,
+    });
+    app.calendar = Arc::new(Calendar::build(tomlook::calendar::fixture(60), Default::default(), Vec::new()).unwrap());
+    let target = app.calendar.events[30].clone();
+    app.assistant = true;
+    app.query = "unrelated".into();
+    let (opened, reminder_open) = mpsc::sync_channel(8);
+    app.reminder_open = Some(reminder_open);
+    opened.send(None).unwrap();
+    opened.send(Some(target.id.clone())).unwrap();
+    app.receive_reminders();
+    assert_eq!(app.selected, app.calendar.event_index(&target.id));
+    assert_eq!(app.anchor, target.calendar_dates().0);
+    assert!(app.scroll_meeting && !app.insights_expanded && !app.assistant && app.query.is_empty());
+    assert!(receiver.try_iter().any(|command| matches!(command, Command::Detail { id, .. } if id == target.id)));
+    opened.send(Some("missing-meeting".into())).unwrap();
+    app.receive_reminders();
+    assert_eq!(app.error.as_deref(), Some("Meeting is no longer in the current calendar."));
+    assert!(receiver.try_iter().all(|command| matches!(command, Command::Detail { .. } | Command::Preferences(_))));
+    assert!(ai_commands.try_recv().is_err());
 }

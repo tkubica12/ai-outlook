@@ -114,6 +114,14 @@ impl Event {
         }
     }
 
+    /// Online meeting join link, only when it is a safe http(s) URL.
+    pub fn join_url(&self) -> Option<&str> {
+        self.extra
+            .get("onlineMeeting")
+            .and_then(|meeting| meeting["joinUrl"].as_str())
+            .filter(|url| safe_url(url))
+    }
+
     pub fn attendee_count(&self) -> usize {
         self.extra
             .get("tomlook_attendees_total")

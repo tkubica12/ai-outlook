@@ -30,6 +30,9 @@ pub struct Preferences {
     pub automatic_update_check: bool,
     pub update_checked_at: Option<chrono::DateTime<chrono::Utc>>,
     pub update_latest_version: String,
+    pub meeting_reminders: bool,
+    pub reminder_minutes: u8,
+    pub remind_tentative: bool,
 }
 
 impl Default for Preferences {
@@ -52,6 +55,9 @@ impl Default for Preferences {
             automatic_update_check: true,
             update_checked_at: None,
             update_latest_version: String::new(),
+            meeting_reminders: true,
+            reminder_minutes: crate::reminders::DEFAULT_MINUTES,
+            remind_tentative: false,
         }
     }
 }
@@ -518,6 +524,55 @@ impl Store {
                 [json],
             )
             .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Occurrence keys of meeting reminders already shown, with each meeting's start.
+    pub fn fired_reminders(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>>> {
+        let payload: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT payload FROM settings WHERE key='meeting-reminders-fired-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "Read meeting reminder history failed")?;
+        let fired: std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>> =
+            match payload {
+                Some(payload) if payload.len() <= 1024 * 1024 => serde_json::from_str(&payload)
+                    .map_err(|_| "Saved meeting reminder history is invalid")?,
+                Some(_) => return Err("Meeting reminder history exceeds its safety limit".into()),
+                None => Default::default(),
+            };
+        if fired.len() > crate::reminders::FIRED_LIMIT
+            || fired
+                .keys()
+                .any(|key| key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err("Saved meeting reminder history is invalid".into());
+        }
+        Ok(fired)
+    }
+
+    pub fn save_fired_reminders(
+        &self,
+        fired: &std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()> {
+        if fired.len() > crate::reminders::FIRED_LIMIT {
+            return Err("Meeting reminder history exceeds its safety limit".into());
+        }
+        let json = serde_json::to_string(fired)
+            .map_err(|_| "Encode meeting reminder history failed")?;
+        self.connection
+            .execute(
+                "INSERT INTO settings VALUES('meeting-reminders-fired-v1',?1)
+                 ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                [json],
+            )
+            .map_err(|_| "Save meeting reminder history failed")?;
         Ok(())
     }
 
