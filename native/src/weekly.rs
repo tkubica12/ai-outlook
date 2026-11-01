@@ -162,8 +162,9 @@ impl Coverage {
 }
 
 /// Timed meetings I organize or accepted (not followed, tentative, declined or cancelled).
+/// Attended meetings: BLOCKER holds without attendees still block time but are not meetings.
 fn attended(event: &Event) -> bool {
-    event.accepted() && !myday::cancelled(event) && !event.all_day_like()
+    event.accepted() && !myday::cancelled(event) && !event.all_day_like() && !crate::scheduling::is_blocker(event)
 }
 
 fn organized(event: &Event, own: &BTreeSet<String>) -> bool {
@@ -1947,6 +1948,25 @@ mod tests {
             categorized(meeting("k", "Last week's wrap-up", at(day(11, 1), 23, 0), 60, "accepted"), "Office"),
             categorized(meeting("l", "Weekend fix", at(monday + Duration::days(5), 10, 0), 60, "accepted"), "Office"),
         ]
+    }
+
+    #[test]
+    fn blocker_holds_are_not_meetings_and_never_miss_an_agenda() {
+        let monday = day(11, 2);
+        let mut events = first_week();
+        let mut blocker = meeting("blocker", "BLOCKER: Pilot kickoff", at(monday + Duration::days(3), 14, 0), 30, "organizer");
+        blocker.attendees.clear();
+        blocker.extra.insert("isOrganizer".into(), json!(true));
+        blocker.extra.insert("bodyPreview".into(), json!(""));
+        events.push(blocker);
+        let now = Local.from_local_datetime(&day(11, 9).and_hms_opt(9, 0, 0).unwrap()).unwrap();
+        let with = review(&sources(events, whole_week(monday)), monday, now);
+        let without = review(&sources(first_week(), whole_week(monday)), monday, now);
+        assert_eq!(with.headline.meetings, without.headline.meetings, "A BLOCKER is not an attended meeting");
+        assert_eq!(with.headline.meeting_minutes, without.headline.meeting_minutes);
+        assert!(with.agenda.missing.iter().all(|item| item.event_id != "blocker"), "Nor a meeting without agenda");
+        assert_eq!(with.agenda.eligible, without.agenda.eligible);
+        assert!(with.headline.focus_minutes < without.headline.focus_minutes, "It still blocks focus time");
     }
 
     #[test]

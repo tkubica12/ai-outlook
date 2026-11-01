@@ -36,6 +36,32 @@ pub enum Command {
         draft: Box<crate::event_creation::Draft>,
         parent: Option<Box<calendar::Event>>,
     },
+    /// Saves a new scheduling proposal if needed and approves its BLOCKERs in your own calendar.
+    HoldTimes {
+        account: String,
+        proposal: Box<crate::scheduling::Proposal>,
+        private: bool,
+        category: Option<String>,
+    },
+    /// The explicitly approved Teams proposal: one new chat and one message.
+    ProposeChat {
+        account: String,
+        proposal: Box<crate::scheduling::Proposal>,
+        draft: Box<crate::scheduling::ChatDraft>,
+    },
+    /// The explicitly approved deletion of held BLOCKERs; `cancel` closes the proposal.
+    ReleaseBlockers {
+        account: String,
+        proposal: String,
+        events: Vec<String>,
+        cancel: bool,
+    },
+    /// The invitation of a proposal's time was created and verified.
+    ScheduleProposal {
+        account: String,
+        proposal: String,
+        record: String,
+    },
     AskLocal {
         id: u64,
         query: crate::chat_cache::LocalQuery,
@@ -345,6 +371,10 @@ pub struct Activity {
     pub followups: Arc<std::collections::BTreeMap<String, crate::followup::Saved>>,
     /// Saved AI summaries of weekly reviews by Monday.
     pub weekly_summaries: Arc<std::collections::BTreeMap<chrono::NaiveDate, crate::weekly::Saved>>,
+    /// Scheduling proposals of `task_account` by ID.
+    pub proposals: Arc<std::collections::BTreeMap<String, crate::scheduling::Proposal>>,
+    /// Proposal ID of every BLOCKER event Tomlook created and still holds, by event ID.
+    pub blockers: Arc<std::collections::BTreeMap<String, String>>,
 }
 
 pub struct Shutdown {
@@ -469,6 +499,85 @@ fn reload_tasks(store: &Store, account: Option<&str>, views: &mut TaskViews) -> 
         None => Default::default(),
     };
     Ok(())
+}
+
+type Proposals = std::collections::BTreeMap<String, crate::scheduling::Proposal>;
+
+/// An account's scheduling proposals; the offline preview seeds its fictional open proposal once.
+/// Anything in flight that is not `active` in this process was interrupted and becomes uncertain.
+fn load_proposals(
+    store: &Store,
+    account: &str,
+    calendar: &Calendar,
+    language: crate::i18n::Language,
+    demo: bool,
+    active: impl Fn(&crate::scheduling::Proposal) -> bool,
+) -> Result<Proposals, String> {
+    let mut proposals = store.proposals_except(account, active)?;
+    if demo
+        && proposals.is_empty()
+        && let Some(sample) = crate::showcase::sample_proposal(account, calendar, language, chrono::Local::now())?
+    {
+        store.save_proposal(&sample)?;
+        proposals.insert(sample.id.clone(), sample);
+    }
+    Ok(proposals)
+}
+
+/// The saved proposal with this identity, or the new one; a changed copy is never accepted.
+fn saved_proposal(
+    proposals: &Proposals,
+    proposal: crate::scheduling::Proposal,
+) -> Result<crate::scheduling::Proposal, String> {
+    match proposals.get(&proposal.id) {
+        Some(saved)
+            if (&saved.account, &saved.topic, &saved.attendees, saved.minutes, &saved.candidates)
+                == (&proposal.account, &proposal.topic, &proposal.attendees, proposal.minutes, &proposal.candidates) =>
+        {
+            Ok(saved.clone())
+        }
+        Some(_) => Err("This proposal changed; find a time again".into()),
+        None if proposal.blockers.is_empty() && proposal.chat.is_none() && proposal.hold_record.is_none()
+            && proposal.status == crate::scheduling::ProposalStatus::Open => Ok(proposal),
+        None => Err("A new proposal cannot carry earlier outcomes".into()),
+    }
+}
+
+/// Applies a change to a saved proposal of `account` and saves it; `false` when it is unknown.
+fn update_proposal(
+    store: &Store,
+    proposals: &mut Proposals,
+    account: &str,
+    id: &str,
+    change: impl FnOnce(&mut crate::scheduling::Proposal) -> Result<(), String>,
+) -> Result<bool, String> {
+    if proposals.get(id).is_some_and(|proposal| proposal.account == account) {
+        let proposal = proposals.get_mut(id).ok_or("Scheduling proposal disappeared")?;
+        change(proposal)?;
+        store.save_proposal(proposal)?;
+        return Ok(true);
+    }
+    // The calendar account changed meanwhile: update the saved copy of the other account exactly
+    // as saved, so the outcome of its write in flight is not mistaken for an interrupted one.
+    let Some(mut proposal) = store.proposal(account, id)? else { return Ok(false) };
+    change(&mut proposal)?;
+    store.save_proposal(&proposal)?;
+    Ok(false)
+}
+
+/// Proposal of every BLOCKER event Tomlook created that may still be in the calendar.
+fn blocker_index(proposals: &Proposals) -> std::collections::BTreeMap<String, String> {
+    use crate::scheduling::BlockerState;
+    proposals
+        .values()
+        .flat_map(|proposal| {
+            proposal
+                .blockers
+                .iter()
+                .filter(|blocker| matches!(blocker.state, BlockerState::Held | BlockerState::Releasing | BlockerState::ReleaseReview))
+                .filter_map(|blocker| blocker.event_id.clone().map(|id| (id, proposal.id.clone())))
+        })
+        .collect()
 }
 
 fn propose_change(
@@ -951,8 +1060,15 @@ fn load(store: &mut Store, options: &Options) -> Result<(Arc<Calendar>, Preferen
         let coverage = (-14..42)
             .map(|i| calendar::monday(now.date_naive()) + chrono::Duration::days(i))
             .collect();
+        // Two fictional BLOCKERs of the sample proposal replace the last generated meetings.
+        let blockers = if count >= 50 { 2 } else { 0 };
+        let mut events = crate::showcase::preview_events(now, count - blockers);
+        if blockers > 0 {
+            let held = crate::showcase::demo_blockers(now, &events, preferences.language);
+            events.extend(held);
+        }
         Calendar::build(
-            crate::showcase::preview_events(now, count),
+            events,
             coverage,
             vec!["Synthetic preview - no live AI or work data".into()],
         )?
@@ -1022,6 +1138,13 @@ impl Worker {
                 let mut task_views: TaskViews = Default::default();
                 let mut tasks_revision = 0_u64;
                 let mut published_tasks_revision = u64::MAX;
+                let mut proposals = std::collections::BTreeMap::<String, crate::scheduling::Proposal>::new();
+                let mut proposals_revision = 0_u64;
+                let mut published_proposals_revision = u64::MAX;
+                // Account and close-on-release of each proposal with a Teams or release write in flight.
+                let mut proposal_flights = std::collections::BTreeMap::<String, (String, bool)>::new();
+                let (chat_sender, mut chat_results) = tokio::sync::mpsc::channel::<crate::scheduling::ChatResult>(2);
+                let (release_sender, mut release_results) = tokio::sync::mpsc::channel::<crate::scheduling::ReleaseResult>(2);
                 let mut inbox = store.recommendations()?;
                 let stale_events: std::collections::BTreeSet<_> = inbox.values_mut().filter(|record|
                     record.state == crate::recommendations::State::NotSent
@@ -1108,6 +1231,23 @@ impl Worker {
                             }
                         };
                         tasks_revision += 1;
+                        // Writes still waiting for their outcome in this process were not
+                        // interrupted; only those of an earlier run or an ended executor were.
+                        let active = |proposal: &crate::scheduling::Proposal| {
+                            proposal_flights.get(&proposal.id).is_some_and(|(account, _)| *account == proposal.account)
+                                || proposal.hold_record.as_ref().and_then(|id| event_creations.get(id)).is_some_and(|record|
+                                    record.state == crate::event_creation::State::Creating && record.account == proposal.account)
+                        };
+                        proposals = match task_account.as_deref()
+                            .map(|account| load_proposals(&store, account, &calendar, preferences.language, options.demo.is_some(), active))
+                            .transpose() {
+                            Ok(loaded) => loaded.unwrap_or_default(),
+                            Err(error) => {
+                                notify(Notice::Error(format!("Scheduling proposals could not be loaded: {error}")));
+                                Default::default()
+                            }
+                        };
+                        proposals_revision += 1;
                     }
                     if let Some((id, key, _)) = &recap_flight
                         && let Some(sdk) = &sdk
@@ -1351,6 +1491,13 @@ impl Worker {
                             record.event_ids = result.events.iter().map(|event| event.id.clone()).collect();
                             // Save the outcome before updating the display cache.
                             store.save_event_creation(record)?;
+                            if let Some(hold) = &record.hold {
+                                let (state, ids, message) = (record.state, record.event_ids.clone(), record.message.clone());
+                                if update_proposal(&store, &mut proposals, &record.account, &hold.proposal,
+                                    |proposal| { proposal.finish_hold(state, &ids, &message, now); Ok(()) })? {
+                                    proposals_revision += 1;
+                                }
+                            }
                             if store.calendar_owner()?.as_deref() == Some(record.account.as_str()) {
                                 for event in result.events {
                                     calendar = Arc::new(store.save_calendar_event(&event, &record.account)?);
@@ -1364,10 +1511,45 @@ impl Worker {
                     if sdk_terminated {
                         for record in event_creations.values_mut().filter(|record| record.state == crate::event_creation::State::Creating) {
                             record.state = crate::event_creation::State::Review;
-                            record.message = crate::workiq::connection::calendar_write::UNCERTAIN.into();
+                            record.message = record.review_message(crate::workiq::connection::calendar_write::UNCERTAIN);
                             store.save_event_creation(record)?;
                             inbox_revision += 1;
                         }
+                    }
+                    while let Ok(result) = chat_results.try_recv() {
+                        if let Some((account, _)) = proposal_flights.remove(&result.proposal)
+                            && update_proposal(&store, &mut proposals, &account, &result.proposal,
+                                |proposal| { proposal.finish_chat(&result, now); Ok(()) })? {
+                            proposals_revision += 1;
+                        }
+                    }
+                    while let Ok(result) = release_results.try_recv() {
+                        let Some((account, cancel)) = proposal_flights.remove(&result.proposal) else { continue };
+                        if update_proposal(&store, &mut proposals, &account, &result.proposal,
+                            |proposal| { proposal.finish_release(&result.outcomes, cancel, now); Ok(()) })? {
+                            proposals_revision += 1;
+                        }
+                        if store.calendar_owner()?.as_deref() == Some(account.as_str()) {
+                            let released = result.outcomes.iter()
+                                .filter(|outcome| outcome.state == crate::scheduling::BlockerState::Released)
+                                .collect::<Vec<_>>();
+                            for outcome in &released {
+                                calendar = Arc::new(store.remove_calendar_event(&outcome.event_id, &account)?);
+                            }
+                            if !released.is_empty() {
+                                dirty = true;
+                                notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: Some(account.clone()) });
+                            }
+                        }
+                    }
+                    if sdk_terminated && (!proposal_flights.is_empty() || proposals.values().any(crate::scheduling::Proposal::in_flight)) {
+                        for proposal in proposals.values_mut().filter(|proposal| proposal.in_flight()) {
+                            proposal.recover();
+                            store.save_proposal(proposal)?;
+                        }
+                        // Those of another calendar account become uncertain when they load again.
+                        proposal_flights.clear();
+                        proposals_revision += 1;
                     }
                     while let Ok(result) = calendar_results.try_recv() {
                         if let Some(recommendation) = inbox.get_mut(&result.id)
@@ -1540,7 +1722,7 @@ impl Worker {
                         published_owner = owner;
                         published_minute = Some(now.timestamp() / 60);
                     }
-                    if view_changed || queue_changed || previous.identity != identity || previous.enabled != preferences.prepare_enabled || previous.paused != preferences.paused || previous.error != failure || previous.sync != sync || inbox_revision != published_inbox_revision || recaps_revision != published_recaps_revision || tasks_revision != published_tasks_revision {
+                    if view_changed || queue_changed || previous.identity != identity || previous.enabled != preferences.prepare_enabled || previous.paused != preferences.paused || previous.error != failure || previous.sync != sync || inbox_revision != published_inbox_revision || recaps_revision != published_recaps_revision || tasks_revision != published_tasks_revision || proposals_revision != published_proposals_revision {
                         if inbox_revision != published_inbox_revision { store.save_recommendations(&inbox)?; }
                         let index = if queue_changed {
                             Arc::new(ActivityIndex::new(&queue))
@@ -1549,14 +1731,19 @@ impl Worker {
                         };
                         revision += 1;
                         let recap_snapshot = if recaps_revision != published_recaps_revision { Arc::new(recaps.clone()) } else { previous.recaps.clone() };
+                        let (proposal_snapshot, blocker_snapshot) = if proposals_revision != published_proposals_revision {
+                            (Arc::new(proposals.clone()), Arc::new(blocker_index(&proposals)))
+                        } else { (previous.proposals.clone(), previous.blockers.clone()) };
                         let next = Activity { revision, queue: queue.clone(), index, enabled: preferences.prepare_enabled, paused: preferences.paused, error: failure.clone(), sync, recommendations: Arc::new(inbox.clone()), recommendation_view: recommendation_view.clone(), identity: identity.clone(), event_creations: Arc::new(event_creations.clone()), recaps: recap_snapshot,
                             task_account: task_account.clone(), tasks: task_views.0.clone(), followups: task_views.1.clone(), weekly_summaries: task_views.2.clone(),
+                            proposals: proposal_snapshot, blockers: blocker_snapshot,
                             queued: queue.jobs.values().filter(|job| job.state == crate::scheduler::State::Queued).count(),
                             deferred: queue.jobs.values().filter(|job| job.state == crate::scheduler::State::Deferred).count() };
                         *state.lock().map_err(|_| "Preparation state is unavailable")? = Arc::new(next);
                         published_inbox_revision = inbox_revision;
                         published_recaps_revision = recaps_revision;
                         published_tasks_revision = tasks_revision;
+                        published_proposals_revision = proposals_revision;
                         context.request_repaint();
                     }
                     let command = loop {
@@ -1565,7 +1752,8 @@ impl Worker {
                                 Ok(command) => command,
                                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected)
                                     if inbox.values().any(|recommendation| recommendation.state == crate::recommendations::State::Dispatching)
-                                        || event_creations.values().any(|record| record.state == crate::event_creation::State::Creating) => {
+                                        || event_creations.values().any(|record| record.state == crate::event_creation::State::Creating)
+                                        || !proposal_flights.is_empty() => {
                                         thread::sleep(Duration::from_millis(20));
                                         break Command::Wake;
                                     }
@@ -1604,7 +1792,8 @@ impl Worker {
                             break Command::Wake;
                         }
                     };
-                    let recommendation_command = matches!(&command, Command::ProposeChange { .. } | Command::CreateEvents { .. } | Command::ConfirmRecommendation { .. } | Command::ConfirmMeetingAction { .. } | Command::RecheckCalendarResult(_) | Command::DismissRecommendation(_) | Command::ReviewRecommendations { .. });
+                    let recommendation_command = matches!(&command, Command::ProposeChange { .. } | Command::CreateEvents { .. } | Command::ConfirmRecommendation { .. } | Command::ConfirmMeetingAction { .. } | Command::RecheckCalendarResult(_) | Command::DismissRecommendation(_) | Command::ReviewRecommendations { .. }
+                        | Command::HoldTimes { .. } | Command::ProposeChat { .. } | Command::ReleaseBlockers { .. } | Command::ScheduleProposal { .. });
                     let result = match command {
                         Command::ProposeChange { account, request, run, reply } => {
                             let result = if exiting || options.demo.is_some() || run.cancelled.load(Ordering::Acquire) {
@@ -1651,6 +1840,11 @@ impl Worker {
                                 }
                                 record
                             } else {
+                                if draft.attendees.iter().any(|attendee| attendee.email.eq_ignore_ascii_case(&account)
+                                    || identity.as_ref().is_some_and(|identity| identity.account.eq_ignore_ascii_case(&attendee.email)
+                                        || identity.mail.as_ref().is_some_and(|mail| mail.eq_ignore_ascii_case(&attendee.email)))) {
+                                    return Err("Your own mailbox is the organizer and cannot be invited".into());
+                                }
                                 crate::event_creation::Record::new(account, *draft)?
                             };
                             store.approve_event_creation(&record)?;
@@ -1663,6 +1857,152 @@ impl Worker {
                             }
                             event_creations.insert(record.id.clone(), record);
                             inbox_revision += 1;
+                            Ok(())
+                        })(),
+                        Command::HoldTimes { account, proposal, private, category } => (|| {
+                            if exiting { return Err("Tomlook is stopping; no calendar write was submitted".into()); }
+                            if options.demo.is_some() { return Err("Preview never changes a live calendar".into()); }
+                            if store.calendar_owner()?.as_deref() != Some(account.as_str()) || proposal.account != account {
+                                return Err("Calendar account changed before confirmation".into());
+                            }
+                            proposal.validate()?;
+                            if proposal.candidates.iter().any(|slot| slot.start <= now) {
+                                return Err("A proposed time is already in the past; find a time again".into());
+                            }
+                            if event_creations.len() >= 512 {
+                                return Err("Event creation history reached its safety limit".into());
+                            }
+                            if event_creations.values().any(|record| record.state == crate::event_creation::State::Creating)
+                                || proposal_flights.contains_key(&proposal.id) {
+                                return Err("Wait for the current event creation to finish".into());
+                            }
+                            let sdk = sdk.as_ref().filter(|sdk| !sdk.terminated.load(Ordering::Acquire) && sdk.workiq_ready.load(Ordering::Acquire))
+                                .ok_or("Connect WorkIQ before confirming a calendar change")?;
+                            let mut proposal = saved_proposal(&proposals, *proposal)?;
+                            let draft = proposal.hold_draft(private, category)?;
+                            draft.validate_categories(&known_categories(&calendar))?;
+                            let mut record = crate::event_creation::Record::blockers(account.clone(), proposal.id.clone(),
+                                draft, proposal.candidates.clone())?;
+                            proposal.begin_hold(&record, now)?;
+                            store.approve_event_creation(&record)?;
+                            if let Err(error) = store.save_proposal(&proposal) {
+                                record.state = crate::event_creation::State::NotSent;
+                                record.message = "The proposal could not be saved; nothing was submitted".into();
+                                store.save_event_creation(&record)?;
+                                event_creations.insert(record.id.clone(), record);
+                                inbox_revision += 1;
+                                return Err(error);
+                            }
+                            if sdk.commands.try_send(ai::Command::CreateEvents {
+                                record: Box::new(record.clone()), reply: creation_sender.clone(), wake: wake.clone(),
+                            }).is_err() {
+                                record.state = crate::event_creation::State::NotSent;
+                                record.message = "Calendar change was not queued; nothing was submitted".into();
+                                store.save_event_creation(&record)?;
+                                proposal.finish_hold(record.state, &[], &record.message, now);
+                                store.save_proposal(&proposal)?;
+                            }
+                            event_creations.insert(record.id.clone(), record);
+                            proposals.insert(proposal.id.clone(), proposal);
+                            proposals_revision += 1;
+                            inbox_revision += 1;
+                            Ok(())
+                        })(),
+                        Command::ProposeChat { account, proposal, draft } => (|| {
+                            if exiting { return Err("Tomlook is stopping; nothing was sent".into()); }
+                            if options.demo.is_some() { return Err("The offline demo never contacts anyone".into()); }
+                            if store.calendar_owner()?.as_deref() != Some(account.as_str()) || proposal.account != account {
+                                return Err("Calendar account changed before confirmation".into());
+                            }
+                            proposal.validate()?;
+                            draft.validate()?;
+                            if proposal_flights.contains_key(&proposal.id) {
+                                return Err("Wait for the current proposal action to finish".into());
+                            }
+                            if draft.members.iter().any(|member| member.email.eq_ignore_ascii_case(&account)
+                                || identity.as_ref().is_some_and(|identity| identity.mail.as_ref()
+                                    .is_some_and(|mail| mail.eq_ignore_ascii_case(&member.email)))) {
+                                return Err("You are added to the chat automatically; remove yourself from the members".into());
+                            }
+                            let sdk = sdk.as_ref().filter(|sdk| !sdk.terminated.load(Ordering::Acquire) && sdk.workiq_ready.load(Ordering::Acquire))
+                                .ok_or("Connect WorkIQ before sending a Teams proposal")?;
+                            let mut proposal = saved_proposal(&proposals, *proposal)?;
+                            proposal.begin_chat((*draft).clone(), now)?;
+                            // The single-use approval is durable before anything is sent.
+                            store.save_proposal(&proposal)?;
+                            let request = crate::scheduling::ChatRequest { proposal: proposal.id.clone(), account: account.clone(), draft: *draft };
+                            if sdk.commands.try_send(ai::Command::ProposeChat {
+                                request: Box::new(request), reply: chat_sender.clone(), wake: wake.clone(),
+                            }).is_err() {
+                                proposal.finish_chat(&crate::scheduling::ChatResult {
+                                    proposal: proposal.id.clone(), state: crate::scheduling::ChatState::NotSent,
+                                    chat_id: None, web_url: None, message_id: None,
+                                    message: "The Teams proposal was not queued; nothing was sent".into(),
+                                }, now);
+                                store.save_proposal(&proposal)?;
+                            } else {
+                                proposal_flights.insert(proposal.id.clone(), (account, false));
+                            }
+                            proposals.insert(proposal.id.clone(), proposal);
+                            proposals_revision += 1;
+                            Ok(())
+                        })(),
+                        Command::ReleaseBlockers { account, proposal: id, events, cancel } => (|| {
+                            if exiting { return Err("Tomlook is stopping; nothing was deleted".into()); }
+                            if options.demo.is_some() { return Err("Preview never changes a live calendar".into()); }
+                            if store.calendar_owner()?.as_deref() != Some(account.as_str()) {
+                                return Err("Calendar account changed before confirmation".into());
+                            }
+                            if proposal_flights.contains_key(&id)
+                                || event_creations.values().any(|record| record.state == crate::event_creation::State::Creating) {
+                                return Err("Wait for the current calendar change to finish".into());
+                            }
+                            let mut proposal = proposals.get(&id).filter(|proposal| proposal.account == account).cloned()
+                                .ok_or("This proposal no longer exists")?;
+                            if events.is_empty() {
+                                if !cancel || proposal.held().next().is_some() || proposal.in_flight() {
+                                    return Err("Choose the BLOCKERs to delete".into());
+                                }
+                                proposal.finish_release(&[], true, now);
+                                store.save_proposal(&proposal)?;
+                                proposals.insert(id, proposal);
+                                proposals_revision += 1;
+                                return Ok(());
+                            }
+                            let sdk = sdk.as_ref().filter(|sdk| !sdk.terminated.load(Ordering::Acquire) && sdk.workiq_ready.load(Ordering::Acquire))
+                                .ok_or("Connect WorkIQ before confirming a calendar change")?;
+                            let blockers = proposal.begin_release(&events, now)?;
+                            store.save_proposal(&proposal)?;
+                            let request = crate::scheduling::ReleaseRequest { proposal: id.clone(), account: account.clone(), blockers };
+                            if sdk.commands.try_send(ai::Command::ReleaseBlockers {
+                                request: Box::new(request), reply: release_sender.clone(), wake: wake.clone(),
+                            }).is_err() {
+                                let outcomes = events.iter().map(|event_id| crate::scheduling::ReleaseOutcome {
+                                    event_id: event_id.clone(), state: crate::scheduling::BlockerState::Held,
+                                    message: "The deletion was not queued; nothing was deleted".into(),
+                                }).collect::<Vec<_>>();
+                                proposal.finish_release(&outcomes, false, now);
+                                store.save_proposal(&proposal)?;
+                            } else {
+                                proposal_flights.insert(id.clone(), (account, cancel));
+                            }
+                            proposals.insert(id, proposal);
+                            proposals_revision += 1;
+                            Ok(())
+                        })(),
+                        Command::ScheduleProposal { account, proposal: id, record } => (|| {
+                            if options.demo.is_some() { return Err("Preview never changes a live calendar".into()); }
+                            if store.calendar_owner()?.as_deref() != Some(account.as_str()) {
+                                return Err("Calendar account changed before confirmation".into());
+                            }
+                            event_creations.get(&record)
+                                .filter(|created| created.account == account && created.state == crate::event_creation::State::Created
+                                    && created.hold.is_none() && created.parent.is_none())
+                                .ok_or("The meeting was not created and verified")?;
+                            if !update_proposal(&store, &mut proposals, &account, &id, |proposal| proposal.schedule(&record, now))? {
+                                return Err("This proposal no longer exists".into());
+                            }
+                            proposals_revision += 1;
                             Ok(())
                         })(),
                         Command::AskLocal { id,query,account,meeting,language } => {

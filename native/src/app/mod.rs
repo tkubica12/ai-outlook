@@ -18,6 +18,7 @@ mod calendar;
 mod connections;
 mod event_editor;
 mod feedback;
+mod find_time;
 mod followup;
 mod meeting;
 mod myday;
@@ -176,6 +177,14 @@ pub struct Tomlook {
     meeting_menu: Option<String>,
     meeting_action: Option<MeetingActionDraft>,
     event_draft: Option<EventDraft>,
+    /// Identity of the newest editor lookup; older answers are ignored.
+    lookup_sequence: u64,
+    /// Account whose provider was asked whether new events accept attendees; `None` while pending.
+    invitation_capability: Option<(String, Option<Result<(), String>>)>,
+    find_time: Option<find_time::FindTime>,
+    blocker_release: Option<find_time::ReleaseDraft>,
+    /// Proposal and event-creation approval of a confirmed proposal time, until it is verified.
+    proposal_confirmation: Option<(String, String)>,
     time_drag: Option<(NaiveDate, u16, u16)>,
     activity_filter: ActivityFilter,
     insights_expanded: bool,
@@ -468,6 +477,11 @@ impl Tomlook {
             meeting_menu: None,
             meeting_action: None,
             event_draft: None,
+            lookup_sequence: 0,
+            invitation_capability: None,
+            find_time: None,
+            blocker_release: None,
+            proposal_confirmation: None,
             time_drag: None,
             activity_filter: ActivityFilter::All,
             insights_expanded: false,
@@ -856,10 +870,19 @@ impl Tomlook {
                         self.photos.clear();
                         self.photos_pending.clear();
                         self.photos_busy = false;
+                        self.invitation_capability = None;
                     }
                     self.hosted_workiq_status = message;
                 }
                 ai::Notice::Workiq { message } => self.workiq_status = message,
+                ai::Notice::People { id, result } => self.receive_people(id, result),
+                ai::Notice::Availability { id, result } => self.receive_availability(id, result),
+                ai::Notice::MeetingTimes { id, result } => self.receive_meeting_times(id, result),
+                ai::Notice::InvitationCapability { account, result } => {
+                    self.receive_invitation_capability(account, result)
+                }
+                ai::Notice::GroupAvailability { id, result } => self.receive_group_availability(id, result),
+                ai::Notice::ChatCheck { id, result } => self.receive_chat_check(id, result),
                 ai::Notice::Photos(results) => {
                     self.photos_busy = false;
                     self.photos_pending.clear();
@@ -1231,6 +1254,7 @@ impl eframe::App for Tomlook {
         self.receive_reminders();
         self.sync_myday();
         self.sync_weekly();
+        self.sync_proposal_confirmation();
         self.receive_ask_inputs(context);
         self.sync_detached_ask(context);
         if let Some(trace) = &self.startup
@@ -1476,6 +1500,7 @@ impl eframe::App for Tomlook {
                         if status_text(ui, "status-activity", language.text(&(format!("{} ready | {} researching | {} waiting | {} to review", completed, self.activity.queue.flights.len(), self.activity.queued + self.activity.deferred, problems)))).on_hover_text(language.text("Show meetings, queue and local context")).clicked() { self.settings = true; }
                         let has_messages = self.error.is_some() || self.activity.error.is_some() || self.activity.sync.error.is_some() || problems > 0
                             || self.activity.event_creations.values().any(|record| self.calendar_owner.as_deref() == Some(record.account.as_str()))
+                            || self.activity.proposals.values().any(|proposal| proposal.in_flight() || proposal.needs_review())
                             || self.activity.recommendations.values().any(|recommendation|
                                 recommendation.state == tomlook::recommendations::State::Review
                                     && self.calendar_owner.as_deref() == Some(recommendation.account.as_str()))

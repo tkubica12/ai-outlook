@@ -25,6 +25,12 @@ pub enum Scene {
     Notifications,
     /// The weekly review of the demo's current week.
     Weekly,
+    /// The new-event editor with three fictional attendees and their availability grid.
+    Invite,
+    /// **Find a time** with fictional candidates for a group.
+    FindTime,
+    /// **Find a time** with the Teams proposal approval preview (never sent).
+    Teams,
 }
 
 impl Scene {
@@ -38,13 +44,16 @@ impl Scene {
             "myday" => Ok(Self::MyDay),
             "notifications" => Ok(Self::Notifications),
             "weekly" => Ok(Self::Weekly),
-            _ => Err("--demo-scene must be details, feedback, prompts, tasks, followup, myday, notifications or weekly".into()),
+            "invite" => Ok(Self::Invite),
+            "findtime" => Ok(Self::FindTime),
+            "teams" => Ok(Self::Teams),
+            _ => Err("--demo-scene must be details, feedback, prompts, tasks, followup, myday, notifications, weekly, invite, findtime or teams".into()),
         }
     }
 
     /// Whether the scene first selects [`Scene::meeting`] and waits for its saved document.
     pub fn selects_meeting(self) -> bool {
-        !matches!(self, Self::MyDay | Self::Notifications | Self::Weekly)
+        !matches!(self, Self::MyDay | Self::Notifications | Self::Weekly | Self::Invite | Self::FindTime | Self::Teams)
     }
 
     /// The sample meeting whose details the scene shows.
@@ -59,6 +68,377 @@ impl Scene {
 
 /// The fictional preview meeting that already ended and has sample notes, tasks and a follow-up.
 pub const ENDED_MEETING: &str = "Northstar / Pilot planning";
+
+/// The fictional demo user: the organizer of the preview's own meetings.
+pub const DEMO_USER: &str = "taylor@example.invalid";
+
+/// Attendees the `invite` scene adds to a new fictional meeting.
+pub const INVITE_ATTENDEES: &str =
+    "Alex Rivers <alex@example.invalid>; Jamie Brooks <jamie@example.invalid>; Dana Novak <dana@northstar.invalid>";
+
+/// The fictional people directory of the offline demo.
+const DIRECTORY: &[(&str, &str)] = &[
+    ("Alex Rivers", "alex@example.invalid"),
+    ("Jamie Brooks", "jamie@example.invalid"),
+    ("Morgan Lee", "morgan@example.invalid"),
+    ("Riley Chen", "riley@example.invalid"),
+    ("Avery Stone", "avery@example.invalid"),
+    ("Jordan Park", "jordan@example.invalid"),
+    ("Dana Novak", "dana@northstar.invalid"),
+    ("Sam Ortiz", "sam@cedar.invalid"),
+    ("Kim Lambert", "kim@orbit.invalid"),
+];
+
+/// Fictional people-search results; the demo never searches a real directory.
+pub fn people(query: &str) -> Vec<crate::attendees::Person> {
+    let people = DIRECTORY
+        .iter()
+        .map(|(name, email)| crate::attendees::Person {
+            email: (*email).into(),
+            name: (*name).into(),
+            meetings: 0,
+            score: 0.0,
+        })
+        .collect::<Vec<_>>();
+    crate::attendees::matching(&people, query, &[], crate::attendees::SEARCH_RESULTS)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+/// Fictional free/busy for the demo's colleagues; your own row comes from the demo calendar and
+/// customers' calendars are not shared, so they stay unknown. No WorkIQ call is made.
+pub fn availability(
+    request: &crate::availability::ScheduleRequest,
+    events: &[Event],
+) -> crate::availability::Availability {
+    use crate::availability::{Item, Schedule, Status};
+    let at = |minutes: i64| request.start.with_timezone(&Utc) + Duration::minutes(minutes);
+    let item = |from: i64, to: i64, status, subject: Option<&str>, location: Option<&str>| Item {
+        status,
+        start: at(from),
+        end: at(to),
+        subject: subject.map(Into::into),
+        location: location.map(Into::into),
+    };
+    let schedules = request
+        .schedules
+        .iter()
+        .map(|email| {
+            let items = match email.as_str() {
+                DEMO_USER => return Schedule::from_events(request, email, events),
+                "alex@example.invalid" => vec![
+                    item(540, 630, Status::Busy, Some("Sprint planning"), Some("Studio / Room 2")),
+                    item(720, 780, Status::Busy, None, None),
+                    item(960, 1080, Status::WorkingElsewhere, Some("Customer site"), None),
+                ],
+                "jamie@example.invalid" => vec![
+                    item(480, 750, Status::OutOfOffice, None, None),
+                    item(780, 1080, Status::Tentative, Some("Partner office hours"), Some("Online")),
+                ],
+                "morgan@example.invalid" => vec![
+                    item(600, 660, Status::Busy, Some("Design review"), None),
+                    item(840, 930, Status::Busy, Some("Hiring panel"), None),
+                ],
+                "riley@example.invalid" => vec![
+                    item(540, 600, Status::Tentative, None, None),
+                    item(900, 960, Status::Busy, Some("Release check"), None),
+                ],
+                other if other.ends_with("@example.invalid") => {
+                    vec![item(660, 720, Status::Busy, None, None)]
+                }
+                _ => {
+                    return Schedule {
+                        email: email.clone(),
+                        view: vec![Status::Unknown; request.cells()],
+                        items: Vec::new(),
+                        error: Some("Availability is not shared with you".into()),
+                    };
+                }
+            };
+            Schedule::from_items(request, email.clone(), items)
+        })
+        .collect();
+    crate::availability::Availability {
+        start: request.start,
+        end: request.end,
+        interval: request.interval,
+        schedules,
+    }
+}
+
+/// Fictional meeting time suggestions: quarter hours when you are available, most available
+/// colleagues first.
+pub fn meeting_times(
+    request: &crate::availability::MeetingTimesRequest,
+    events: &[Event],
+) -> crate::availability::MeetingTimes {
+    use crate::availability::{MeetingTimes, ScheduleRequest, Suggestion};
+    let duration = Duration::minutes(i64::from(request.minutes));
+    let mut suggestions = Vec::new();
+    let mut day = request.start.with_timezone(&Local).date_naive();
+    while day <= request.end.with_timezone(&Local).date_naive() {
+        let emails = std::iter::once(DEMO_USER.to_owned())
+            .chain(request.attendees.iter().map(|attendee| attendee.email.clone()))
+            .collect::<Vec<_>>();
+        if day.weekday().num_days_from_monday() < 5
+            && let Ok(schedule) = ScheduleRequest::day(day, emails)
+        {
+            let free = availability(&schedule, events);
+            for quarter in 36..68 {
+                let start = schedule.start + Duration::minutes(quarter * 15);
+                let end = start + duration;
+                if !request.slots.iter().any(|(first, last)| start >= *first && end <= *last) {
+                    continue;
+                }
+                let organizer = free.status(DEMO_USER, start, end);
+                if !organizer.available() {
+                    continue;
+                }
+                let attendees = request
+                    .attendees
+                    .iter()
+                    .map(|attendee| (attendee.email.clone(), free.status(&attendee.email, start, end)))
+                    .collect::<Vec<_>>();
+                let available = attendees.iter().filter(|(_, status)| status.available()).count();
+                suggestions.push(Suggestion {
+                    start,
+                    end,
+                    confidence: Some((available * 100 / attendees.len().max(1)) as f64),
+                    organizer,
+                    attendees,
+                });
+            }
+        }
+        let Some(next) = day.succ_opt() else { break };
+        day = next;
+    }
+    suggestions.sort_by_key(|suggestion| std::cmp::Reverse(suggestion.available()));
+    suggestions.truncate(crate::availability::MAX_SUGGESTIONS);
+    MeetingTimes {
+        empty_reason: suggestions
+            .is_empty()
+            .then_some("No meeting times were found in this range"),
+        suggestions,
+        reason_code: None,
+    }
+}
+
+/// Topic of the fictional open proposal that two BLOCKERs hold in the demo calendar.
+pub const PROPOSAL_TOPIC: &str = "Orbit / Roadmap sync";
+
+/// Attendees of the fictional open proposal.
+pub const PROPOSAL_ATTENDEES: &str =
+    "Alex Rivers <alex@example.invalid>; Jamie Brooks <jamie@example.invalid>; Kim Lambert <kim@orbit.invalid>";
+
+/// Attendees of the `findtime` scene: two required colleagues, an optional colleague and an
+/// optional customer whose calendar is not shared.
+pub const FIND_TIME_ATTENDEES: &str =
+    "Alex Rivers <alex@example.invalid>; Jamie Brooks <jamie@example.invalid>; Morgan Lee <morgan@example.invalid>; Kim Lambert <kim@orbit.invalid>";
+
+/// Fictional free/busy over several days for **Find a time**: colleagues' busy, tentative,
+/// out-of-office and working-elsewhere time varies by weekday, your own row comes from the demo
+/// calendar and customers' calendars are not shared (unknown). No WorkIQ call is made.
+pub fn group_availability(
+    request: &crate::availability::ScheduleRequest,
+    events: &[Event],
+) -> crate::availability::Availability {
+    use crate::availability::{Item, Schedule, Status};
+    let mut days = Vec::new();
+    let mut day = request.start.with_timezone(&Local).date_naive();
+    while let Some(midnight) = day
+        .and_hms_opt(0, 0, 0)
+        .and_then(|time| time.and_local_timezone(Local).earliest())
+        .map(|time| time.with_timezone(&Utc))
+        .filter(|midnight| *midnight < request.end)
+    {
+        days.push((day.weekday().num_days_from_monday(), midnight));
+        let Some(next) = day.succ_opt() else { break };
+        day = next;
+    }
+    let schedules = request
+        .schedules
+        .iter()
+        .map(|email| {
+            // (weekday or 9 for every weekday, from minute, to minute, status, subject)
+            let plan: &[(u32, i64, i64, Status, Option<&str>)] = match email.as_str() {
+                DEMO_USER => return Schedule::from_events(request, email, events),
+                "alex@example.invalid" => &[
+                    (9, 540, 630, Status::Busy, Some("Sprint planning")),
+                    (9, 720, 780, Status::Busy, None),
+                    (1, 960, 1080, Status::WorkingElsewhere, Some("Customer site")),
+                    (3, 960, 1080, Status::WorkingElsewhere, Some("Customer site")),
+                    (2, 840, 930, Status::Busy, Some("Architecture review")),
+                ],
+                "jamie@example.invalid" => &[
+                    (0, 480, 1080, Status::OutOfOffice, None),
+                    (1, 780, 900, Status::Tentative, Some("Partner office hours")),
+                    (2, 600, 690, Status::Busy, Some("Hiring panel")),
+                    (3, 900, 960, Status::Busy, None),
+                    (4, 780, 1080, Status::OutOfOffice, None),
+                ],
+                "morgan@example.invalid" => &[
+                    (9, 600, 660, Status::Busy, Some("Design review")),
+                    (3, 840, 930, Status::Busy, Some("Hiring panel")),
+                ],
+                "riley@example.invalid" => &[
+                    (9, 540, 600, Status::Tentative, None),
+                    (9, 900, 960, Status::Busy, Some("Release check")),
+                ],
+                other if other.ends_with("@example.invalid") => &[(9, 660, 720, Status::Busy, None)],
+                _ => {
+                    return Schedule {
+                        email: email.clone(),
+                        view: vec![Status::Unknown; request.cells()],
+                        items: Vec::new(),
+                        error: Some("Availability is not shared with you".into()),
+                    };
+                }
+            };
+            let items = days
+                .iter()
+                .filter(|(weekday, _)| *weekday < 5)
+                .flat_map(|(weekday, midnight)| {
+                    plan.iter()
+                        .filter(move |(day, ..)| *day == 9 || day == weekday)
+                        .map(move |(_, from, to, status, subject)| Item {
+                            status: *status,
+                            start: *midnight + Duration::minutes(*from),
+                            end: *midnight + Duration::minutes(*to),
+                            subject: subject.map(Into::into),
+                            location: None,
+                        })
+                })
+                .collect();
+            Schedule::from_items(request, email.clone(), items)
+        })
+        .collect();
+    crate::availability::Availability {
+        start: request.start,
+        end: request.end,
+        interval: request.interval,
+        schedules,
+    }
+}
+
+/// Fictional Teams directory answers: colleagues resolve to fictional user IDs, customers are not
+/// in the organization. Nothing is looked up or sent.
+pub fn chat_check(emails: &[String]) -> crate::scheduling::ChatCheck {
+    let mut check = crate::scheduling::ChatCheck::default();
+    for email in emails {
+        match DIRECTORY.iter().position(|(_, known)| known == email) {
+            Some(index) if email.ends_with("@example.invalid") => check.members.push(crate::scheduling::Member {
+                email: email.clone(),
+                name: DIRECTORY[index].0.into(),
+                user_id: format!("{:08x}-0000-4000-8000-{:012x}", index + 1, index + 1),
+            }),
+            _ => check.unresolved.push((email.clone(), "Not found in your organization's directory".into())),
+        }
+    }
+    check
+}
+
+/// Two free half hours of next week (Tuesday and Thursday) in the demo calendar, held by
+/// fictional BLOCKERs of the open sample proposal.
+pub fn demo_blockers(now: DateTime<Local>, events: &[Event], language: crate::i18n::Language) -> Vec<Event> {
+    let monday = crate::calendar::monday(now.date_naive()) + Duration::days(7);
+    let slots = [1_i64, 3]
+        .into_iter()
+        .filter_map(|offset| {
+            let day = monday + Duration::days(offset);
+            (40..64).map(|quarter| quarter * 15).find_map(|minute: u32| {
+                let start = day
+                    .and_hms_opt(minute / 60, minute % 60, 0)?
+                    .and_local_timezone(Local)
+                    .single()?
+                    .fixed_offset();
+                let end = start + Duration::minutes(30);
+                (!events.iter().any(|event| !event.is_all_day && event.start < end && event.end > start))
+                    .then_some(crate::scheduling::Slot { start, end })
+            })
+        })
+        .collect::<Vec<_>>();
+    let Ok(proposal) = proposal_for(DEMO_USER, slots.clone(), language, now.fixed_offset()) else {
+        return Vec::new();
+    };
+    slots
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| Event {
+            id: format!("synthetic-blocker-{index}"),
+            title: crate::scheduling::blocker_title(PROPOSAL_TOPIC),
+            start: slot.start,
+            end: slot.end,
+            category: String::new(),
+            attendees: Vec::new(),
+            organizer: "Taylor Quinn <taylor@example.invalid>".into(),
+            location: String::new(),
+            status: "organizer".into(),
+            briefing_status: String::new(),
+            is_all_day: false,
+            source_url: None,
+            extra: BTreeMap::from([
+                ("synthetic".into(), json!(true)),
+                ("type".into(), json!("singleInstance")),
+                ("isOrganizer".into(), json!(true)),
+                ("showAs".into(), json!("busy")),
+                ("sensitivity".into(), json!("normal")),
+                ("categories".into(), json!([])),
+                ("transactionId".into(), json!(format!("demo-blocker-{index}"))),
+                ("body".into(), json!({"contentType": "text", "content": proposal.blocker_body()})),
+            ]),
+        })
+        .collect()
+}
+
+fn proposal_for(
+    account: &str,
+    slots: Vec<crate::scheduling::Slot>,
+    language: crate::i18n::Language,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> Result<crate::scheduling::Proposal, String> {
+    let mut attendees = crate::attendees::parse_input(PROPOSAL_ATTENDEES)?;
+    attendees[2].role = crate::attendees::Role::Optional;
+    crate::scheduling::Proposal::new(account, PROPOSAL_TOPIC, attendees, 30, slots, language, now)
+}
+
+/// The fictional open proposal whose two BLOCKERs are in the demo calendar, or `None` without
+/// them.
+pub fn sample_proposal(
+    account: &str,
+    calendar: &crate::calendar::Calendar,
+    language: crate::i18n::Language,
+    now: DateTime<Local>,
+) -> Result<Option<crate::scheduling::Proposal>, String> {
+    let held = calendar
+        .events
+        .iter()
+        .filter(|event| event.id.starts_with("synthetic-blocker-") && event.extra.get("synthetic") == Some(&json!(true)))
+        .collect::<Vec<_>>();
+    if held.is_empty() {
+        return Ok(None);
+    }
+    let slots = held
+        .iter()
+        .map(|event| crate::scheduling::Slot { start: event.start, end: event.end })
+        .collect();
+    let mut proposal = proposal_for(account, slots, language, now.fixed_offset())?;
+    proposal.blockers = held
+        .iter()
+        .map(|event| crate::scheduling::Blocker {
+            start: event.start,
+            end: event.end,
+            title: event.title.clone(),
+            transaction_id: event.extra.get("transactionId").and_then(Value::as_str).unwrap_or_default().into(),
+            event_id: Some(event.id.clone()),
+            state: crate::scheduling::BlockerState::Held,
+            message: String::new(),
+        })
+        .collect();
+    proposal.blockers.sort_by_key(|blocker| blocker.start);
+    proposal.validate()?;
+    Ok(Some(proposal))
+}
 
 /// Fictional ratings of sample Insights, saved only by the `prompts` screenshot scene.
 pub fn sample_feedback(
@@ -897,13 +1277,101 @@ mod tests {
         assert_eq!(summary.preparation.reasons[0], (crate::feedback::Reason::TooVague, 2));
         for (value, scene) in [("details", Scene::Details), ("feedback", Scene::Feedback), ("prompts", Scene::Prompts),
             ("tasks", Scene::Tasks), ("followup", Scene::FollowUp), ("myday", Scene::MyDay),
-            ("notifications", Scene::Notifications), ("weekly", Scene::Weekly)] {
+            ("notifications", Scene::Notifications), ("weekly", Scene::Weekly), ("invite", Scene::Invite),
+            ("findtime", Scene::FindTime), ("teams", Scene::Teams)] {
             assert_eq!(Scene::parse(value).unwrap(), scene);
         }
         assert!(Scene::parse("settings").is_err());
         assert_eq!(Scene::FollowUp.meeting(), ENDED_MEETING);
         assert!(Scene::Details.selects_meeting() && !Scene::MyDay.selects_meeting() && !Scene::Notifications.selects_meeting());
-        assert!(!Scene::Weekly.selects_meeting());
+        assert!(!Scene::Weekly.selects_meeting() && !Scene::Invite.selects_meeting());
+        assert!(!Scene::FindTime.selects_meeting() && !Scene::Teams.selects_meeting());
+    }
+
+    #[test]
+    fn demo_group_availability_proposal_and_blockers_are_fictional_and_consistent() {
+        use crate::availability::{ScheduleRequest, Status};
+        let now = Local::now();
+        let mut events = preview_events(now, 198);
+        let blockers = demo_blockers(now, &events, crate::i18n::Language::En);
+        assert_eq!(blockers.len(), 2, "Two free half hours next week");
+        for blocker in &blockers {
+            assert!(crate::scheduling::is_blocker(blocker));
+            assert!(!events.iter().any(|event| !event.is_all_day && event.start < blocker.end && event.end > blocker.start),
+                "BLOCKERs never overlap the demo agenda");
+        }
+        events.extend(blockers.clone());
+        let calendar = crate::calendar::Calendar::build(events.clone(), Default::default(), Vec::new()).unwrap();
+        let proposal = sample_proposal(crate::feedback::PREVIEW_ACCOUNT, &calendar, crate::i18n::Language::Cs, now).unwrap().unwrap();
+        assert_eq!(proposal.held().count(), 2);
+        assert_eq!(proposal.topic, PROPOSAL_TOPIC);
+        assert!(proposal.attendees.iter().all(|attendee| attendee.email.ends_with(".invalid")));
+        assert!(sample_proposal(crate::feedback::PREVIEW_ACCOUNT, &crate::calendar::Calendar::default(),
+            crate::i18n::Language::En, now).unwrap().is_none());
+        let monday = crate::calendar::monday(now.date_naive()) + Duration::days(7);
+        let people = crate::attendees::parse_input(FIND_TIME_ATTENDEES).unwrap();
+        let emails = std::iter::once(DEMO_USER.to_owned()).chain(people.iter().map(|attendee| attendee.email.clone())).collect::<Vec<_>>();
+        let request = ScheduleRequest::range(monday, monday + Duration::days(4), emails).unwrap();
+        let availability = group_availability(&request, &events);
+        let at = |day: i64, minute: i64| {
+            (monday + Duration::days(day)).and_hms_opt(0, 0, 0).unwrap().and_local_timezone(Local).earliest().unwrap()
+                .with_timezone(&Utc) + Duration::minutes(minute)
+        };
+        let status = |email: &str, day, minute| availability.status(email, at(day, minute), at(day, minute + 30));
+        assert_eq!(status("jamie@example.invalid", 0, 600), Status::OutOfOffice, "Jamie is out on Monday");
+        assert_eq!(status("jamie@example.invalid", 1, 600), Status::Free);
+        assert_eq!(status("jamie@example.invalid", 1, 780), Status::Tentative);
+        assert_eq!(status("alex@example.invalid", 2, 540), Status::Busy);
+        assert_eq!(status("kim@orbit.invalid", 2, 540), Status::Unknown, "Customers do not share their calendars");
+        assert_eq!(status(DEMO_USER, 1, blockers[0].start.with_timezone(&Local).time().signed_duration_since(chrono::NaiveTime::MIN).num_minutes()), Status::Busy,
+            "Your own BLOCKER is busy");
+        let mut search = crate::scheduling::Search::new(monday - Duration::days(1), 30);
+        search.first = monday;
+        let mut attendees = people.clone();
+        attendees[2].role = crate::attendees::Role::Optional;
+        attendees[3].role = crate::attendees::Role::Optional;
+        let candidates = crate::scheduling::candidates(&search, &availability, DEMO_USER, &attendees,
+            (monday - Duration::days(7)).and_hms_opt(0, 0, 0).unwrap().and_utc()).unwrap();
+        assert!(candidates.ideal >= 3, "{candidates:?}");
+        let check = chat_check(&people.iter().map(|attendee| attendee.email.clone()).collect::<Vec<_>>());
+        assert_eq!(check.members.len(), 3);
+        assert!(check.members.iter().all(|member| crate::scheduling::valid_user_id(&member.user_id)));
+        assert_eq!(check.unresolved, vec![("kim@orbit.invalid".to_owned(), "Not found in your organization's directory".to_owned())]);
+    }
+
+    #[test]
+    fn demo_invitees_have_fictional_mixed_availability_and_suggestions_without_workiq() {
+        use crate::availability::{MeetingTimesRequest, ScheduleRequest, Status};
+        let now = Local::now();
+        let events = preview_events(now, 200);
+        let attendees = crate::attendees::parse_input(INVITE_ATTENDEES).unwrap();
+        assert_eq!(attendees.len(), 3);
+        assert!(attendees.iter().all(|attendee| attendee.email.ends_with(".invalid")));
+        let day = crate::calendar::monday(now.date_naive()) + Duration::days(8);
+        let emails = std::iter::once(DEMO_USER.to_owned())
+            .chain(attendees.iter().map(|attendee| attendee.email.clone()))
+            .collect::<Vec<_>>();
+        let request = ScheduleRequest::day(day, emails).unwrap();
+        let availability = availability(&request, &events);
+        let at = |minutes: i64| request.start + Duration::minutes(minutes);
+        assert_eq!(availability.status("alex@example.invalid", at(780), at(840)), Status::Free);
+        assert_eq!(availability.status("alex@example.invalid", at(540), at(600)), Status::Busy);
+        assert_eq!(availability.status("jamie@example.invalid", at(480), at(540)), Status::OutOfOffice);
+        assert_eq!(availability.status("jamie@example.invalid", at(780), at(840)), Status::Tentative);
+        assert_eq!(availability.status("dana@northstar.invalid", at(780), at(840)), Status::Unknown);
+        let alex = availability.schedule("alex@example.invalid").unwrap();
+        assert_eq!(crate::availability::Availability::items(alex, at(540), at(600)).next().unwrap().subject.as_deref(), Some("Sprint planning"));
+        let own = availability.schedule(DEMO_USER).unwrap();
+        assert!(own.view.contains(&Status::Busy), "Your row comes from the fictional calendar");
+        assert!(people("riv").iter().any(|person| person.email == "alex@example.invalid"));
+        assert!(people("zzz").is_empty());
+        let times = MeetingTimesRequest::around(day, 30, attendees, now.with_timezone(&Utc)).unwrap();
+        let suggestions = meeting_times(&times, &events);
+        assert!(!suggestions.suggestions.is_empty());
+        assert!(suggestions.suggestions.iter().all(|suggestion| suggestion.organizer == Status::Free
+            && suggestion.end - suggestion.start == Duration::minutes(30)));
+        assert!(suggestions.suggestions.len() <= crate::availability::MAX_SUGGESTIONS);
+        assert!(suggestions.suggestions.windows(2).all(|pair| pair[0].available() >= pair[1].available()));
     }
 
     #[test]

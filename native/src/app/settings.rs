@@ -539,6 +539,8 @@ impl Tomlook {
         self.preferences_dialog(context);
         self.meeting_action_dialog(context);
         self.event_creation_dialog(context);
+        self.find_time_dialog(context);
+        self.blocker_release_dialog(context);
         self.assistant_dialog(context);
         self.tasks_window(context);
         self.myday_window(context);
@@ -566,12 +568,22 @@ impl Tomlook {
                                     for record in records.iter().rev() {
                                         ui.strong(format!("{}: {}", language.text(record.label()), record.draft.title));
                                         ui.weak(language.text(&record.message));
-                                        ui.weak(format!("{} - {}", record.draft.start.with_timezone(&Local).format("%d.%m. %H:%M"),
-                                            record.draft.end.with_timezone(&Local).format("%d.%m. %H:%M")));
+                                        match &record.hold {
+                                            Some(hold) => for slot in &hold.slots {
+                                                ui.weak(slot.label(language));
+                                            },
+                                            None => { ui.weak(format!("{} - {}", record.draft.start.with_timezone(&Local).format("%d.%m. %H:%M"),
+                                                record.draft.end.with_timezone(&Local).format("%d.%m. %H:%M"))); }
+                                        }
+                                        if !record.draft.attendees.is_empty() {
+                                            ui.weak(format!("{}: {}", language.text("Invited"), record.draft.attendees.iter()
+                                                .map(|attendee| attendee.label()).collect::<Vec<_>>().join(", ")));
+                                        }
                                     }
                                 });
                             });
                     }
+                    self.proposal_messages(ui);
                     let inbox = self.activity.recommendations.clone();
                     let mut applied = inbox.values().filter(|record|
                         record.account == self.calendar_owner.as_deref().unwrap_or("")

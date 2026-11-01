@@ -317,7 +317,8 @@ pub fn overview(sources: &Sources, now: DateTime<Local>, language: Language) -> 
     let day_start = local_time(today, 0);
     let day_end = local_time(today + Duration::days(1), 0);
     let mut agenda = day_events(calendar, today)
-        .filter(|event| !cancelled(event) && (event.accepted() || tentative(event)))
+        // BLOCKER holds without attendees still block focus time but are not meetings.
+        .filter(|event| !cancelled(event) && (event.accepted() || tentative(event)) && !crate::scheduling::is_blocker(event))
         .map(|event| Item {
             event_id: event.id.clone(),
             title: clip(&event.title),
@@ -599,7 +600,7 @@ pub fn free_windows<'a>(
 
 fn tomorrow(calendar: &Calendar, date: NaiveDate) -> Tomorrow {
     let meetings = day_events(calendar, date)
-        .filter(|event| !event.all_day_like() && event.accepted() && !cancelled(event))
+        .filter(|event| !event.all_day_like() && event.accepted() && !cancelled(event) && !crate::scheduling::is_blocker(event))
         .collect::<Vec<_>>();
     Tomorrow {
         date,
@@ -1227,5 +1228,28 @@ mod tests {
         store.save_morning_overview_shown(day(11)).unwrap();
         store.save_morning_overview_shown(day(12)).unwrap();
         assert_eq!(crate::storage::Store::open(root.path()).unwrap().morning_overview_shown().unwrap(), Some(day(12)));
+    }
+
+    #[test]
+    fn blocker_holds_block_focus_time_but_are_not_meetings_or_agenda_items() {
+        let sources = wednesday(&[day(11), day(12)]);
+        let mut events = sources.calendar.events.clone();
+        let mut blocker = meeting("blocker", "BLOCKER: Pilot kickoff", day(11), (16, 30), (17, 30), "organizer");
+        blocker.extra.insert("isOrganizer".into(), json!(true));
+        blocker.extra.insert("showAs".into(), json!("busy"));
+        let mut tomorrow = blocker.clone();
+        tomorrow.id = "blocker-tomorrow".into();
+        tomorrow.start += Duration::days(1);
+        tomorrow.end += Duration::days(1);
+        events.extend([blocker, tomorrow]);
+        let calendar = Calendar::build(events, sources.calendar.coverage.clone(), Vec::new()).unwrap();
+        let with = Sources { calendar: Arc::new(calendar), ..sources.clone() };
+        let before = overview(&sources, local(day(11), 7, 30), Language::En);
+        let after = overview(&with, local(day(11), 7, 30), Language::En);
+        assert!(after.item("blocker").is_none(), "BLOCKERs are not on the agenda");
+        assert_eq!((after.meetings, after.busy_minutes, after.last_end), (before.meetings, before.busy_minutes, before.last_end));
+        assert_eq!(after.tomorrow.meetings, before.tomorrow.meetings);
+        let free = |overview: &Overview| overview.focus.clone().unwrap().iter().map(|(start, end)| (*end - *start).num_minutes()).sum::<i64>();
+        assert_eq!(free(&before) - free(&after), 60, "The hold still blocks focus time");
     }
 }

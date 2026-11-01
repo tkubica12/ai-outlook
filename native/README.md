@@ -49,13 +49,27 @@ have loaded. It cannot be used in production or combined with measurements.
 Only the demo window content is captured, not other desktop windows or the
 Windows title bar. PNG encoding and exclusive-create file output run on the
 bounded storage worker. Existing images are never overwritten.
-`--demo-scene <details|feedback|prompts|tasks|followup|myday|notifications|weekly>` chooses what that screenshot shows:
+`--demo-scene <details|feedback|prompts|tasks|followup|myday|notifications|weekly|invite|findtime|teams>` chooses what that screenshot shows:
 the default details pane, expanded Insights with a saved rating and an open
 reason panel, **Settings > AI prompts** after fictional sample feedback is
 saved into the isolated demo profile through the normal storage path, the
 **Tasks** list, the saved follow-up e-mail of the fictional meeting that
 ended yesterday, the **My day** panel, **Settings > Notifications** scrolled
-to the morning overview, or the **Weekly review** of the current week. The preview seeds fictional tasks (including tasks imported
+to the morning overview, the **Weekly review** of the current week, or the
+**New event** editor of the next workday with three fictional attendees and
+their scheduling grid (`invite`). The demo's availability is fictional and
+computed locally: colleagues have sample busy, tentative, out-of-office and
+working-elsewhere blocks, your own row comes from the demo calendar, and the
+fictional customer's calendar is not shared (unknown). The demo never calls
+WorkIQ, searches a directory or sends invitations. `findtime` opens **Find a
+time** for a fictional group (two required colleagues, an optional colleague
+and an optional customer whose calendar is unknown) with fictional multi-day
+availability and two candidates selected; `teams` additionally shows the Teams
+proposal approval (members, topic, message and consequence) with **Create chat
+and send** disabled. The demo calendar also holds a fictional open proposal with
+two BLOCKERs next week, shown as **Proposed time**. Every write of Find a time is
+disabled in the demo with the reason "The offline demo never changes a calendar
+or contacts anyone." The preview seeds fictional tasks (including tasks imported
 from that meeting's sample notes) and a fictional follow-up draft into the
 isolated profile; it never requests AI or opens an e-mail link by itself.
 Today always has fictional meetings for My day: on a weekday one extra meeting
@@ -173,24 +187,97 @@ the wheel and scrollbars still scroll. **New event** provides a keyboard-accessi
 entry point in every view. Escape, focus loss during selection and closing the
 editor never approve a write.
 
-The bilingual editor offers time sliders, title, description, direct categories,
-Private (automatically selecting an existing personal category), Teams and
-optional paired travel reserves. Reserves default to 30 minutes each, are
+The bilingual editor offers time sliders, title, attendees, description, direct
+categories, Private (automatically selecting an existing personal category),
+Teams and optional paired travel reserves. Reserves default to 30 minutes each, are
 adjustable in 15-minute steps, remain uncategorized, inherit private sensitivity,
-and never create online meetings. Both date/time boundaries are resolved
+never invite anyone and never create online meetings. Both date/time boundaries are resolved
 independently in the local timezone; missing or ambiguous DST times are rejected.
 Unknown calendar coverage and cached overlaps are explicitly shown, not treated
 as verified availability.
 
+#### Attendees and availability
+
+Type a name or e-mail in **Attendees** (**Účastníci**). Suggestions come from the
+people in the cached calendar (organizers and attendees of past and future
+meetings, ranked by how often and how recently you met them) and, when WorkIQ
+is connected, from a read-only directory search (`/me/people?$search=…`, at most
+10 results). The search starts 400 ms after typing stops and only from two
+characters; a newer search supersedes the older one on the AI worker, never on
+the UI thread. Valid typed addresses (`alex@example.com`, `Alex Rivers
+<alex@example.com>`, several separated by semicolons) are accepted directly.
+Addresses are compared case-insensitively; your own account and mailboxes,
+rooms/resources and duplicates are never added. Each chip shows the name (the
+address on hover), a **Required/Optional** toggle and a remove button; at most
+50 attendees. Rooms, resources and recurrence are out of scope.
+
+With attendees and a WorkIQ connection, Tomlook reads free/busy for you and
+every attendee for the selected local day with Graph's read-only
+`POST /me/calendar/getSchedule` (local midnight to midnight sent as UTC,
+15-minute `availabilityView` interval). This is a dedicated typed method of the
+WorkIQ connection with a fixed action path and body; no generic action is
+exposed to the model and no AI is involved. Graph answers for at most 20 people
+per request, so larger groups are read in batches of 20 and joined. Responses are bounded (51
+schedules, 200 items each, 255-character subject/location); private items never
+show text, and unzoned times outside UTC are not guessed. People whose calendar
+is external, hidden or not found show as unknown with the reason.
+
+The scheduling grid under the time sliders has a row for you and each
+attendee and 15-minute columns from 08:00 to 18:00 (30-minute columns when the
+day is extended to include an earlier or later selected interval). Busy is the
+accent color, tentative accent stripes (as in Outlook), out of office purple, working
+elsewhere an accent underline, free empty and unknown hatched gray; the selected
+interval is outlined. Hovering a cell shows the visible subject/location or
+the status, and clicking a column moves the start there with the same
+duration. The summary reads **All available** or, for example,
+**1 of 3 available · Jamie Brooks tentative · Dana Novak unknown**
+(Czech plurals included). Availability refreshes 400 ms after the day or the
+attendee set changes; loading and errors are shown honestly. When the read
+fails, creation remains possible with an explicit "availability is not
+verified" warning. **Suggest times** asks Graph's read-only
+`POST /me/findMeetingTimes` for the chosen duration within 08:00–18:00 local
+weekday slots from the day before to two days after the selected day (never in
+the past, at most five candidates; explicit slots are used because Graph's
+`work` domain depends on mailbox working-hours settings and returned no
+suggestions in the live check) and shows each with attendee availability and
+confidence; picking one sets the day and time. The request/response types and parsing live in the
+library module `availability` for reuse. The diagnostic
+`workiq-availability-probe <state-directory> [work-account]` uses only the saved
+sign-in (never an interactive prompt) to read the create schema's attendee
+shape, the Teams chat and chat-message create schemas, your own free/busy for
+the next workday and for the next five workdays, and suggestions for your own
+mailbox; it prints counts and schema shapes, never calendar text, and never
+writes, invites, creates chats or sends messages.
+
+When attendees are present, the editor states the consequence before approval,
+for example "Creating sends an Outlook invitation to 3 people: …" with optional
+attendees marked, and the button becomes **Create and send invitations**
+(**Vytvořit a odeslat pozvánky**). Nothing is sent without that click. As soon
+as the attendee field is used, Tomlook reads the provider's create schema
+(`get_schema`, no write); if new events cannot carry attendees, adding
+attendees is disabled with the reason and the button stays disabled until
+the attendees are removed. A check that merely fails (for example a timeout)
+is shown without blocking, because the write re-checks the schema anyway.
+
 The storage worker durably records the account-bound exact approval before the
-native WorkIQ executor submits anything. The event and each reserve use distinct
-stable Graph transaction IDs. The provider checks its create schema and, when
-requested, the calendar's allowed Teams providers. It reads back title, times,
-categories, privacy, busy state, description, transaction identity and Teams join
-URL before proceeding to the next part. There are no model calls, participants
-or room invitations. **Messages → Event creation** preserves progress and partial
-outcomes across restart. Interrupted/unknown writes are not replayed. Only a
-definitively not-submitted/rejected approval may be explicitly submitted again.
+native WorkIQ executor submits anything; the exact attendee set and types are
+part of that single-use approval. The event and each reserve use distinct
+stable Graph transaction IDs. The provider checks its create schema (including
+writable attendees when inviting; WorkIQ's flattened schema omits the inherited
+attendee address and type, which are rejected only if marked read-only) and, when
+requested, the calendar's allowed Teams providers. Only the main event carries
+Graph `attendees` (`emailAddress` and `type` required/optional); Outlook sends
+the invitations when it is created. Read-back checks title, times,
+categories, privacy, busy state, description, transaction identity, Teams join
+URL, that you are the organizer and exactly the intended attendee set
+(case-insensitive address, intended types; your own organizer address may be
+listed by the provider) before proceeding to the next part. Travel reserves
+must have zero attendees. There are no model calls or room invitations.
+**Messages → Event creation** preserves progress and partial outcomes across
+restart and lists who was invited. Interrupted/unknown writes are not replayed.
+With attendees, every uncertain outcome adds "Invitations may already have been
+sent; check Outlook before retrying." Only a definitively not-submitted/rejected
+approval may be explicitly submitted again.
 Private sensitivity follows Outlook semantics, including delegate exceptions;
 it is not encryption or a guarantee against privileged mailbox access.
 
@@ -211,6 +298,146 @@ The calendar Teams flow follows Microsoft's
 and [create-event contract](https://learn.microsoft.com/en-us/graph/api/user-post-events?view=graph-rest-1.0).
 Tenant policy can still reject writes or online meetings; offline tests do not
 prove a particular tenant has granted those capabilities.
+
+#### Find a time, proposals and BLOCKERs
+
+**Find a time** (**Najít termín**) finds times that suit a whole group. Open it
+from the command palette, with **Find a time** next to **Suggest times** in the
+new-event editor (title, attendees and duration are carried over), or with
+**Find another time with these people** in a meeting's context menu (its
+organizer and attendees except you and rooms, with their required/optional
+roles, its title and duration). Inputs: topic, attendees (the same chips,
+suggestions and directory search as the editor), duration (15–240 minutes in
+15-minute steps), the first day and 1–15 searched days (by default the next
+five workdays from tomorrow), a local daily window (default 08:00–18:00),
+**Weekdays only** and how many candidates to show at least (default 3).
+
+Free/busy for you and every attendee over all searched days comes from one
+read-only `getSchedule` range (at most 22 days, sent in batches of 20 people),
+debounced by 400 ms and superseded by newer searches on the AI worker; the
+search itself runs locally once per answer. Every 15-minute start inside the
+daily window is considered; local times that do not exist or repeat on
+daylight-saving days are skipped, never guessed, and past times are never
+offered. Your busy or out-of-office time is never proposed. Slots are ranked by
+(1) required attendees busy or out of office, (2) you or required attendees
+unknown — unknown is never free, (3) you or required attendees tentative,
+(4) optional attendees who are not free, (5) the 12:00–13:00 lunch hour as a
+soft preference, (6) how many candidates that day already has, so candidates
+spread across days, (7) half-hour starts and time. Candidates of one day are at
+least an hour (or the meeting's length) apart. Every candidate where you and
+every required attendee are free is shown (at most 10); when there are fewer
+than the requested minimum, the best alternatives fill it and the dialog says
+that no time works for every required attendee. Each candidate shows its
+date/time, status icons for you and every attendee (busy, tentative, out of
+office, working elsewhere, free, unknown — the scheduling grid's colors) and a
+short reason such as "All required free · Morgan Lee unknown (optional)" or
+"Jamie Brooks tentative". Select one to five candidates. `findMeetingTimes` is
+not used here: its ranking cannot express required-versus-optional ordering,
+unknown-is-not-free and the lunch and spreading preferences.
+
+With the selection:
+
+- **Create meeting** (exactly one time) opens the new-event editor with the
+  topic, attendees and time; the normal **Create and send invitations**
+  approval applies.
+- **Hold with BLOCKERs** (**Blokovat termíny**) shows "Creates N BLOCKER events
+  in your calendar: busy, no attendees, no Teams meeting and no reminder", every
+  title and time, cached busy events each time overlaps, **Private event** (off
+  by default) and an optional existing category (none by default; no new
+  categories are invented). **Create N BLOCKERs** is the single-use approval.
+  Each event is titled `BLOCKER: <topic>` in both languages; its description
+  lists the topic and duration, the invitees with their addresses (optional
+  ones marked) and all proposed times in the UI language. The storage worker
+  saves the proposal and the event-creation approval before anything is
+  written; the same event-creation pipeline as travel reserves creates one event
+  per time with `create_entity /me/events`, a distinct Graph transaction ID
+  (`<approval>-blocker-<n>`), `showAs=busy`, `isReminderOn=false`, no attendees
+  and no online meeting, and reads each back (you are the organizer, nobody is
+  invited, exact times, title, busy, privacy, category, transaction ID and
+  description) before the next one. A failure stops the remaining ones;
+  verified BLOCKERs stay, failures are reported per time and uncertain outcomes
+  are never replayed (**Messages → Event creation** and **Scheduling
+  proposals**). Each proposal can be held once.
+- **Propose in a Teams group chat** (**Navrhnout ve skupinovém chatu Teams**)
+  first runs a read-only check: WorkIQ `get_schema` for `POST /chats` and
+  `POST /chats/{chat-id}/messages` (a writable `chatType` and members, and a
+  writable message `body`), then resolves every attendee to exactly one user of
+  your organization (`GET /users/{address}`, falling back to
+  `/users?$filter=mail eq '…'`). If the provider does not support chats the
+  action explains why and points to e-mail; if anyone cannot be resolved
+  (external or guest addresses, unknown people), they are listed and nothing
+  can be sent to the reduced group. Otherwise the approval shows the exact
+  members (you plus everyone resolved), the chat topic (the meeting topic; group
+  chats only), the full editable message (a short default in the UI language
+  with the numbered times, each with its own UTC offset in your Windows time
+  zone such as `Tue 4 Nov 10:00–10:30 (UTC+01:00)`, so people in other time
+  zones read them correctly, also after a daylight-saving change) and "This
+  creates a Teams chat and sends this message to N people." Only **Create chat
+  and send** submits, once. With one other
+  person Tomlook uses Graph's one-on-one chat (`chatType: oneOnOne`, exactly two
+  members, no topic), which Teams reuses when it already exists. The typed
+  WorkIQ operations are `create_entity` with parent `/chats`
+  (`chatType`, `topic`, members bound as
+  `aadUserConversationMember` owners via
+  `user@odata.bind: https://graph.microsoft.com/v1.0/users('<id>')`; you are
+  bound by your account) and `create_entity` with parent
+  `/chats/<id>/messages` (`body.contentType=html`, escaped text with line
+  breaks). Before the message is sent the chat's members are read back and must
+  be exactly you plus the approved people; otherwise no message is sent. The
+  message is read back (`GET /chats/<id>/messages/<id>`) and must carry the
+  approved text. The outcome, the chat link (`webUrl`) and any uncertainty are
+  saved on the proposal and shown in Messages; an uncertain or partly completed
+  Teams write is never repeated, and a proposal is sent to Teams at most once
+  (again only if nothing was created). These operations are never offered to a
+  model as tools.
+- **Propose by e-mail** (**Navrhnout e-mailem**) builds local text — subject
+  and body with the numbered times and their UTC offsets, as in the Teams
+  message — with recipient checkboxes, **Copy** and
+  **Open in Outlook** (`mailto:` with the same long-body clipboard fallback as
+  the follow-up e-mail). Tomlook never sends e-mail and never creates drafts.
+
+The actions can be combined; hold the times first so your time is protected,
+then the dialog suggests proposing them in Teams or by e-mail. Once BLOCKERs or
+a Teams proposal were approved, the proposal's topic, attendees and times are
+fixed.
+
+Proposals are saved locally per account in the `proposals` table: identity,
+account, topic, attendees, duration, the proposed times, every BLOCKER (time,
+title, transaction ID, event ID once verified, state and message), the Teams
+outcome (members, topic, message, chat ID, `webUrl`, message ID), the meeting's
+event-creation approval, timestamps and the status (open, scheduled,
+cancelled). At most 200 per account are kept; open ones are never pruned.
+Anything in flight when Tomlook stops becomes uncertain and is never replayed;
+an outcome that arrives after you switched to another calendar account is
+still saved on its proposal.
+
+BLOCKERs Tomlook created show **Proposed time** (**Navržený termín**) on their
+calendar card and in their details, with **Confirm this time** (**Potvrdit
+tento termín**) and **Release all BLOCKERs** (**Uvolnit všechny BLOCKERy**),
+also in the context menu. Confirm opens the new-event editor with the proposal's
+topic and attendees at that BLOCKER's time; once that invitation is created and
+verified, the proposal is marked scheduled and Tomlook offers — never performs
+on its own — to delete this and the sibling BLOCKERs, listing them, with
+**Delete N BLOCKERs** or **Keep them**. Release asks the same with "Deletes N
+BLOCKER events from your calendar. Nobody is notified." and marks the proposal
+cancelled once nothing is held. Deletion reuses the verified owned-appointment
+delete (`delete_entity /me/events/<id>`, removal proven by a single-resource
+404) and deletes only events that are still the BLOCKER Tomlook created: the
+stored event ID, the transaction ID it was created with, the `BLOCKER:` title
+prefix, you as organizer and nobody invited. Each deletion is submitted at most
+once; changed events are left alone and uncertain outcomes need a check in
+Outlook. BLOCKERs count as busy time (focus time, conflicts, your own free/busy)
+like any personal event, but events titled `BLOCKER:` without attendees are not
+meetings: My day leaves them out of its agenda and meeting counts, and the
+weekly review out of attended meetings and meetings without agenda.
+
+The read-only live probe (see above) found, with the saved sign-in, that WorkIQ
+describes both create schemas: `/chats` is `microsoft.graph.chat` with a
+writable `chatType`, `topic`, `members` (conversation members with `roles`)
+and `webUrl`, and `/chats/{chat-id}/messages` is `microsoft.graph.chatMessage`
+with a writable `body` (`content`, `contentType`). That a tenant accepts a
+specific chat, the member binding or the message, and that every attendee can
+be reached in Teams, is only known when the approved write runs.
 
 Right-click a meeting or press **Shift+F10** on the selected meeting to open
 the same native actions. The detail pane also has a **Meeting actions** button.

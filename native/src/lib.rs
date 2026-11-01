@@ -1,5 +1,7 @@
 pub mod ai;
 pub mod ask;
+pub mod attendees;
+pub mod availability;
 pub mod brand;
 pub mod browser;
 pub mod calendar;
@@ -30,6 +32,7 @@ pub mod recommendations;
 pub mod reminders;
 pub mod retry;
 pub mod scheduler;
+pub mod scheduling;
 mod search;
 pub mod showcase;
 pub mod source_index;

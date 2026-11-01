@@ -84,6 +84,8 @@ impl Tomlook {
             });
         if !slash_menu && consume(Modifiers::NONE, Key::Escape) {
             if self.event_draft.take().is_some()
+                || self.blocker_release.take().is_some()
+                || self.find_time.take().is_some()
                 || self.time_drag.take().is_some()
                 || self.meeting_action.take().is_some()
                 || self.meeting_menu.take().is_some()
@@ -144,6 +146,8 @@ impl Tomlook {
             || self.weekly.open
             || self.meeting_action.is_some()
             || self.event_draft.is_some()
+            || self.find_time.is_some()
+            || self.blocker_release.is_some()
             || self.meeting_menu.is_some()
             || self.connection_panel.is_some()
         {
@@ -710,6 +714,9 @@ impl Tomlook {
             if ghost {
                 ui.weak(language.text(event.response_label()));
             }
+            if self.activity.blockers.contains_key(&event.id) {
+                ui.weak(language.text("Proposed time"));
+            }
             if !event.location.is_empty() {
                 ui.label(&event.location);
             }
@@ -854,6 +861,7 @@ impl Tomlook {
                 ui.visuals().text_color(),
             );
             if !ghost && content.bottom() - y - title_height >= 20.0 {
+                let proposed = self.activity.blockers.contains_key(&event.id).then(|| language.text("Proposed time"));
                 let summary = self
                     .briefing
                     .as_ref()
@@ -861,6 +869,7 @@ impl Tomlook {
                     .and_then(|value| language.insight(value))
                     .and_then(|value| value.get("summary"))
                     .and_then(|value| value.as_str())
+                    .or(proposed.as_deref())
                     .unwrap_or(&event.location);
                 if !summary.is_empty() {
                     let mut job = egui::text::LayoutJob::default();

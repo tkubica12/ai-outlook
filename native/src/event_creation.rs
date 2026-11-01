@@ -1,8 +1,12 @@
-use crate::{calendar::Event, i18n::Language};
+use crate::{attendees::Attendee, calendar::Event, i18n::Language};
 use chrono::{DateTime, Duration, FixedOffset, Local, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+/// Added to uncertain outcomes of meetings with attendees: Outlook may already have invited them.
+pub const INVITATIONS_MAY_BE_SENT: &str =
+    "Invitations may already have been sent; check Outlook before retrying.";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Draft {
@@ -15,6 +19,9 @@ pub struct Draft {
     pub teams: bool,
     pub travel_minutes: Option<u16>,
     pub language: Language,
+    /// Invited with the main event only; omitted when empty so earlier approvals keep their identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attendees: Vec<Attendee>,
 }
 
 pub fn personal_category(categories: &[String]) -> Option<String> {
@@ -63,6 +70,7 @@ impl Draft {
             teams: false,
             travel_minutes: Some(minutes),
             language,
+            attendees: Vec::new(),
         };
         draft.validate_with_duration(Duration::days(366))?;
         Ok(draft)
@@ -103,6 +111,7 @@ impl Draft {
         {
             return Err("Travel time must be 15 to 180 minutes in 15-minute steps".into());
         }
+        crate::attendees::validate_list(&self.attendees)?;
         Ok(())
     }
 
@@ -128,6 +137,7 @@ impl Draft {
             category: self.category.clone(),
             private: self.private,
             teams: self.teams,
+            attendees: self.attendees.clone(),
         }];
         if let Some(minutes) = self.travel_minutes {
             let duration = Duration::minutes(i64::from(minutes));
@@ -154,6 +164,7 @@ impl Draft {
                     category: None,
                     private: self.private,
                     teams: false,
+                    attendees: Vec::new(),
                 });
             }
         }
@@ -188,6 +199,8 @@ pub struct Part {
     pub category: Option<String>,
     pub private: bool,
     pub teams: bool,
+    /// Invitees of the main event; travel reserves never have any.
+    pub attendees: Vec<Attendee>,
 }
 
 impl Part {
@@ -196,10 +209,18 @@ impl Part {
             json!({"dateTime":time.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%S").to_string(),
                 "timeZone":"UTC"})
         };
+        let attendees = self
+            .attendees
+            .iter()
+            .map(|attendee| {
+                json!({"emailAddress":{"address":attendee.email,"name":attendee.label()},
+                    "type":attendee.role.graph()})
+            })
+            .collect::<Vec<_>>();
         let mut body = json!({
             "subject":self.title, "body":{"contentType":"text","content":self.description},
             "start":utc(self.start), "end":utc(self.end), "showAs":"busy",
-            "isAllDay":false, "isReminderOn":false, "attendees":[],
+            "isAllDay":false, "isReminderOn":false, "attendees":attendees,
             "categories":self.category.iter().collect::<Vec<_>>(),
             "sensitivity":if self.private {"private"} else {"normal"},
             "isOnlineMeeting":self.teams, "transactionId":self.transaction_id,
@@ -208,6 +229,44 @@ impl Part {
             body["onlineMeetingProvider"] = json!("teamsForBusiness");
         }
         body
+    }
+
+    /// Exactly the intended invitees (case-insensitive address) with their intended types.
+    /// The organizer's own address may be listed by the provider; nobody else may be added.
+    fn attendees_verified(&self, event: &Event) -> bool {
+        if self.attendees.is_empty() {
+            return event.attendee_count() == 0;
+        }
+        if event.attendee_count() != event.attendees.len() {
+            return false;
+        }
+        let organizer = crate::calendar::person_email(&event.organizer);
+        let roles = event
+            .extra
+            .get("tomlook_attendee_roles")
+            .and_then(Value::as_object);
+        let mut actual = std::collections::BTreeMap::new();
+        for person in &event.attendees {
+            let Some(email) = crate::calendar::person_email(person) else {
+                return false;
+            };
+            if organizer.as_ref() == Some(&email)
+                && !self.attendees.iter().any(|attendee| attendee.email == email)
+            {
+                continue;
+            }
+            let role = roles
+                .and_then(|roles| roles.get(&email))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if actual.insert(email, role).is_some() {
+                return false;
+            }
+        }
+        actual.len() == self.attendees.len()
+            && self.attendees.iter().all(|attendee| {
+                actual.get(&attendee.email) == Some(&attendee.role.graph())
+            })
     }
 
     pub fn verified(&self, event: &Event) -> bool {
@@ -236,7 +295,7 @@ impl Part {
         event.title == self.title
             && event.start == self.start
             && event.end == self.end
-            && event.attendee_count() == 0
+            && self.attendees_verified(event)
             && !event.is_all_day
             && extra.get("isOrganizer") == Some(&json!(true))
             && extra.get("showAs") == Some(&json!("busy"))
@@ -287,12 +346,53 @@ pub struct Record {
     pub created_at: DateTime<FixedOffset>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<Event>,
+    /// BLOCKERs of a scheduling proposal: one part per proposed time instead of the draft's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<Hold>,
+}
+
+/// The proposed times a BLOCKER approval holds in your own calendar.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Hold {
+    pub proposal: String,
+    pub slots: Vec<crate::scheduling::Slot>,
 }
 
 impl Record {
     pub fn new(account: String, draft: Draft) -> Result<Self, String> {
         draft.validate()?;
         Self::build(account, draft)
+    }
+
+    /// One busy BLOCKER per proposed time: no attendees, no Teams, no travel, no reminder. The
+    /// approval binds the proposal, every time and the exact text.
+    pub fn blockers(
+        account: String,
+        proposal: String,
+        draft: Draft,
+        slots: Vec<crate::scheduling::Slot>,
+    ) -> Result<Self, String> {
+        draft.validate()?;
+        let first = slots.first().ok_or("Select 1 to 5 times")?;
+        if slots.len() > crate::scheduling::MAX_SELECTED
+            || slots.windows(2).any(|pair| pair[0] >= pair[1])
+            || slots.iter().any(|slot| slot.end <= slot.start || slot.end - slot.start > Duration::hours(4))
+            || (first.start, first.end) != (draft.start, draft.end)
+            || !draft.title.starts_with(crate::scheduling::BLOCKER_PREFIX)
+            || !draft.attendees.is_empty()
+            || draft.teams
+            || draft.travel_minutes.is_some()
+            || proposal.len() != 32
+            || !proposal.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("BLOCKER approval does not match its proposal".into());
+        }
+        let mut record = Self::build(account, draft)?;
+        let identity = serde_json::to_vec(&(&record.account, "blockers", &proposal, &slots, &record.draft))
+            .map_err(|_| "Encode event creation approval failed")?;
+        record.id = format!("{:x}", Sha256::digest(identity));
+        record.hold = Some(Hold { proposal, slots });
+        Ok(record)
     }
 
     fn build(account: String, draft: Draft) -> Result<Self, String> {
@@ -311,6 +411,7 @@ impl Record {
             message: String::new(),
             created_at: Local::now().fixed_offset(),
             parent: None,
+            hold: None,
         })
     }
 
@@ -344,16 +445,36 @@ impl Record {
                     .ok_or("Travel time is unavailable")?,
                 self.draft.language,
             )?
+        } else if let Some(hold) = &self.hold {
+            Self::blockers(self.account.clone(), hold.proposal.clone(), self.draft.clone(), hold.slots.clone())?
         } else {
             Self::new(self.account.clone(), self.draft.clone())?
         };
-        if self.id != expected.id || self.draft != expected.draft {
+        if self.id != expected.id || self.draft != expected.draft || self.hold != expected.hold {
             return Err("Calendar account or event creation approval changed".into());
         }
         Ok(())
     }
 
     pub fn parts(&self) -> Vec<Part> {
+        if let Some(hold) = &self.hold {
+            return hold
+                .slots
+                .iter()
+                .enumerate()
+                .map(|(index, slot)| Part {
+                    transaction_id: format!("{}-blocker-{index}", self.id),
+                    title: self.draft.title.clone(),
+                    description: self.draft.description.clone(),
+                    start: slot.start,
+                    end: slot.end,
+                    category: self.draft.category.clone(),
+                    private: self.draft.private,
+                    teams: false,
+                    attendees: Vec::new(),
+                })
+                .collect();
+        }
         self.draft
             .parts(&self.id)
             .into_iter()
@@ -362,6 +483,14 @@ impl Record {
     }
 
     pub fn label(&self) -> &'static str {
+        if self.hold.is_some() {
+            return match self.state {
+                State::Creating => "Creating BLOCKERs",
+                State::Created => "BLOCKERs created",
+                State::NotSent => "BLOCKERs not created",
+                State::Review => "Check BLOCKERs in Outlook",
+            };
+        }
         if self.parent.is_none() {
             return self.state.label();
         }
@@ -370,6 +499,15 @@ impl Record {
             State::Created => "Travel blocks created",
             State::NotSent => "Travel blocks not created",
             State::Review => "Check travel blocks in Outlook",
+        }
+    }
+
+    /// An outcome that needs review; with attendees it says invitations may already be out.
+    pub fn review_message(&self, message: &str) -> String {
+        if self.draft.attendees.is_empty() || message.contains(INVITATIONS_MAY_BE_SENT) {
+            message.to_owned()
+        } else {
+            format!("{message}\n{INVITATIONS_MAY_BE_SENT}")
         }
     }
 }
@@ -396,7 +534,112 @@ pub(crate) mod tests {
             teams: true,
             travel_minutes: Some(30),
             language: Language::En,
+            attendees: Vec::new(),
         }
+    }
+
+    pub fn invited() -> Draft {
+        let mut value = draft();
+        value.attendees = crate::attendees::parse_input(
+            "Alex Rivers <alex@example.com>; jamie@example.com",
+        )
+        .unwrap();
+        value.attendees[1].role = crate::attendees::Role::Optional;
+        value
+    }
+
+    /// What Graph returns for a created part: its body as the provider read it back.
+    pub fn readback(part: &Part, change: impl FnOnce(&mut Value)) -> Event {
+        let mut body = part.body();
+        body["id"] = json!("created");
+        body["isOrganizer"] = json!(true);
+        body["organizer"] = json!({"emailAddress":{"name":"Me","address":"me@example.com"}});
+        if part.teams {
+            body["onlineMeeting"] = json!({"joinUrl":"https://teams.microsoft.com/l/meetup-join/example"});
+        }
+        change(&mut body);
+        crate::workiq::connection::calendar_write::parse_event_for_tests(body).unwrap()
+    }
+
+    #[test]
+    fn invitations_go_only_to_the_main_event_and_old_approvals_keep_their_identity() {
+        let value = invited();
+        value.validate_categories(&["osobní".into()]).unwrap();
+        let parts = value.parts("approval");
+        assert_eq!(parts[0].body()["attendees"], json!([
+            {"emailAddress":{"address":"alex@example.com","name":"Alex Rivers"},"type":"required"},
+            {"emailAddress":{"address":"jamie@example.com","name":"jamie@example.com"},"type":"optional"}
+        ]));
+        for part in &parts[1..] {
+            assert!(part.attendees.is_empty());
+            assert_eq!(part.body()["attendees"], json!([]), "Travel reserves never invite anyone");
+        }
+        let plain = Record::new("owner".into(), draft()).unwrap();
+        assert!(serde_json::to_value(&plain.draft).unwrap().get("attendees").is_none());
+        let with = Record::new("owner".into(), value.clone()).unwrap();
+        assert_ne!(plain.id, with.id, "The approval binds the exact invitee set");
+        let mut changed = value.clone();
+        changed.attendees[1].role = crate::attendees::Role::Required;
+        assert_ne!(Record::new("owner".into(), changed).unwrap().id, with.id);
+        let restored: Record = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored.draft.attendees, value.attendees);
+        let mut invalid = value.clone();
+        invalid.attendees.push(invalid.attendees[0].clone());
+        assert!(invalid.validate().is_err());
+        let mut invalid = value;
+        invalid.attendees = (0..=crate::attendees::LIMIT)
+            .map(|index| crate::attendees::Attendee::new(&format!("p{index}@example.com"), "", Default::default()).unwrap())
+            .collect();
+        assert!(invalid.validate().is_err());
+        assert!(Draft::travel(&parent(), 30, Language::En).unwrap().attendees.is_empty());
+    }
+
+    #[test]
+    fn readback_requires_the_exact_attendee_set_and_types_and_reserves_stay_attendee_free() {
+        let parts = invited().parts("approval");
+        let main = &parts[0];
+        assert!(main.verified(&readback(main, |_| {})));
+        assert!(main.verified(&readback(main, |body| {
+            body["attendees"][0]["emailAddress"]["address"] = json!("ALEX@Example.com");
+        })), "Addresses compare case-insensitively");
+        assert!(main.verified(&readback(main, |body| {
+            body["attendees"].as_array_mut().unwrap().push(
+                json!({"emailAddress":{"address":"me@example.com","name":"Me"},"type":"required"}));
+        })), "The organizer may be listed by the provider");
+        for (case, change) in [
+            ("missing attendee", Box::new(|body: &mut Value| { body["attendees"].as_array_mut().unwrap().pop(); }) as Box<dyn Fn(&mut Value)>),
+            ("extra attendee", Box::new(|body: &mut Value| { body["attendees"].as_array_mut().unwrap().push(
+                json!({"emailAddress":{"address":"eve@example.com"},"type":"required"})); })),
+            ("type mismatch", Box::new(|body: &mut Value| { body["attendees"][1]["type"] = json!("required"); })),
+            ("missing type", Box::new(|body: &mut Value| { body["attendees"][0]["type"] = json!(""); })),
+            ("duplicate", Box::new(|body: &mut Value| { let first = body["attendees"][0].clone();
+                body["attendees"].as_array_mut().unwrap().push(first); })),
+            ("not organizer", Box::new(|body: &mut Value| { body["isOrganizer"] = json!(false); })),
+            ("no attendees", Box::new(|body: &mut Value| { body["attendees"] = json!([]); })),
+        ] {
+            assert!(!main.verified(&readback(main, change)), "{case} must not verify");
+        }
+        for part in &parts[1..] {
+            assert!(part.verified(&readback(part, |_| {})));
+            assert!(!part.verified(&readback(part, |body| {
+                body["attendees"] = json!([{"emailAddress":{"address":"alex@example.com"},"type":"required"}]);
+            })), "Travel reserves must have zero attendees");
+        }
+        let plain = draft().parts("approval");
+        assert!(!plain[0].verified(&readback(&plain[0], |body| {
+            body["attendees"] = json!([{"emailAddress":{"address":"alex@example.com"},"type":"required"}]);
+        })));
+    }
+
+    #[test]
+    fn uncertain_outcomes_with_attendees_warn_that_invitations_may_be_out() {
+        let record = Record::new("owner".into(), invited()).unwrap();
+        let message = record.review_message("Calendar write outcome is uncertain.");
+        assert_eq!(message, format!("Calendar write outcome is uncertain.\n{INVITATIONS_MAY_BE_SENT}"));
+        assert_eq!(record.review_message(&message), message, "Never repeated");
+        let plain = Record::new("owner".into(), draft()).unwrap();
+        assert_eq!(plain.review_message("Uncertain."), "Uncertain.");
     }
 
     pub fn parent() -> Event {

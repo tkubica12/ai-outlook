@@ -111,6 +111,47 @@ pub enum Command {
     ContextSources(crate::source_index::Config),
     DailyAiLimit(u32),
     Photos(Vec<String>),
+    /// Read-only directory search for the attendee field; a newer search supersedes older ones.
+    People {
+        id: u64,
+        query: String,
+        own: Vec<String>,
+    },
+    /// Read-only free/busy (`getSchedule`) for the new-event editor.
+    Availability {
+        id: u64,
+        request: Box<crate::availability::ScheduleRequest>,
+    },
+    /// Read-only meeting time suggestions (`findMeetingTimes`) for the new-event editor.
+    MeetingTimes {
+        id: u64,
+        request: Box<crate::availability::MeetingTimesRequest>,
+    },
+    /// Whether the connected provider accepts attendees on new events; reads its schema only.
+    InvitationCapability(String),
+    /// Read-only free/busy over the searched days of **Find a time**.
+    GroupAvailability {
+        id: u64,
+        request: Box<crate::availability::ScheduleRequest>,
+    },
+    /// Read-only Teams check: chat support and the attendees' directory identities.
+    ChatCheck {
+        id: u64,
+        account: String,
+        emails: Vec<String>,
+    },
+    /// The explicitly approved Teams proposal: one new chat and one message.
+    ProposeChat {
+        request: Box<crate::scheduling::ChatRequest>,
+        reply: async_mpsc::Sender<crate::scheduling::ChatResult>,
+        wake: std::sync::mpsc::SyncSender<crate::worker::Command>,
+    },
+    /// The explicitly approved deletion of held BLOCKERs.
+    ReleaseBlockers {
+        request: Box<crate::scheduling::ReleaseRequest>,
+        reply: async_mpsc::Sender<crate::scheduling::ReleaseResult>,
+        wake: std::sync::mpsc::SyncSender<crate::worker::Command>,
+    },
     Companies(Vec<String>),
     SuggestPrompt(Box<crate::feedback::SuggestionRequest>),
     FollowUp(Box<crate::followup::Request>),
@@ -229,6 +270,30 @@ pub enum Notice {
         result: Result<Vec<crate::chat::Checkpoint>, String>,
     },
     Photos(Vec<(String, Result<Option<egui::ColorImage>, String>)>),
+    People {
+        id: u64,
+        result: Result<Vec<crate::attendees::Person>, String>,
+    },
+    Availability {
+        id: u64,
+        result: Result<Arc<crate::availability::Availability>, String>,
+    },
+    MeetingTimes {
+        id: u64,
+        result: Result<crate::availability::MeetingTimes, String>,
+    },
+    InvitationCapability {
+        account: String,
+        result: Result<(), String>,
+    },
+    GroupAvailability {
+        id: u64,
+        result: Result<Arc<crate::availability::Availability>, String>,
+    },
+    ChatCheck {
+        id: u64,
+        result: Result<crate::scheduling::ChatCheck, String>,
+    },
     Companies(Vec<(String, Result<Option<egui::ColorImage>, String>)>),
     PromptSuggestion {
         id: u64,
@@ -284,6 +349,12 @@ struct Pending {
     chat_progress: BTreeMap<u64, Notice>,
     chat_recovered: Option<Notice>,
     photos: Option<Notice>,
+    people: Option<Notice>,
+    availability: Option<Notice>,
+    meeting_times: Option<Notice>,
+    invitation_capability: Option<Notice>,
+    group_availability: Option<Notice>,
+    chat_check: Option<Notice>,
     companies: Option<Notice>,
     prompt_suggestion: Option<Notice>,
     followup: Option<Notice>,
@@ -304,6 +375,12 @@ impl Pending {
             .or_else(|| self.chat_progress.pop_first().map(|(_, notice)| notice))
             .or_else(|| self.chat_recovered.take())
             .or_else(|| self.photos.take())
+            .or_else(|| self.invitation_capability.take())
+            .or_else(|| self.people.take())
+            .or_else(|| self.availability.take())
+            .or_else(|| self.meeting_times.take())
+            .or_else(|| self.group_availability.take())
+            .or_else(|| self.chat_check.take())
             .or_else(|| self.companies.take())
             .or_else(|| self.prompt_suggestion.take())
             .or_else(|| self.followup.take())
@@ -355,6 +432,12 @@ impl Notices {
             Notice::ChatRecovered { .. } => pending.chat_recovered = Some(notice),
             Notice::Stopped => pending.stopped = true,
             Notice::Photos(_) => pending.photos = Some(notice),
+            Notice::People { .. } => pending.people = Some(notice),
+            Notice::Availability { .. } => pending.availability = Some(notice),
+            Notice::MeetingTimes { .. } => pending.meeting_times = Some(notice),
+            Notice::InvitationCapability { .. } => pending.invitation_capability = Some(notice),
+            Notice::GroupAvailability { .. } => pending.group_availability = Some(notice),
+            Notice::ChatCheck { .. } => pending.chat_check = Some(notice),
             Notice::Companies(_) => pending.companies = Some(notice),
             Notice::PromptSuggestion { .. } => pending.prompt_suggestion = Some(notice),
             Notice::FollowUp { .. } => pending.followup = Some(notice),
@@ -449,6 +532,8 @@ enum Completion {
         result: Result<crate::source_index::Report, String>,
     },
     Companies(Vec<(String, Result<Option<egui::ColorImage>, String>)>),
+    /// A finished editor lookup (people, availability, suggestions or invitation capability).
+    Lookup(Box<Notice>),
     Photos {
         generation: u64,
         result: Vec<(String, Result<Option<egui::ColorImage>, String>)>,
@@ -518,6 +603,23 @@ impl RequestError {
             Self::Operation(message) => message,
             Self::Quota(_) => crate::telemetry::QUOTA_REACHED.into(),
         }
+    }
+}
+
+/// One editor lookup; a newer lookup of the same kind or shutdown drops it before it finishes.
+async fn editor_lookup<T>(
+    mut superseded: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
+    operation: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    if *shutdown.borrow() || *superseded.borrow() {
+        return Err("Lookup cancelled before it was sent".into());
+    }
+    tokio::select! {
+        biased;
+        _ = superseded.changed() => Err("Superseded by a newer lookup".into()),
+        _ = shutdown.changed() => Err("Tomlook is stopping".into()),
+        result = operation => result,
     }
 }
 
@@ -619,6 +721,7 @@ impl Engine {
                 let mut next_source_refresh = tokio::time::Instant::now();
                 let mut photos_busy = false;
                 let mut photos_queue: Vec<String> = Vec::new();
+                let mut lookup_cancels = BTreeMap::<&'static str, watch::Sender<bool>>::new();
                 let mut companies_busy = false;
                 let mut ai_login_cancel: Option<watch::Sender<bool>> = None;
                 let mut auto_login_cancel: Option<watch::Sender<bool>> = None;
@@ -1017,6 +1120,75 @@ impl Engine {
                                         Completion::CalendarDelivered { admitted, result }
                                     });
                                 }
+                                Some(Command::ProposeChat { request, reply, wake }) => {
+                                    // Contacts other people: serialized with calendar writes, never replayed.
+                                    let connection = workiq.clone().filter(|connection| !demo && !calendar_mutating
+                                        && connection.is_active() && connection.account == request.account);
+                                    let admitted = connection.is_some();
+                                    if admitted { calendar_mutating = true; }
+                                    let telemetry = telemetry.clone();
+                                    tasks.spawn(async move {
+                                        use crate::scheduling::{ChatResult, ChatState};
+                                        let outcome = match connection {
+                                            Some(connection) => {
+                                                telemetry.record("teams", "confirmed_chat_started", None, 0);
+                                                match tokio::time::timeout(Duration::from_secs(240),
+                                                    crate::workiq::connection::chat_write::propose(connection.as_ref(), &request)).await {
+                                                    Ok(outcome) => outcome,
+                                                    Err(_) => ChatResult { proposal: request.proposal.clone(), state: ChatState::Review,
+                                                        chat_id: None, web_url: None, message_id: None,
+                                                        message: crate::scheduling::UNCERTAIN_CHAT.into() },
+                                                }
+                                            }
+                                            None => ChatResult { proposal: request.proposal.clone(), state: ChatState::NotSent,
+                                                chat_id: None, web_url: None, message_id: None,
+                                                message: "Teams writes are unavailable or busy; nothing was sent".into() },
+                                        };
+                                        telemetry.record("teams", match outcome.state {
+                                            ChatState::Sent => "chat_readback_verified",
+                                            ChatState::NotSent => "chat_not_sent_or_rejected",
+                                            _ => "chat_requires_review",
+                                        }, None, 0);
+                                        let result = tokio::time::timeout(Duration::from_secs(10), reply.send(outcome)).await
+                                            .map_err(|_| "Teams outcome delivery timed out".to_owned())
+                                            .and_then(|result| result.map_err(|_| "Teams outcome could not reach storage".to_owned()));
+                                        let _ = wake.try_send(crate::worker::Command::Wake);
+                                        Completion::CalendarDelivered { admitted, result }
+                                    });
+                                }
+                                Some(Command::ReleaseBlockers { request, reply, wake }) => {
+                                    let connection = workiq.clone().filter(|connection| !demo && !calendar_mutating
+                                        && connection.is_active() && connection.account == request.account);
+                                    let admitted = connection.is_some();
+                                    if admitted { calendar_mutating = true; }
+                                    let telemetry = telemetry.clone();
+                                    tasks.spawn(async move {
+                                        use crate::scheduling::{BlockerState, ReleaseOutcome, ReleaseResult};
+                                        let unsent = |message: &str| ReleaseResult { proposal: request.proposal.clone(),
+                                            outcomes: request.blockers.iter().filter_map(|blocker| blocker.event_id.clone())
+                                                .map(|event_id| ReleaseOutcome { event_id, state: BlockerState::Held, message: message.into() }).collect() };
+                                        let outcome = match connection {
+                                            Some(connection) => {
+                                                telemetry.record("calendar", "confirmed_release_started", None, 0);
+                                                let run = crate::workiq::connection::calendar_write::release_blockers(connection.as_ref(), &request);
+                                                match tokio::time::timeout(Duration::from_secs(300), run).await {
+                                                    Ok(outcome) => outcome,
+                                                    Err(_) => {
+                                                        let mut uncertain = unsent(crate::scheduling::UNCERTAIN_RELEASE);
+                                                        uncertain.outcomes.iter_mut().for_each(|outcome| outcome.state = BlockerState::ReleaseReview);
+                                                        uncertain
+                                                    }
+                                                }
+                                            }
+                                            None => unsent("Calendar writes are unavailable or busy; nothing was deleted"),
+                                        };
+                                        let result = tokio::time::timeout(Duration::from_secs(10), reply.send(outcome)).await
+                                            .map_err(|_| "BLOCKER release outcome delivery timed out".to_owned())
+                                            .and_then(|result| result.map_err(|_| "BLOCKER release outcome could not reach storage".to_owned()));
+                                        let _ = wake.try_send(crate::worker::Command::Wake);
+                                        Completion::CalendarDelivered { admitted, result }
+                                    });
+                                }
                                 Some(Command::DailyAiLimit(limit)) => {
                                     if let Err(error) = telemetry.set_limit(limit) {
                                         telemetry.failure("accounting", &error, None);
@@ -1097,6 +1269,58 @@ impl Engine {
                                     if !demo && emails.len() <= 8 && workiq.as_ref().is_some_and(|connection| connection.is_active()) {
                                         photos_queue = emails;
                                     } else { notify(Notice::Photos(emails.into_iter().take(8).map(|email| (email, Err("Connect WorkIQ to load photos".into()))).collect())); }
+                                }
+                                Some(command @ (Command::People { .. } | Command::Availability { .. } | Command::MeetingTimes { .. } | Command::InvitationCapability(_)
+                                    | Command::GroupAvailability { .. } | Command::ChatCheck { .. })) => {
+                                    // Editor lookups are reads only; the preview never reaches WorkIQ.
+                                    let connection = workiq.clone().filter(|connection| !demo && connection.is_active());
+                                    let kind = match &command {
+                                        Command::People { .. } => "people",
+                                        Command::Availability { .. } => "availability",
+                                        Command::MeetingTimes { .. } => "times",
+                                        Command::GroupAvailability { .. } => "group",
+                                        Command::ChatCheck { .. } => "chat",
+                                        _ => "capability",
+                                    };
+                                    let (cancel, cancelled) = watch::channel(false);
+                                    if let Some(previous) = lookup_cancels.insert(kind, cancel) { let _ = previous.send(true); }
+                                    let shutdown = stopped.clone();
+                                    tasks.spawn(async move {
+                                        let unavailable = || if demo { "Synthetic preview never fetches live WorkIQ data.".to_owned() } else { "Connect WorkIQ to look up people and availability".to_owned() };
+                                        let notice = match command {
+                                            Command::People { id, query, own } => Notice::People { id, result: match connection {
+                                                Some(connection) => editor_lookup(cancelled, shutdown, connection.people(&query, &own)).await,
+                                                None => Err(unavailable()),
+                                            } },
+                                            Command::Availability { id, request } => Notice::Availability { id, result: match connection {
+                                                Some(connection) => editor_lookup(cancelled, shutdown, connection.schedule(&request)).await.map(Arc::new),
+                                                None => Err(unavailable()),
+                                            } },
+                                            Command::MeetingTimes { id, request } => Notice::MeetingTimes { id, result: match connection {
+                                                Some(connection) => editor_lookup(cancelled, shutdown, connection.meeting_times(&request)).await,
+                                                None => Err(unavailable()),
+                                            } },
+                                            Command::GroupAvailability { id, request } => Notice::GroupAvailability { id, result: match connection {
+                                                Some(connection) => editor_lookup(cancelled, shutdown, connection.schedule(&request)).await.map(Arc::new),
+                                                None => Err(unavailable()),
+                                            } },
+                                            Command::ChatCheck { id, account, emails } => Notice::ChatCheck { id, result: match connection.filter(|connection| connection.account == account) {
+                                                Some(connection) => editor_lookup(cancelled, shutdown,
+                                                    crate::workiq::connection::chat_write::check(&connection, &emails)).await,
+                                                None => Err(unavailable()),
+                                            } },
+                                            Command::InvitationCapability(account) => {
+                                                let result = match connection.filter(|connection| connection.account == account) {
+                                                    Some(connection) => editor_lookup(cancelled, shutdown,
+                                                        crate::workiq::connection::calendar_write::invitation_capability(&connection)).await,
+                                                    None => Err(unavailable()),
+                                                };
+                                                Notice::InvitationCapability { account, result }
+                                            }
+                                            _ => unreachable!("Only editor lookups are matched"),
+                                        };
+                                        Completion::Lookup(Box::new(notice))
+                                    });
                                 }
                                 Some(Command::ContextSources(config)) => {
                                     if config != source_config || source_index.is_none() {
@@ -1569,6 +1793,9 @@ impl Engine {
                                 Some(Ok(Completion::Companies(results))) => {
                                     companies_busy = false;
                                     notify(Notice::Companies(results));
+                                }
+                                Some(Ok(Completion::Lookup(notice))) => {
+                                    if !stopping { notify(*notice); }
                                 }
                                 Some(Ok(Completion::Photos { generation, result })) => {
                                     photos_busy = false;

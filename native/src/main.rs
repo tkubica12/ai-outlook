@@ -99,7 +99,7 @@ fn parse_options(
                     &args
                         .next()
                         .and_then(|value| value.into_string().ok())
-                        .ok_or("--demo-scene needs details, feedback, prompts, tasks, followup, myday, notifications or weekly")?,
+                        .ok_or("--demo-scene needs details, feedback, prompts, tasks, followup, myday, notifications, weekly, invite, findtime or teams")?,
                 )?);
             }
             Some("--fixture-cache") => fixture_cache = true,

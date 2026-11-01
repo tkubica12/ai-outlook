@@ -18,6 +18,8 @@ use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
 #[path = "calendar_write.rs"]
 pub mod calendar_write;
+#[path = "chat_write.rs"]
+pub mod chat_write;
 #[path = "cloud.rs"]
 pub mod cloud;
 #[path = "meeting_notes.rs"]
@@ -35,6 +37,8 @@ pub(super) const READ_TOO_LARGE: &str =
 struct ReadSlots {
     calendar: Semaphore,
     research: Semaphore,
+    /// Interactive editor lookups (people search, availability) never wait behind research.
+    lookup: Semaphore,
 }
 
 impl ReadSlots {
@@ -42,6 +46,7 @@ impl ReadSlots {
         Self {
             calendar: Semaphore::new(1),
             research: Semaphore::new(1),
+            lookup: Semaphore::new(1),
         }
     }
 
@@ -55,6 +60,7 @@ impl ReadSlots {
     fn close(&self) {
         self.calendar.close();
         self.research.close();
+        self.lookup.close();
     }
 }
 
@@ -432,6 +438,109 @@ impl Connection {
         tokio::task::spawn_blocking(move || decode_photo(&value))
             .await
             .map_err(|_| "Photo decoder stopped")?
+    }
+
+    /// Read-only directory search for the attendee field: bounded `/me/people` results.
+    pub async fn people(
+        &self,
+        query: &str,
+        own: &[String],
+    ) -> Result<Vec<crate::attendees::Person>, String> {
+        let resource = crate::attendees::people_resource(query)?;
+        let data = self
+            .fetch_resource_in(&resource, &self.admission.lookup)
+            .await?;
+        crate::attendees::parse_people(&data, own)
+    }
+
+    /// Free/busy of you and the attendees: Graph's read-only `getSchedule` action, in batches of
+    /// at most 20 people as Graph requires.
+    pub async fn schedule(
+        &self,
+        request: &crate::availability::ScheduleRequest,
+    ) -> Result<crate::availability::Availability, String> {
+        request.validate()?;
+        let mut parts = Vec::new();
+        for batch in request.batches() {
+            let value = self.read_action(ReadAction::Schedule, batch.body()).await?;
+            parts.push(crate::availability::parse_schedule(&batch, &value)?);
+        }
+        crate::availability::Availability::merge(parts)
+    }
+
+    /// Suggested meeting times: Graph's read-only `findMeetingTimes` action.
+    pub async fn meeting_times(
+        &self,
+        request: &crate::availability::MeetingTimesRequest,
+    ) -> Result<crate::availability::MeetingTimes, String> {
+        request.validate()?;
+        let value = self
+            .read_action(ReadAction::MeetingTimes, request.body())
+            .await?;
+        crate::availability::parse_meeting_times(&value)
+    }
+
+    /// One of the fixed read-only Graph POST actions through `do_action`; no other action path
+    /// or body can reach the provider from here.
+    async fn read_action(&self, action: ReadAction, body: Value) -> Result<Value, String> {
+        if !self.calendar_write_tools.contains("do_action") {
+            return Err("WorkIQ does not offer availability lookups on this connection".into());
+        }
+        let _permit = ReadSlots::acquire(&self.admission.lookup).await?;
+        tokio::time::timeout(Timeout::from_secs(30), async {
+            if !self.is_active() {
+                return Err("WorkIQ is disconnected; sign in again".into());
+            }
+            let body = if self.calendar_action_body_is_string {
+                Value::String(body.to_string())
+            } else {
+                body
+            };
+            let arguments = json!({"actionUrl": action.path(), "jsonBody": body})
+                .as_object()
+                .cloned()
+                .ok_or("Invalid availability request")?;
+            let result = self
+                .peer
+                .call_tool(CallToolRequestParams::new("do_action").with_arguments(arguments))
+                .await
+                .map_err(|error| self.request_error(error, "availability"))?;
+            let payload = hosted::read_json_payload(&result)?;
+            match (payload.get("statusCode").and_then(Value::as_u64), result.is_error == Some(true)) {
+                (Some(401), _) => {
+                    self.active.store(false, Ordering::Release);
+                    Err("WorkIQ authorization expired; sign in again".into())
+                }
+                (Some(403), _) => Err("Availability lookups are not permitted for this account".into()),
+                (Some(200) | None, false) => match payload.get("data") {
+                    Some(Value::String(text)) => serde_json::from_str(text)
+                        .map_err(|_| "Availability response is not valid JSON".to_owned()),
+                    Some(data) if data.is_object() => Ok(data.clone()),
+                    _ => Ok(payload),
+                },
+                (Some(status), _) if status != 200 => {
+                    Err(format!("Availability lookup returned HTTP {status}"))
+                }
+                _ => Err("Availability lookup returned a tool error; provider details withheld".into()),
+            }
+        })
+        .await
+        .map_err(|_| "Availability lookup exceeded its 30-second deadline")?
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReadAction {
+    Schedule,
+    MeetingTimes,
+}
+
+impl ReadAction {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Schedule => "/me/calendar/getSchedule",
+            Self::MeetingTimes => "/me/findMeetingTimes",
+        }
     }
 }
 

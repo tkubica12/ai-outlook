@@ -127,6 +127,8 @@ pub(crate) fn fingerprint_for(event: &Event, analysis_revision: &str) -> String 
 
 pub fn eligible(event: &Event, now: DateTime<FixedOffset>) -> bool {
     event.accepted()
+        // A proposal's BLOCKER only holds time; it has nothing to prepare.
+        && !crate::scheduling::is_blocker(event)
         && event.end > now
         && now
             .date_naive()
@@ -1107,6 +1109,20 @@ mod tests {
                 assert!(actual.current(running).is_none());
             }
         }
+    }
+
+    #[test]
+    fn proposal_blockers_are_never_prepared_automatically() {
+        let now = Local::now().fixed_offset();
+        let mut event = crate::calendar::fixture(1).remove(0);
+        event.start = now + Duration::hours(2);
+        event.end = event.start + Duration::minutes(30);
+        event.attendees.clear();
+        event.extra.remove("tomlook_attendees_total");
+        assert!(eligible(&event, now), "An ordinary accepted personal event stays eligible");
+        event.title = crate::scheduling::blocker_title("Pilot retrospective");
+        assert!(crate::scheduling::is_blocker(&event));
+        assert!(!eligible(&event, now));
     }
 
     #[test]

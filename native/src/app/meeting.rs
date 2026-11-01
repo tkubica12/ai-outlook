@@ -178,6 +178,31 @@ impl Tomlook {
                 response.on_hover_text(language.text(&error));
             }
         }
+        if self.has_other_people(event)
+            && ui.button(language.text("Find another time with these people"))
+                .on_hover_text(language.text("Opens Find a time with this meeting's people, title and duration"))
+                .clicked()
+        {
+            self.open_find_time_for(event);
+            ui.close();
+        }
+        if let Some((proposal, _)) = self.blocker_proposal(&event.id)
+            && proposal.status == tomlook::scheduling::ProposalStatus::Open
+        {
+            let proposal = proposal.id.clone();
+            ui.separator();
+            ui.weak(language.text("Proposed time"));
+            if ui.add_enabled(ready, egui::Button::new(language.text("Confirm this time")))
+                .on_hover_text(language.text("Opens the invitation with the proposal's attendees at this time"))
+                .clicked() {
+                self.confirm_blocker(event);
+                ui.close();
+            }
+            if ui.add_enabled(ready, egui::Button::new(language.text("Release all BLOCKERs"))).clicked() {
+                self.open_release(&proposal, true);
+                ui.close();
+            }
+        }
         for response in [
             MeetingResponse::Accept,
             MeetingResponse::Tentative,
@@ -359,6 +384,30 @@ impl Tomlook {
         if ended { ui.strong(language.text("Meeting ended")); }
         if event.extra.get("sensitivity").and_then(serde_json::Value::as_str) == Some("private") {
             ui.weak(language.text("Private event"));
+        }
+        if let Some((proposal, _)) = self.blocker_proposal(&event.id) {
+            let (id, topic, open) = (proposal.id.clone(), proposal.topic.clone(),
+                proposal.status == tomlook::scheduling::ProposalStatus::Open);
+            let ready = self.workiq_ready && self.ai.is_some() && self.calendar_owner.is_some() && !self.preview;
+            egui::Frame::new().fill(self.accent().gamma_multiply(0.18)).corner_radius(6)
+                .inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
+                    ui.strong(language.text("Proposed time"));
+                    ui.weak(format!("{}: {topic}", language.text("Held by Tomlook for")));
+                    if open {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.add_enabled(ready, egui::Button::new(language.text("Confirm this time")))
+                                .on_disabled_hover_text(language.text(if self.preview { "The offline demo never changes a calendar or contacts anyone." } else { "Connect WorkIQ before confirming a calendar change" }))
+                                .clicked() {
+                                self.confirm_blocker(&event);
+                            }
+                            if ui.add_enabled(ready, egui::Button::new(language.text("Release all BLOCKERs")))
+                                .on_disabled_hover_text(language.text(if self.preview { "The offline demo never changes a calendar or contacts anyone." } else { "Connect WorkIQ before confirming a calendar change" }))
+                                .clicked() {
+                                self.open_release(&id, true);
+                            }
+                        });
+                    }
+                });
         }
         if !ended && let Some(url) = event.join_url()
             && ui.button(language.text("Join Teams meeting")).clicked()

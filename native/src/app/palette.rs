@@ -10,6 +10,7 @@ pub(super) enum PaletteCommand {
     Ask,
     Tasks,
     AddTask,
+    FindTime,
     Prepare,
     Settings,
     Theme,
@@ -31,6 +32,7 @@ impl PaletteCommand {
             Self::Ask => "Ask a question",
             Self::Tasks => "Open tasks",
             Self::AddTask => "Add task",
+            Self::FindTime => "Find a time",
             Self::Prepare => "Research selected meeting now",
             Self::Settings => "Insights activity",
             Self::Theme => "Toggle dark / light",
@@ -59,6 +61,7 @@ pub(super) fn command_matches_in(query: &str, language: tomlook::i18n::Language)
         PaletteCommand::Ask,
         PaletteCommand::Tasks,
         PaletteCommand::AddTask,
+        PaletteCommand::FindTime,
         PaletteCommand::Prepare,
         PaletteCommand::Settings,
         PaletteCommand::Theme,
@@ -109,6 +112,7 @@ impl Tomlook {
             }
             PaletteCommand::Tasks => self.open_tasks(false),
             PaletteCommand::AddTask => self.open_tasks(true),
+            PaletteCommand::FindTime => self.open_find_time("", Vec::new(), 30),
             PaletteCommand::Prepare => {
                 if let Some(index) = self.selected {
                     self.request_insights(self.calendar.events[index].id.clone());

@@ -12,6 +12,7 @@ use std::time::Duration;
 pub const POLICY_BLOCKED: &str = "WorkIQ denied this calendar change. Your tenant may block mutations; an administrator must enable calendar writes. Nothing was changed by this request.";
 pub const UNCERTAIN: &str = "Calendar write outcome is uncertain. Inspect Outlook before proposing another change; this operation will not be replayed automatically.";
 pub const MEETING_CHANGED: &str = "Meeting changed after the recommendation; no calendar write was submitted";
+pub const INVITATIONS_UNSUPPORTED: &str = "Your calendar provider does not accept attendees on new events through Tomlook; remove the attendees or invite them in Outlook";
 
 #[derive(Clone, Debug)]
 pub enum Outcome {
@@ -96,7 +97,7 @@ pub trait Api: Send + Sync {
     async fn removed(&self, _id: &str) -> Result<bool, String> {
         Err("Calendar removal read-back is unavailable".into())
     }
-    async fn creation_capability(&self, _teams: bool) -> Result<(), String> {
+    async fn creation_capability(&self, _teams: bool, _invitations: bool) -> Result<(), String> {
         Err("Calendar provider has no verified event creation capability".into())
     }
     async fn create(&self, _part: &crate::event_creation::Part) -> Result<String, SubmissionError> {
@@ -120,7 +121,10 @@ pub async fn create_events(
         if record.state != State::Creating || record.account != api.account() {
             return Err("Calendar account or event creation approval changed".to_owned());
         }
-        api.creation_capability(record.draft.teams).await?;
+        if record.draft.attendees.iter().any(|attendee| attendee.email.eq_ignore_ascii_case(api.account())) {
+            return Err("Your own mailbox is the organizer and cannot be invited".to_owned());
+        }
+        api.creation_capability(record.draft.teams, !record.draft.attendees.is_empty()).await?;
         if let Some(parent) = &record.parent {
             let current = api.event(&parent.id).await?;
             if crate::scheduler::fingerprint(&current) != crate::scheduler::fingerprint(parent) {
@@ -164,6 +168,9 @@ pub async fn create_events(
                 if !result.events.is_empty() {
                     result.message = format!("{}\n{}", "Some events were created; remaining events were not completed. Inspect Outlook before creating anything again.", result.message);
                 }
+                if result.state == State::Review {
+                    result.message = record.review_message(&result.message);
+                }
                 return result;
             }
         };
@@ -178,7 +185,7 @@ pub async fn create_events(
         }
         let Some(mut event) = verified else {
             result.state = State::Review;
-            result.message = "Event creation could not be verified completely. Inspect Outlook; no write will be repeated automatically.".into();
+            result.message = record.review_message("Event creation could not be verified completely. Inspect Outlook; no write will be repeated automatically.");
             return result;
         };
         // Full invitation text is only needed for this read-back, not the calendar cache.
@@ -187,8 +194,130 @@ pub async fn create_events(
         result.events.push(event);
     }
     result.state = State::Created;
-    result.message = "All requested events were created and verified".into();
+    result.message = if record.draft.attendees.is_empty() {
+        "All requested events were created and verified"
+    } else {
+        "All requested events were created and verified; Outlook sent the invitations"
+    }.into();
     result
+}
+
+/// Whether the connected provider accepts attendees on new events, checked before any invitation
+/// can be approved. Reads the create schema only; never writes.
+pub async fn invitation_capability(connection: &Connection) -> Result<(), String> {
+    Api::creation_capability(connection, false, true).await
+}
+
+/// Property names, types and read-only flags of the create schema's attendees, for the read-only
+/// live probe. Schema metadata only; never calendar data.
+pub async fn invitation_schema_shape(connection: &Connection) -> Result<Value, String> {
+    let schema = discover_schema(connection, true).await?;
+    let schema = schema.get("data").unwrap_or(&schema);
+    let attendees = schema_property(schema, schema, "attendees", 0)
+        .ok_or("Calendar create schema has no attendees")?;
+    Ok(schema_shape(schema, attendees, 0))
+}
+
+/// A schema's property names, types, titles and read-only flags with local references resolved;
+/// metadata only.
+pub(super) fn schema_shape(root: &Value, node: &Value, depth: usize) -> Value {
+    if depth > 6 {
+        return Value::Null;
+    }
+    let node = node
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|reference| root.pointer(reference.strip_prefix('#')?))
+        .unwrap_or(node);
+    let mut out = serde_json::Map::new();
+    for key in ["type", "readOnly", "title"] {
+        if let Some(value) = node.get(key) {
+            out.insert(key.into(), value.clone());
+        }
+    }
+    if let Some(properties) = node.get("properties").and_then(Value::as_object) {
+        out.insert("properties".into(), Value::Object(properties.iter().take(40)
+            .map(|(name, value)| (name.clone(), schema_shape(root, value, depth + 1))).collect()));
+    }
+    if let Some(items) = node.get("items") {
+        out.insert("items".into(), schema_shape(root, items, depth + 1));
+    }
+    for key in ["allOf", "anyOf", "oneOf"] {
+        if let Some(nodes) = node.get(key).and_then(Value::as_array) {
+            out.insert(key.into(), nodes.iter().take(8).map(|node| schema_shape(root, node, depth + 1)).collect());
+        }
+    }
+    Value::Object(out)
+}
+
+/// Deletes held BLOCKERs of a proposal through the verified owned-appointment delete path
+/// ([`execute`] with [`Change::Delete`]). Each one is read again first and must still be the
+/// BLOCKER Tomlook created: the stored event ID, the transaction ID it was created with, the
+/// `BLOCKER:` title prefix, you as organizer and nobody invited. Every deletion is submitted at
+/// most once; uncertain outcomes are reported for review and never repeated.
+pub async fn release_blockers(
+    api: &impl Api,
+    request: &crate::scheduling::ReleaseRequest,
+) -> crate::scheduling::ReleaseResult {
+    use crate::scheduling::{ReleaseOutcome, ReleaseResult};
+    let mut outcomes = Vec::new();
+    for blocker in &request.blockers {
+        let Some(id) = blocker.event_id.clone() else { continue };
+        let (state, message) = release_one(api, &request.account, blocker, &id).await;
+        outcomes.push(ReleaseOutcome { event_id: id, state, message });
+    }
+    ReleaseResult { proposal: request.proposal.clone(), outcomes }
+}
+
+async fn release_one(
+    api: &impl Api,
+    account: &str,
+    blocker: &crate::scheduling::Blocker,
+    id: &str,
+) -> (crate::scheduling::BlockerState, String) {
+    use crate::scheduling::BlockerState;
+    const NOT_OURS: &str = "This event is no longer the BLOCKER Tomlook created; nothing was deleted. Delete it in Outlook if needed.";
+    if api.account() != account {
+        return (BlockerState::Held, "Calendar account changed; nothing was deleted".into());
+    }
+    let current = match api.event(id).await {
+        Ok(event) => event,
+        Err(_) if api.removed(id).await == Ok(true) => {
+            return (BlockerState::Released, "Already deleted in Outlook".into());
+        }
+        Err(error) => return (BlockerState::Held, format!("{error}; nothing was deleted")),
+    };
+    let tagged = match api.created_event(id).await {
+        Ok(event) => event,
+        Err(error) => return (BlockerState::Held, format!("{error}; nothing was deleted")),
+    };
+    if current.id != id
+        || tagged.id != id
+        || tagged.extra.get("transactionId").and_then(Value::as_str) != Some(blocker.transaction_id.as_str())
+        || !crate::scheduling::is_blocker(&current)
+        || current.extra.get("isOrganizer").and_then(Value::as_bool) != Some(true)
+    {
+        return (BlockerState::Held, NOT_OURS.into());
+    }
+    let mut recommendation = match crate::recommendations::Recommendation::from_manual(
+        &current, account, Change::Delete, Local::now().fixed_offset(),
+    ) {
+        Ok(recommendation) => recommendation,
+        Err(error) => return (BlockerState::Held, error),
+    };
+    recommendation.state = crate::recommendations::State::Dispatching;
+    let operation = Operation { recommendation, event: current, change: Change::Delete };
+    match execute(api, &operation).await {
+        Outcome::Removed(_) => (BlockerState::Released, "BLOCKER deleted and verified".into()),
+        Outcome::Stale(_) => (BlockerState::Held, "The BLOCKER changed before deletion; nothing was deleted".into()),
+        Outcome::NotSent(message) => (BlockerState::Held, message),
+        Outcome::Applied(_) | Outcome::Review(_) => (BlockerState::ReleaseReview, crate::scheduling::UNCERTAIN_RELEASE.into()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn parse_event_for_tests(value: Value) -> Result<Event, String> {
+    parse_event(value)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -545,7 +674,7 @@ impl Api for Connection {
         Ok(())
     }
 
-    async fn creation_capability(&self, teams: bool) -> Result<(), String> {
+    async fn creation_capability(&self, teams: bool, invitations: bool) -> Result<(), String> {
         if !self.is_active() {
             return Err("WorkIQ is disconnected; sign in again".into());
         }
@@ -553,6 +682,9 @@ impl Api for Connection {
         let schema = schema.get("data").unwrap_or(&schema);
         if !compatible_creation_schema(schema) {
             return Err("Calendar provider has no compatible event creation schema; nothing was submitted".into());
+        }
+        if invitations && !compatible_invitation_schema(schema) {
+            return Err(INVITATIONS_UNSUPPORTED.into());
         }
         if teams {
             let calendar = self.fetch_in("/me/calendar?$select=allowedOnlineMeetingProviders", &self.admission.calendar).await?;
@@ -658,6 +790,31 @@ fn compatible_creation_schema(schema: &Value) -> bool {
             })
 }
 
+/// Writable attendees. WorkIQ's flattened schema lists only an attendee's own properties
+/// (`status`, `proposedNewTime`) and omits the inherited `emailAddress` and `type`, like the
+/// event's inherited subject and categories; those are rejected only when described read-only.
+fn compatible_invitation_schema(schema: &Value) -> bool {
+    let Some(attendees) = schema_property(schema, schema, "attendees", 0) else {
+        return false;
+    };
+    if attendees.get("readOnly") == Some(&Value::Bool(true)) {
+        return false;
+    }
+    let mut items = attendees.get("items");
+    if items.is_none() {
+        items = attendees
+            .get("anyOf")
+            .and_then(Value::as_array)
+            .and_then(|nodes| nodes.iter().find_map(|node| node.get("items")));
+    }
+    items.is_none_or(|items| {
+        ["emailAddress", "type"].iter().all(|name| {
+            schema_property(schema, items, name, 0)
+                .is_none_or(|property| property.get("readOnly") != Some(&Value::Bool(true)))
+        })
+    })
+}
+
 fn created_id(result: &rmcp::model::CallToolResult) -> Result<String, SubmissionError> {
     let payload = hosted::read_json_payload(result).map_err(|_| SubmissionError::Unknown)?;
     match payload["statusCode"].as_u64() {
@@ -714,7 +871,7 @@ async fn discover_schema(connection: &Connection, create: bool) -> Result<Value,
     hosted::read_json(&result)
 }
 
-fn schema_property<'a>(
+pub(super) fn schema_property<'a>(
     root: &'a Value,
     node: &'a Value,
     name: &str,
@@ -818,7 +975,7 @@ fn submission_result(
     }
 }
 
-fn provider_error_code(payload: &Value) -> Option<&'static str> {
+pub(super) fn provider_error_code(payload: &Value) -> Option<&'static str> {
     // Persist known error identifiers, never arbitrary provider text or calendar data.
     const CODES: &[&str] = &[
         "BadRequest",
@@ -876,7 +1033,9 @@ mod tests {
         reject: Option<usize>,
         unknown: bool,
         unsupported: bool,
+        invitations_unsupported: bool,
         wrong_readback: bool,
+        readback: Option<fn(&mut Value)>,
         parent: Option<Event>,
         busy: bool,
         incomplete: bool,
@@ -896,6 +1055,7 @@ mod tests {
                 body["onlineMeeting"] = json!({"joinUrl":"https://teams.microsoft.com/l/meetup-join/example"});
             }
             if self.wrong_readback { body["sensitivity"] = json!("normal"); }
+            if let Some(change) = self.readback { change(&mut body); }
             parse_event(body)
         }
         async fn calendar(&self, range: Range) -> Result<Calendar, String> {
@@ -915,8 +1075,10 @@ mod tests {
             Calendar::build(events, coverage, Vec::new())
         }
         async fn submit(&self, _: &Operation) -> Result<String, SubmissionError> { panic!("Creation must use its exact approval") }
-        async fn creation_capability(&self, _: bool) -> Result<(), String> {
-            if self.unsupported { Err("Unsupported calendar".into()) } else { Ok(()) }
+        async fn creation_capability(&self, _: bool, invitations: bool) -> Result<(), String> {
+            if self.unsupported { Err("Unsupported calendar".into()) }
+            else if invitations && self.invitations_unsupported { Err(INVITATIONS_UNSUPPORTED.into()) }
+            else { Ok(()) }
         }
         async fn create(&self, part: &crate::event_creation::Part) -> Result<String, SubmissionError> {
             let index = self.writes.fetch_add(1, Ordering::Relaxed);
@@ -930,8 +1092,98 @@ mod tests {
 
     fn creation_fake() -> CreationFake {
         CreationFake { bodies: Mutex::new(Vec::new()), writes: AtomicUsize::new(0),
-            reject: None, unknown: false, unsupported: false, wrong_readback: false,
-            parent: None, busy: false, incomplete: false }
+            reject: None, unknown: false, unsupported: false, invitations_unsupported: false,
+            wrong_readback: false, readback: None, parent: None, busy: false, incomplete: false }
+    }
+
+    #[tokio::test]
+    async fn invitations_are_sent_once_with_the_main_event_and_read_back_exactly() {
+        use crate::event_creation::{INVITATIONS_MAY_BE_SENT, Record, State, tests::invited};
+        let record = Record::new("owner".into(), invited()).unwrap();
+        let fake = creation_fake();
+        let result = create_events(&fake, &record).await;
+        assert_eq!(result.state, State::Created, "{}", result.message);
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 3);
+        let bodies = fake.bodies.lock().unwrap().clone();
+        assert_eq!(bodies[0]["attendees"].as_array().unwrap().len(), 2);
+        assert_eq!(bodies[0]["attendees"][1]["type"], "optional");
+        assert!(bodies[1..].iter().all(|body| body["attendees"] == json!([])), "Reserves invite nobody");
+        for change in [
+            (|body: &mut Value| { body["attendees"].as_array_mut().unwrap().pop(); }) as fn(&mut Value),
+            |body: &mut Value| { body["attendees"].as_array_mut().unwrap().push(
+                json!({"emailAddress":{"address":"eve@example.com"},"type":"required"})); },
+            |body: &mut Value| { body["attendees"][0]["type"] = json!("optional"); },
+        ] {
+            let mut fake = creation_fake();
+            fake.readback = Some(change);
+            let result = create_events(&fake, &record).await;
+            assert_eq!(result.state, State::Review);
+            assert_eq!(fake.writes.load(Ordering::Relaxed), 1, "Never replay or continue after an unverified invitation");
+            assert!(result.message.ends_with(INVITATIONS_MAY_BE_SENT), "{}", result.message);
+        }
+        let mut fake = creation_fake();
+        fake.reject = Some(0);
+        fake.unknown = true;
+        let result = create_events(&fake, &record).await;
+        assert_eq!(result.state, State::Review);
+        assert!(result.message.contains(UNCERTAIN) && result.message.ends_with(INVITATIONS_MAY_BE_SENT));
+        let mut fake = creation_fake();
+        fake.reject = Some(0);
+        let result = create_events(&fake, &record).await;
+        assert_eq!(result.state, State::NotSent);
+        assert!(!result.message.contains(INVITATIONS_MAY_BE_SENT), "A definitive rejection sent nothing");
+        let mut fake = creation_fake();
+        fake.invitations_unsupported = true;
+        let result = create_events(&fake, &record).await;
+        assert_eq!(result.state, State::NotSent);
+        assert_eq!(result.message, INVITATIONS_UNSUPPORTED);
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 0);
+        let plain = Record::new("owner".into(), crate::event_creation::tests::draft()).unwrap();
+        assert_eq!(create_events(&fake, &plain).await.state, State::Created, "Appointments without attendees stay available");
+        let mut own = invited();
+        own.attendees[0].email = "owner@example.com".into();
+        let record = Record::new("owner@example.com".into(), own).unwrap();
+        struct Owner(CreationFake);
+        #[async_trait]
+        impl Api for Owner {
+            fn account(&self) -> &str { "owner@example.com" }
+            async fn schema(&self, _: bool) -> Result<(), String> { Ok(()) }
+            async fn event(&self, id: &str) -> Result<Event, String> { self.0.event(id).await }
+            async fn calendar(&self, range: Range) -> Result<Calendar, String> { self.0.calendar(range).await }
+            async fn submit(&self, operation: &Operation) -> Result<String, SubmissionError> { self.0.submit(operation).await }
+            async fn creation_capability(&self, teams: bool, invitations: bool) -> Result<(), String> { self.0.creation_capability(teams, invitations).await }
+            async fn create(&self, part: &crate::event_creation::Part) -> Result<String, SubmissionError> { self.0.create(part).await }
+        }
+        let owner = Owner(creation_fake());
+        assert_eq!(create_events(&owner, &record).await.state, State::NotSent);
+        assert_eq!(owner.0.writes.load(Ordering::Relaxed), 0, "Never invite your own mailbox");
+    }
+
+    #[test]
+    fn invitation_schema_accepts_workiq_flattened_attendees_but_not_read_only_ones() {
+        let base = json!({"title":"microsoft.graph.event","type":"object","properties":{
+            "start":{},"end":{},"showAs":{},"isAllDay":{},"transactionId":{},"isReminderOn":{},
+            "body":{},"isOnlineMeeting":{},"onlineMeetingProvider":{},
+            "attendees":{"type":"array","items":{"$ref":"#/$defs/attendee"}}
+        }, "$defs":{"attendee":{"type":"object","properties":{"emailAddress":{},"type":{}}}}});
+        assert!(compatible_invitation_schema(&base));
+        // The live WorkIQ shape lists only the attendee's own properties.
+        let mut live = base.clone();
+        live["properties"]["attendees"] = json!({"type":"array","items":{"type":"object","properties":{
+            "@odata.type":{"type":"string"},"proposedNewTime":{"anyOf":[{"type":"object"},{"type":["object","null"]}]},
+            "status":{"anyOf":[{"type":"object"},{"type":["object","null"]}]}}}});
+        assert!(compatible_invitation_schema(&live), "Inherited address and type are omitted, not forbidden");
+        let mut schema = base.clone();
+        schema["properties"]["attendees"] = json!({"type":"array"});
+        assert!(compatible_invitation_schema(&schema), "An undescribed item shape is accepted");
+        schema["properties"]["attendees"]["readOnly"] = json!(true);
+        assert!(!compatible_invitation_schema(&schema));
+        let mut schema = base.clone();
+        schema["$defs"]["attendee"]["properties"]["type"] = json!({"readOnly":true});
+        assert!(!compatible_invitation_schema(&schema));
+        let mut schema = base;
+        schema["properties"].as_object_mut().unwrap().remove("attendees");
+        assert!(!compatible_invitation_schema(&schema));
     }
 
     #[tokio::test]
@@ -2112,5 +2364,132 @@ mod tests {
         returned.extra.insert("type".into(), json!("exception"));
         returned.start += chrono::Duration::minutes(1);
         assert!(!verified(&returned, &operation));
+    }
+
+    fn hold_record(private: bool) -> (crate::scheduling::Proposal, crate::event_creation::Record) {
+        let proposal = crate::scheduling::tests::proposal(crate::i18n::Language::En);
+        let draft = proposal.hold_draft(private, None).unwrap();
+        let record = crate::event_creation::Record::blockers("owner".into(), proposal.id.clone(), draft,
+            proposal.candidates.clone()).unwrap();
+        (proposal, record)
+    }
+
+    #[tokio::test]
+    async fn blockers_are_busy_holds_without_attendees_teams_or_reminders_and_keep_partial_success() {
+        use crate::event_creation::State;
+        let (mut proposal, record) = hold_record(true);
+        record.validate().unwrap();
+        let fake = creation_fake();
+        let result = create_events(&fake, &record).await;
+        assert_eq!(result.state, State::Created, "{}", result.message);
+        assert_eq!(result.events.len(), 2);
+        let bodies = fake.bodies.lock().unwrap().clone();
+        for (index, body) in bodies.iter().enumerate() {
+            assert_eq!(body["subject"], "BLOCKER: Pilot kickoff");
+            assert_eq!(body["showAs"], "busy");
+            assert_eq!(body["attendees"], json!([]));
+            assert_eq!(body["isOnlineMeeting"], false);
+            assert_eq!(body["isReminderOn"], false);
+            assert_eq!(body["sensitivity"], "private");
+            assert_eq!(body["categories"], json!([]));
+            assert_eq!(body["transactionId"], format!("{}-blocker-{index}", record.id));
+            assert_eq!(body["body"]["content"], proposal.blocker_body());
+            assert!(body.get("onlineMeetingProvider").is_none());
+        }
+        assert_eq!(bodies[0]["start"]["dateTime"], proposal.candidates[0].start.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%S").to_string());
+        assert_eq!(bodies[1]["start"]["dateTime"], proposal.candidates[1].start.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%S").to_string());
+        let mut fake = creation_fake();
+        fake.reject = Some(1);
+        let result = create_events(&fake, &record).await;
+        assert_eq!((result.state, result.events.len()), (State::Review, 1), "Successful BLOCKERs stay");
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 2, "Never retried");
+        proposal.begin_hold(&record, proposal.created_at).unwrap();
+        proposal.finish_hold(result.state, &result.events.iter().map(|event| event.id.clone()).collect::<Vec<_>>(),
+            &result.message, proposal.created_at);
+        assert_eq!(proposal.blockers[0].state, crate::scheduling::BlockerState::Held);
+        assert_eq!(proposal.blockers[0].event_id.as_deref(), Some("created-0"));
+        assert_eq!(proposal.blockers[1].state, crate::scheduling::BlockerState::Review);
+        let mut fake = creation_fake();
+        fake.reject = Some(0);
+        fake.unknown = true;
+        let result = create_events(&fake, &record).await;
+        assert_eq!((result.state, result.events.len()), (State::Review, 0));
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 1);
+        let mut fake = creation_fake();
+        fake.readback = Some(|body| { body["attendees"] = json!([{"emailAddress":{"address":"eve@example.com"},"type":"required"}]); });
+        assert_eq!(create_events(&fake, &record).await.state, State::Review, "A BLOCKER with attendees is never verified");
+        let mut fake = creation_fake();
+        fake.readback = Some(|body| { body["showAs"] = json!("free"); });
+        assert_eq!(create_events(&fake, &record).await.state, State::Review);
+        let mut changed = record.clone();
+        changed.hold.as_mut().unwrap().slots.pop();
+        assert!(changed.validate().is_err(), "The approval binds every proposed time");
+        let mut invited = proposal.hold_draft(false, None).unwrap();
+        invited.attendees = crate::attendees::parse_input("alex@example.com").unwrap();
+        assert!(crate::event_creation::Record::blockers("owner".into(), proposal.id.clone(), invited, proposal.candidates.clone()).is_err());
+        let mut teams = proposal.hold_draft(false, None).unwrap();
+        teams.teams = true;
+        assert!(crate::event_creation::Record::blockers("owner".into(), proposal.id.clone(), teams, proposal.candidates.clone()).is_err());
+        let normal = hold_record(false).1;
+        assert_ne!(normal.id, record.id, "Privacy is part of the approval");
+    }
+
+    fn blocker_fake() -> (Fake, crate::scheduling::Blocker) {
+        let operation = manual_operation(Change::Delete, true);
+        let mut fake = Fake::new(&operation);
+        fake.current.title = "BLOCKER: Pilot kickoff".into();
+        fake.current.extra.insert("type".into(), json!("singleInstance"));
+        fake.current.extra.insert("transactionId".into(), json!("approval-blocker-0"));
+        let blocker = crate::scheduling::Blocker {
+            start: fake.current.start, end: fake.current.end, title: fake.current.title.clone(),
+            transaction_id: "approval-blocker-0".into(), event_id: Some(fake.current.id.clone()),
+            state: crate::scheduling::BlockerState::Releasing, message: String::new(),
+        };
+        (fake, blocker)
+    }
+
+    #[tokio::test]
+    async fn releasing_deletes_only_the_exact_tomlook_blockers_once_through_the_verified_delete_path() {
+        use crate::scheduling::{BlockerState, ReleaseRequest};
+        let request = |blocker: &crate::scheduling::Blocker, account: &str| ReleaseRequest {
+            proposal: "p".repeat(32), account: account.into(), blockers: vec![blocker.clone()],
+        };
+        let (fake, blocker) = blocker_fake();
+        let result = release_blockers(&fake, &request(&blocker, "owner")).await;
+        assert_eq!(result.outcomes[0].state, BlockerState::Released, "{}", result.outcomes[0].message);
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 1);
+        for change in [
+            (|event: &mut Event| { event.extra.insert("transactionId".into(), json!("someone-else")); }) as fn(&mut Event),
+            |event| event.title = "Pilot kickoff".into(),
+            |event| event.attendees = vec!["alex@example.com".into()],
+            |event| { event.extra.insert("isOrganizer".into(), json!(false)); },
+        ] {
+            let (mut fake, blocker) = blocker_fake();
+            change(&mut fake.current);
+            let result = release_blockers(&fake, &request(&blocker, "owner")).await;
+            assert_eq!(result.outcomes[0].state, BlockerState::Held, "{}", result.outcomes[0].message);
+            assert_eq!(fake.writes.load(Ordering::Relaxed), 0, "Only Tomlook's own BLOCKER is ever deleted");
+        }
+        let (fake, blocker) = blocker_fake();
+        assert_eq!(release_blockers(&fake, &request(&blocker, "someone")).await.outcomes[0].state, BlockerState::Held);
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 0);
+        let (mut fake, blocker) = blocker_fake();
+        fake.rejection = Some(SubmissionError::Rejected(409));
+        let result = release_blockers(&fake, &request(&blocker, "owner")).await;
+        assert_eq!(result.outcomes[0].state, BlockerState::Held);
+        assert!(result.outcomes[0].message.contains("HTTP 409"));
+        let (mut fake, blocker) = blocker_fake();
+        fake.rejection = Some(SubmissionError::Unknown);
+        let result = release_blockers(&fake, &request(&blocker, "owner")).await;
+        assert_eq!(result.outcomes[0].state, BlockerState::ReleaseReview);
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 1, "Uncertain deletions are never repeated");
+        let (fake, blocker) = blocker_fake();
+        fake.removed.store(true, Ordering::Relaxed);
+        let result = release_blockers(&fake, &request(&blocker, "owner")).await;
+        assert_eq!(result.outcomes[0].state, BlockerState::Released);
+        assert_eq!(fake.writes.load(Ordering::Relaxed), 0, "Already deleted in Outlook");
+        let (fake, mut blocker) = blocker_fake();
+        blocker.event_id = None;
+        assert!(release_blockers(&fake, &request(&blocker, "owner")).await.outcomes.is_empty());
     }
 }

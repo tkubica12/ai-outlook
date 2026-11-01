@@ -26,6 +26,19 @@ fn feedback_payload(payload: &str) -> Result<crate::feedback::Entry> {
     Ok(entry)
 }
 
+fn saved_proposal(account: &str, id: &str, payload: &str) -> Result<crate::scheduling::Proposal> {
+    if payload.len() > 256 * 1024 {
+        return Err("Saved scheduling proposal exceeds its safety limit".into());
+    }
+    let proposal: crate::scheduling::Proposal =
+        serde_json::from_str(payload).map_err(|_| "Saved scheduling proposal is invalid")?;
+    proposal.validate()?;
+    if proposal.account != account || proposal.id != id {
+        return Err("Saved scheduling proposal does not match its account".into());
+    }
+    Ok(proposal)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
@@ -152,7 +165,7 @@ impl Store {
             record.validate()?;
             if record.state == crate::event_creation::State::Creating {
                 record.state = crate::event_creation::State::Review;
-                record.message = crate::workiq::connection::calendar_write::UNCERTAIN.into();
+                record.message = record.review_message(crate::workiq::connection::calendar_write::UNCERTAIN);
             }
             records.insert(record.id.clone(), record);
         }
@@ -545,7 +558,11 @@ impl Store {
                    payload TEXT NOT NULL,PRIMARY KEY(account,meeting_key));
                  CREATE TABLE IF NOT EXISTS weekly_summaries(
                    account TEXT NOT NULL,week TEXT NOT NULL,updated_at TEXT NOT NULL,
-                   payload TEXT NOT NULL,PRIMARY KEY(account,week));",
+                   payload TEXT NOT NULL,PRIMARY KEY(account,week));
+                 CREATE TABLE IF NOT EXISTS proposals(
+                   id TEXT PRIMARY KEY,account TEXT NOT NULL,status TEXT NOT NULL,
+                   created_at TEXT NOT NULL,updated_at TEXT NOT NULL,payload TEXT NOT NULL);
+                 CREATE INDEX IF NOT EXISTS proposals_by_account ON proposals(account,created_at);",
             )
             .map_err(|e| e.to_string())?;
         Ok(Self {
@@ -1770,6 +1787,113 @@ impl Store {
             )
             .map(|count| count > 0)
             .map_err(|_| "Discard follow-up e-mail failed".into())
+    }
+
+    /// Saved scheduling proposals of an account by ID, the newest within the limit. Anything that
+    /// was in flight when Tomlook stopped becomes uncertain and is never replayed.
+    pub fn proposals(
+        &self,
+        account: &str,
+    ) -> Result<std::collections::BTreeMap<String, crate::scheduling::Proposal>> {
+        self.proposals_except(account, |_| false)
+    }
+
+    /// [`Self::proposals`], except that `active` proposals, whose writes still wait for an outcome
+    /// in this process, are kept exactly as saved.
+    pub fn proposals_except(
+        &self,
+        account: &str,
+        active: impl Fn(&crate::scheduling::Proposal) -> bool,
+    ) -> Result<std::collections::BTreeMap<String, crate::scheduling::Proposal>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id,payload FROM proposals WHERE account=?1 ORDER BY created_at DESC LIMIT ?2",
+            )
+            .map_err(|_| "Read scheduling proposals failed")?;
+        let rows = statement
+            .query_map(
+                params![account, crate::scheduling::SAVED_LIMIT as i64],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|_| "Read scheduling proposals failed")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| "Read scheduling proposals failed")?;
+        drop(statement);
+        let mut proposals = std::collections::BTreeMap::new();
+        for (id, payload) in rows {
+            let mut proposal = saved_proposal(account, &id, &payload)?;
+            if proposal.in_flight() && !active(&proposal) {
+                proposal.recover();
+                self.save_proposal(&proposal)?;
+            }
+            proposals.insert(id, proposal);
+        }
+        Ok(proposals)
+    }
+
+    /// One saved scheduling proposal of an account exactly as saved, in flight or not.
+    pub fn proposal(&self, account: &str, id: &str) -> Result<Option<crate::scheduling::Proposal>> {
+        let payload: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT payload FROM proposals WHERE id=?1 AND account=?2",
+                params![id, account],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "Read scheduling proposal failed")?;
+        payload.map(|payload| saved_proposal(account, id, &payload)).transpose()
+    }
+
+    /// Saves a scheduling proposal; the oldest closed proposals beyond the limit are removed.
+    pub fn save_proposal(&self, proposal: &crate::scheduling::Proposal) -> Result<()> {
+        proposal.validate()?;
+        let payload =
+            serde_json::to_string(proposal).map_err(|_| "Encode scheduling proposal failed")?;
+        if payload.len() > 256 * 1024 {
+            return Err("Scheduling proposal exceeds its safety limit".into());
+        }
+        let status = serde_json::to_value(proposal.status)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| "Begin scheduling proposal storage failed")?;
+        let existing: Option<String> = transaction
+            .query_row("SELECT account FROM proposals WHERE id=?1", [&proposal.id], |row| row.get(0))
+            .optional()
+            .map_err(|_| "Read scheduling proposal failed")?;
+        if existing.is_some_and(|account| account != proposal.account) {
+            return Err("Scheduling proposal belongs to a different account".into());
+        }
+        transaction
+            .execute(
+                "INSERT INTO proposals VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(id) DO UPDATE SET status=excluded.status,
+                   updated_at=excluded.updated_at,payload=excluded.payload",
+                params![
+                    proposal.id,
+                    proposal.account,
+                    status,
+                    proposal.created_at.to_rfc3339(),
+                    proposal.updated_at.to_rfc3339(),
+                    payload
+                ],
+            )
+            .map_err(|_| "Save scheduling proposal failed")?;
+        transaction
+            .execute(
+                "DELETE FROM proposals WHERE account=?1 AND status<>'Open' AND id NOT IN (
+                   SELECT id FROM proposals WHERE account=?1 ORDER BY created_at DESC LIMIT ?2)",
+                params![proposal.account, crate::scheduling::SAVED_LIMIT as i64],
+            )
+            .map_err(|_| "Save scheduling proposal failed")?;
+        transaction
+            .commit()
+            .map_err(|_| "Commit scheduling proposal failed".into())
     }
 
     /// Saved AI summaries of an account's weeks by Monday, the newest weeks within the limit.

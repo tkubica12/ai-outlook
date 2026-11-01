@@ -753,6 +753,20 @@ impl Tomlook {
                 }
                 ready && self.demo_frames > 5
             }
+            Scene::Invite => {
+                let ready = self.demo_invitation_ready();
+                if !ready {
+                    self.demo_frames = 0;
+                }
+                ready && self.demo_frames > 8
+            }
+            Scene::FindTime | Scene::Teams => {
+                let ready = self.demo_find_time_ready(self.demo_scene == Scene::Teams);
+                if !ready {
+                    self.demo_frames = 0;
+                }
+                ready && self.demo_frames > 8
+            }
         }
     }
 }

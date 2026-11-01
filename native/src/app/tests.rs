@@ -6022,3 +6022,569 @@ fn demo_weekly_review_shows_fictional_numbers_and_never_requests_ai() {
         assert!(receiver.try_iter().all(|command| !matches!(command, Command::SaveWeeklySummary(_))));
     }
 }
+/// Draws until a window that changed size has been laid out, re-centered and painted.
+fn settled(context: &egui::Context, app: &mut Tomlook, show: Show) -> String {
+    for _ in 0..5 {
+        draw_with(context, app, vec![], show);
+    }
+    output_text(&draw_with(context, app, vec![], show))
+}
+fn drain_ai(commands: &mut tokio::sync::mpsc::Receiver<ai::Command>, seen: &mut Vec<ai::Command>) {
+    while let Ok(command) = commands.try_recv() {
+        seen.push(command);
+    }
+}
+
+fn synthetic_availability(request: &tomlook::availability::ScheduleRequest, day: NaiveDate) -> tomlook::availability::Availability {
+    use tomlook::availability::{Availability, Item, Schedule, Status};
+    let at = |minutes| tomlook::event_creation::local_time(day, minutes).unwrap().with_timezone(&chrono::Utc);
+    Availability {
+        start: request.start,
+        end: request.end,
+        interval: request.interval,
+        schedules: vec![
+            Schedule::from_items(request, "owner@example.com".into(), Vec::new()),
+            Schedule::from_items(request, "jamie@example.com".into(), vec![Item {
+                status: Status::Busy, start: at(600), end: at(630),
+                subject: Some("Synthetic review".into()), location: Some("Room 7".into()),
+            }]),
+            Schedule {
+                email: "alex@example.com".into(),
+                view: vec![Status::Unknown; request.cells()],
+                items: Vec::new(),
+                error: Some("Availability is not shared with you".into()),
+            },
+        ],
+    }
+}
+
+#[test]
+fn event_editor_invites_attendees_shows_their_availability_and_needs_the_explicit_invitation_click() {
+    let show: Show = &|app, ui| app.event_creation_dialog(ui.ctx());
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, notices, mut ai_commands) = assistant_fixture();
+        let (sender, receiver) = mpsc::sync_channel(16);
+        app.worker = Some(Worker {
+            commands: sender, notices: Arc::new(Default::default()),
+            activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+            stop: Arc::new(Default::default()), done: None,
+        });
+        let mut past = tomlook::calendar::fixture(1).remove(0);
+        past.organizer = "Alex Rivers <alex@example.com>".into();
+        past.attendees = vec!["Jamie Brooks <jamie@example.com>".into(), "Owner <owner@example.com>".into()];
+        app.calendar = Arc::new(Calendar::build(vec![past], Default::default(), Vec::new()).unwrap());
+        app.calendar_owner = Some("owner@example.com".into());
+        app.workiq_ready = true;
+        app.preferences.language = language;
+        let day = Local::now().date_naive() + chrono::Duration::days(1);
+        app.open_event_draft(day, 600, 660);
+        app.event_draft.as_mut().unwrap().title = "Synthetic planning".into();
+        app.event_draft.as_mut().unwrap().attendee_input = "ja".into();
+        let context = egui::Context::default();
+        let mut seen = Vec::new();
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains("Jamie Brooks · jamie@example.com"), "Cached people are suggested at once\n{text}");
+        assert!(!text.contains("owner@example.com"), "Your own mailbox is never suggested");
+        drain_ai(&mut ai_commands, &mut seen);
+        assert!(seen.iter().any(|command| matches!(command, ai::Command::InvitationCapability(account) if account == "owner@example.com")));
+        app.event_draft.as_mut().unwrap().directory.changed = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        draw_with(&context, &mut app, vec![], show);
+        drain_ai(&mut ai_commands, &mut seen);
+        let (id, own) = seen.iter().rev().find_map(|command| match command {
+            ai::Command::People { id, query, own } if query == "ja" => Some((*id, own.clone())),
+            _ => None,
+        }).expect("Debounced read-only directory search");
+        assert!(own.contains(&"owner@example.com".to_owned()));
+        notices.send(ai::Notice::People { id, result: Ok(vec![tomlook::attendees::Person {
+            email: "jade@example.com".into(), name: "Jade Doe".into(), meetings: 0, score: 0.0,
+        }]) }).unwrap();
+        notices.send(ai::Notice::InvitationCapability { account: "owner@example.com".into(), result: Ok(()) }).unwrap();
+        app.receive();
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains("Jade Doe · jade@example.com"), "Directory results join the suggestions\n{text}");
+        click_text(&context, &mut app, show, "Jamie Brooks · jamie@example.com");
+        app.event_draft.as_mut().unwrap().attendee_input = "Alex Rivers <ALEX@example.com>; owner@example.com".into();
+        let output = click_text(&context, &mut app, show, language.text("Add").as_ref());
+        let draft = app.event_draft.as_ref().unwrap();
+        assert_eq!(draft.attendees.iter().map(|attendee| attendee.email.as_str()).collect::<Vec<_>>(), ["jamie@example.com", "alex@example.com"]);
+        assert!(draft.attendee_input.is_empty());
+        assert!(output_text(&output).contains(language.text("You are the organizer and are not invited").as_ref()));
+        assert!(receiver.try_recv().is_err(), "Adding attendees never writes");
+        draw_with(&context, &mut app, vec![], show);
+        app.event_draft.as_mut().unwrap().availability.changed = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        draw_with(&context, &mut app, vec![], show);
+        drain_ai(&mut ai_commands, &mut seen);
+        let (id, request) = seen.iter().rev().find_map(|command| match command {
+            ai::Command::Availability { id, request } => Some((*id, request.clone())),
+            _ => None,
+        }).expect("Debounced read-only availability");
+        assert_eq!(request.schedules, ["owner@example.com", "jamie@example.com", "alex@example.com"]);
+        assert_eq!(request.interval, 15);
+        assert_eq!(request.start, tomlook::event_creation::local_time(day, 0).unwrap().with_timezone(&chrono::Utc));
+        notices.send(ai::Notice::Availability { id, result: Ok(Arc::new(synthetic_availability(&request, day))) }).unwrap();
+        app.receive();
+        let text = settled(&context, &mut app, show);
+        let summary = match language {
+            tomlook::i18n::Language::En => "0 of 2 available · Jamie Brooks busy · Alex Rivers unknown",
+            tomlook::i18n::Language::Cs => "Volno nemá nikdo z 2 · Jamie Brooks: obsazeno · Alex Rivers: neznámé",
+        };
+        assert!(text.contains(summary), "{text}");
+        for label in ["You", "Busy", "Tentative", "Out of office", "Working elsewhere", "Free", "Unknown", "Suggest times"] {
+            assert!(text.contains(language.text(label).as_ref()), "Missing {label}\n{text}");
+        }
+        let notice = tomlook::attendees::invitation_notice(&app.event_draft.as_ref().unwrap().attendees, language);
+        assert!(text.contains(&notice), "The invitation consequence is explicit\n{text}");
+        assert!(!text.contains(&format!("\n{}\n", language.text("Create event"))));
+        assert!(receiver.try_recv().is_err());
+        click_text(&context, &mut app, show, language.text("Suggest times").as_ref());
+        drain_ai(&mut ai_commands, &mut seen);
+        let (id, times) = seen.iter().rev().find_map(|command| match command {
+            ai::Command::MeetingTimes { id, request } => Some((*id, request.clone())),
+            _ => None,
+        }).expect("Read-only meeting time suggestions");
+        assert_eq!(times.minutes, 60);
+        assert_eq!(times.attendees.len(), 2);
+        let start = tomlook::event_creation::local_time(day, 840).unwrap().with_timezone(&chrono::Utc);
+        notices.send(ai::Notice::MeetingTimes { id, result: Ok(tomlook::availability::MeetingTimes {
+            suggestions: vec![tomlook::availability::Suggestion {
+                start, end: start + chrono::Duration::hours(1), confidence: Some(100.0),
+                organizer: tomlook::availability::Status::Free,
+                attendees: vec![("jamie@example.com".into(), tomlook::availability::Status::Free),
+                    ("alex@example.com".into(), tomlook::availability::Status::Free)],
+            }],
+            empty_reason: None,
+            reason_code: None,
+        }) }).unwrap();
+        app.receive();
+        let label = format!("{} 14:00–15:00 · {} · 100 %", language.date(day, false), language.text("2/2 available"));
+        settled(&context, &mut app, show);
+        click_text(&context, &mut app, show, &label);
+        let draft = app.event_draft.as_ref().unwrap();
+        assert_eq!((draft.day, draft.start, draft.end), (day, 840, 900));
+        settled(&context, &mut app, show);
+        click_text(&context, &mut app, show, language.text("Create and send invitations").as_ref());
+        let Command::CreateEvents { account, draft, parent } = receiver.try_recv().unwrap() else { panic!("Exact invitation approval") };
+        assert_eq!(account, "owner@example.com");
+        assert!(parent.is_none());
+        assert_eq!(draft.attendees.len(), 2);
+        assert!(draft.attendees.iter().all(|attendee| attendee.role == tomlook::attendees::Role::Required));
+        assert_eq!(draft.start, tomlook::event_creation::local_time(day, 840).unwrap());
+        assert!(app.event_draft.is_none());
+        assert!(receiver.try_recv().is_err(), "One explicit click is one approval");
+        drain_ai(&mut ai_commands, &mut seen);
+        assert!(seen.iter().all(|command| matches!(command, ai::Command::People { .. } | ai::Command::Availability { .. }
+            | ai::Command::MeetingTimes { .. } | ai::Command::InvitationCapability(_))), "Only read-only lookups, never a model call");
+    }
+}
+
+#[test]
+fn unsupported_invitations_disable_attendees_with_a_reason_and_failed_availability_still_allows_review() {
+    let show: Show = &|app, ui| app.event_creation_dialog(ui.ctx());
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, _, mut ai_commands) = assistant_fixture();
+        let (sender, receiver) = mpsc::sync_channel(16);
+        app.worker = Some(Worker {
+            commands: sender, notices: Arc::new(Default::default()),
+            activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+            stop: Arc::new(Default::default()), done: None,
+        });
+        app.calendar_owner = Some("owner@example.com".into());
+        app.workiq_ready = true;
+        app.preferences.language = language;
+        let reason = tomlook::workiq::connection::calendar_write::INVITATIONS_UNSUPPORTED;
+        app.invitation_capability = Some(("owner@example.com".into(), Some(Err(reason.into()))));
+        let day = Local::now().date_naive() + chrono::Duration::days(1);
+        app.open_event_draft(day, 600, 660);
+        let draft = app.event_draft.as_mut().unwrap();
+        draft.title = "Synthetic planning".into();
+        draft.attendees = tomlook::attendees::parse_input("jamie@example.com").unwrap();
+        draft.availability.key = format!("{day}|owner@example.com,jamie@example.com");
+        draft.availability.result = Some(Err("Availability lookups are not permitted for this account".into()));
+        let context = egui::Context::default();
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains(&format!("{}: {}", language.text("Invitations are unavailable"), language.text(reason))), "{text}");
+        assert!(text.contains(&format!("{}: {}", language.text("Availability could not be checked"),
+            language.text("Availability lookups are not permitted for this account"))), "{text}");
+        assert!(text.contains(language.text("You can still create the event; availability is not verified.").as_ref()));
+        click_text(&context, &mut app, show, language.text("Create and send invitations").as_ref());
+        assert!(receiver.try_recv().is_err(), "No invitation while the provider rejects attendees");
+        click_text(&context, &mut app, show, "×");
+        assert!(app.event_draft.as_ref().unwrap().attendees.is_empty(), "Attendees can still be removed");
+        click_text(&context, &mut app, show, language.text("Create event").as_ref());
+        let Command::CreateEvents { draft, .. } = receiver.try_recv().unwrap() else { panic!("Plain appointment") };
+        assert!(draft.attendees.is_empty());
+        let mut seen = Vec::new();
+        drain_ai(&mut ai_commands, &mut seen);
+        assert!(seen.iter().all(|command| !matches!(command, ai::Command::People { .. })));
+    }
+}
+
+#[test]
+fn messages_name_invitees_and_warn_that_uncertain_invitations_may_already_be_out() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, _, _) = assistant_fixture();
+        app.preferences.language = language;
+        app.calendar_owner = Some("owner".into());
+        let draft = tomlook::event_creation::Draft {
+            title: "Synthetic invitation".into(), description: String::new(),
+            start: chrono::DateTime::parse_from_rfc3339("2026-11-03T10:00:00+01:00").unwrap(),
+            end: chrono::DateTime::parse_from_rfc3339("2026-11-03T11:00:00+01:00").unwrap(),
+            category: None, private: false, teams: false, travel_minutes: None, language,
+            attendees: tomlook::attendees::parse_input("Alex Rivers <alex@example.com>").unwrap(),
+        };
+        draft.validate().unwrap();
+        let mut record = tomlook::event_creation::Record::new("owner".into(), draft).unwrap();
+        record.state = tomlook::event_creation::State::Review;
+        record.message = record.review_message(tomlook::workiq::connection::calendar_write::UNCERTAIN);
+        app.activity = Arc::new(tomlook::worker::Activity {
+            event_creations: Arc::new([(record.id.clone(), record)].into()),
+            ..Default::default()
+        });
+        app.messages_open = true;
+        let context = egui::Context::default();
+        let show: Show = &|app, ui| app.overlays(ui.ctx());
+        draw_with(&context, &mut app, vec![], show);
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains(language.text(tomlook::event_creation::INVITATIONS_MAY_BE_SENT).as_ref()), "{text}");
+        assert!(text.contains(&format!("{}: Alex Rivers", language.text("Invited"))), "{text}");
+    }
+}
+
+#[test]
+fn invite_demo_scene_shows_fictional_attendees_and_availability_without_workiq() {
+    let (mut app, _, mut ai_commands) = assistant_fixture();
+    app.preview = true;
+    app.calendar = Arc::new(Calendar::build(tomlook::showcase::preview_events(Local::now(), 200), Default::default(), Vec::new()).unwrap());
+    assert!(!app.demo_invitation_ready());
+    let draft = app.event_draft.as_ref().unwrap();
+    assert_eq!(draft.attendees.len(), 3);
+    assert!(draft.attendees.iter().all(|attendee| attendee.email.ends_with(".invalid")));
+    let context = egui::Context::default();
+    let show: Show = &|app, ui| app.event_creation_dialog(ui.ctx());
+    draw_with(&context, &mut app, vec![], show);
+    app.event_draft.as_mut().unwrap().availability.changed = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    draw_with(&context, &mut app, vec![], show);
+    assert!(app.demo_invitation_ready());
+    let text = settled(&context, &mut app, show);
+    for expected in ["Alex Rivers", "Jamie Brooks", "Dana Novak", "Create and send invitations", "Dana Novak unknown"] {
+        assert!(text.contains(expected), "Missing {expected}\n{text}");
+    }
+    assert!(ai_commands.try_recv().is_err(), "The demo never calls WorkIQ or AI");
+}
+/// All free for everyone except Morgan, whose calendar is not shared.
+fn group_availability(request: &tomlook::availability::ScheduleRequest) -> tomlook::availability::Availability {
+    use tomlook::availability::{Availability, Schedule, Status};
+    Availability {
+        start: request.start,
+        end: request.end,
+        interval: request.interval,
+        schedules: request.schedules.iter().map(|email| if email == "morgan@example.com" {
+            Schedule { email: email.clone(), view: vec![Status::Unknown; request.cells()], items: Vec::new(),
+                error: Some("Availability is not shared with you".into()) }
+        } else {
+            Schedule::from_items(request, email.clone(), Vec::new())
+        }).collect(),
+    }
+}
+
+fn find_time_fixture(language: tomlook::i18n::Language) -> (Tomlook, mpsc::Receiver<Command>, tokio::sync::mpsc::Receiver<ai::Command>, Arc<ai::Notices>) {
+    let (mut app, receiver, ai_commands, notices) = task_fixture(language);
+    app.workiq_ready = true;
+    let mut people = tomlook::attendees::parse_input("Alex Rivers <alex@example.com>; Jamie Brooks <jamie@example.com>; Morgan Lee <morgan@example.com>").unwrap();
+    people[2].role = tomlook::attendees::Role::Optional;
+    app.open_find_time("Synthetic sync", people, 30);
+    (app, receiver, ai_commands, notices)
+}
+
+/// Answers the debounced read-only free/busy request and returns the candidates' labels.
+fn answer_group_availability(context: &egui::Context, app: &mut Tomlook, ai_commands: &mut tokio::sync::mpsc::Receiver<ai::Command>,
+    notices: &ai::Notices, show: Show) -> Vec<String> {
+    draw_with(context, app, vec![], show);
+    app.find_time.as_mut().unwrap().availability.changed = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    draw_with(context, app, vec![], show);
+    let mut seen = Vec::new();
+    drain_ai(ai_commands, &mut seen);
+    let (id, request) = seen.iter().rev().find_map(|command| match command {
+        ai::Command::GroupAvailability { id, request } => Some((*id, request.clone())),
+        _ => None,
+    }).expect("Debounced read-only free/busy over the searched days");
+    assert_eq!(request.schedules, ["owner@example.com", "alex@example.com", "jamie@example.com", "morgan@example.com"]);
+    assert!(request.end - request.start >= chrono::Duration::days(5), "Five workdays are searched");
+    notices.send(ai::Notice::GroupAvailability { id, result: Ok(Arc::new(group_availability(&request))) }).unwrap();
+    app.receive();
+    draw_with(context, app, vec![], show);
+    let language = app.preferences.language;
+    let Some(Ok(candidates)) = app.find_time.as_ref().unwrap().candidates() else { panic!("Candidates are computed locally") };
+    candidates.list.iter().map(|candidate| tomlook::scheduling::slot_label(candidate.start, candidate.end, language)).collect()
+}
+
+#[test]
+fn find_a_time_shows_candidates_and_holds_selected_times_only_after_the_explicit_blocker_approval() {
+    let show: Show = &|app, ui| app.find_time_dialog(ui.ctx());
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, mut ai_commands, notices) = find_time_fixture(language);
+        let context = egui::Context::default();
+        let labels = answer_group_availability(&context, &mut app, &mut ai_commands, &notices, show);
+        assert!(labels.len() >= 3 && labels.len() <= 10, "{labels:?}");
+        let text = settled(&context, &mut app, show);
+        for label in ["Find a time", "Candidates", "Topic", "Duration", "Weekdays only", "Hold with BLOCKERs",
+            "Propose in a Teams group chat", "Propose by e-mail", "Create meeting"] {
+            assert!(text.contains(language.text(label).as_ref()), "Missing {label}\n{text}");
+        }
+        let reason = match language {
+            tomlook::i18n::Language::En => "All required free · Morgan Lee unknown (optional)",
+            tomlook::i18n::Language::Cs => "Povinní účastníci mají volno · Morgan Lee: neznámé (nepovinně)",
+        };
+        assert!(text.contains(reason), "Unknown is never free\n{text}");
+        click_text(&context, &mut app, show, &labels[0]);
+        click_text(&context, &mut app, show, &labels[1]);
+        assert_eq!(app.find_time.as_ref().unwrap().selected.len(), 2);
+        click_text(&context, &mut app, show, language.text("Hold with BLOCKERs").as_ref());
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains(&tomlook::scheduling::hold_notice(2, language)), "The consequence is explicit\n{text}");
+        assert!(text.contains(&format!("BLOCKER: Synthetic sync · {}", labels[0])), "{text}");
+        assert!(receiver.try_recv().is_err(), "Choosing an action writes nothing");
+        click_text(&context, &mut app, show, &tomlook::scheduling::hold_button(2, language));
+        let Command::HoldTimes { account, proposal, private, category } = receiver.try_recv().unwrap() else { panic!("Exact BLOCKER approval") };
+        assert_eq!(account, "owner@example.com");
+        assert_eq!((proposal.topic.as_str(), proposal.candidates.len(), proposal.attendees.len()), ("Synthetic sync", 2, 3));
+        assert!(!private && category.is_none(), "Normal sensitivity and no category unless chosen");
+        assert!(receiver.try_recv().is_err(), "One click is one approval");
+        assert!(app.find_time.as_ref().unwrap().proposal.is_some(), "The proposal's times are now fixed");
+        let mut seen = Vec::new();
+        drain_ai(&mut ai_commands, &mut seen);
+        assert!(seen.iter().all(|command| matches!(command, ai::Command::GroupAvailability { .. } | ai::Command::People { .. })),
+            "Only read-only lookups reach the AI engine; the write goes through the storage worker");
+    }
+}
+
+#[test]
+fn teams_proposal_shows_exact_members_topic_and_message_and_sends_only_after_create_chat_and_send() {
+    let show: Show = &|app, ui| app.find_time_dialog(ui.ctx());
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, mut ai_commands, notices) = find_time_fixture(language);
+        let context = egui::Context::default();
+        let labels = answer_group_availability(&context, &mut app, &mut ai_commands, &notices, show);
+        click_text(&context, &mut app, show, &labels[0]);
+        click_text(&context, &mut app, show, language.text("Propose in a Teams group chat").as_ref());
+        draw_with(&context, &mut app, vec![], show);
+        let mut seen = Vec::new();
+        drain_ai(&mut ai_commands, &mut seen);
+        let (id, emails) = seen.iter().rev().find_map(|command| match command {
+            ai::Command::ChatCheck { id, account, emails } if account == "owner@example.com" => Some((*id, emails.clone())),
+            _ => None,
+        }).expect("Read-only Teams check");
+        assert_eq!(emails, ["alex@example.com", "jamie@example.com", "morgan@example.com"]);
+        notices.send(ai::Notice::ChatCheck { id, result: Ok(tomlook::scheduling::ChatCheck {
+            members: emails.iter().enumerate().map(|(index, email)| tomlook::scheduling::Member {
+                email: email.clone(), name: email.split('@').next().unwrap().to_owned(),
+                user_id: format!("{:08x}-0000-4000-8000-{:012x}", index + 1, index + 1),
+            }).collect(),
+            unresolved: Vec::new(),
+        }) }).unwrap();
+        app.receive();
+        let text = settled(&context, &mut app, show);
+        let notice = match language {
+            tomlook::i18n::Language::En => "This creates a Teams chat and sends this message to 3 people.",
+            tomlook::i18n::Language::Cs => "Tímto se vytvoří chat v Teams a zpráva se odešle 3 lidem.",
+        };
+        assert!(text.contains(notice), "{text}");
+        assert!(text.contains(&format!("{}: Synthetic sync", language.text("Chat topic"))), "{text}");
+        assert!(text.contains("alex (alex@example.com)"), "{text}");
+        let message = app.find_time.as_ref().unwrap().message.clone();
+        assert!(message.contains(&labels[0]) && message.contains("Synthetic sync"), "{message}");
+        assert!(receiver.try_recv().is_err());
+        click_text(&context, &mut app, show, language.text("Create chat and send").as_ref());
+        let Command::ProposeChat { account, proposal, draft } = receiver.try_recv().unwrap() else { panic!("Exact Teams approval") };
+        assert_eq!(account, "owner@example.com");
+        assert_eq!(proposal.candidates.len(), 1);
+        assert_eq!(draft.members.len(), 3);
+        assert_eq!(draft.topic.as_deref(), Some("Synthetic sync"));
+        assert_eq!(draft.message, message.trim());
+        assert!(receiver.try_recv().is_err());
+    }
+    for (result, expected) in [
+        (Ok(tomlook::scheduling::ChatCheck { members: Vec::new(), unresolved: vec![("guest@partner.example".into(),
+            "Not found in your organization's directory".into())] }), "These people cannot be added to a Teams chat:"),
+        (Err(tomlook::workiq::connection::chat_write::UNSUPPORTED.to_owned()), "Teams proposals are unavailable"),
+    ] {
+        let (mut app, receiver, mut ai_commands, notices) = find_time_fixture(tomlook::i18n::Language::En);
+        let context = egui::Context::default();
+        let labels = answer_group_availability(&context, &mut app, &mut ai_commands, &notices, show);
+        click_text(&context, &mut app, show, &labels[0]);
+        click_text(&context, &mut app, show, "Propose in a Teams group chat");
+        draw_with(&context, &mut app, vec![], show);
+        let mut seen = Vec::new();
+        drain_ai(&mut ai_commands, &mut seen);
+        let id = seen.iter().rev().find_map(|command| match command {
+            ai::Command::ChatCheck { id, .. } => Some(*id),
+            _ => None,
+        }).unwrap();
+        notices.send(ai::Notice::ChatCheck { id, result }).unwrap();
+        app.receive();
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains(expected) && text.contains("Use Propose by e-mail instead."), "{text}");
+        assert!(!text.contains("Create chat and send"), "Nothing can be sent to a reduced group");
+        assert!(receiver.try_recv().is_err());
+    }
+}
+
+#[test]
+fn email_proposal_is_local_text_with_copy_and_a_mailto_link_and_never_sends() {
+    let show: Show = &|app, ui| app.find_time_dialog(ui.ctx());
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, mut ai_commands, notices) = find_time_fixture(language);
+        let context = egui::Context::default();
+        let labels = answer_group_availability(&context, &mut app, &mut ai_commands, &notices, show);
+        click_text(&context, &mut app, show, &labels[0]);
+        click_text(&context, &mut app, show, language.text("Propose by e-mail").as_ref());
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains(language.text("Tomlook never sends e-mail: copy the text or open a new message in your e-mail app.").as_ref()), "{text}");
+        let find = app.find_time.as_ref().unwrap();
+        assert!(find.email_body.contains(&labels[0]), "{}", find.email_body);
+        click_text(&context, &mut app, show, "Morgan Lee (morgan@example.com)");
+        let output = click_text(&context, &mut app, show, language.text("Copy").as_ref());
+        assert!(copied(&output).iter().any(|text| text.contains("Synthetic sync")), "Copied locally");
+        super::followup::OPENED_LINKS.with(|links| links.borrow_mut().clear());
+        click_text(&context, &mut app, show, language.text("Open in Outlook").as_ref());
+        let opened = super::followup::OPENED_LINKS.with(|links| links.borrow().clone());
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].starts_with("mailto:alex@example.com,jamie@example.com?subject="), "Unchecked recipients are left out: {}", opened[0]);
+        assert!(receiver.try_recv().is_err(), "E-mail proposals never write or send");
+    }
+}
+
+fn blocker_activity(app: &mut Tomlook) -> (Event, tomlook::scheduling::Proposal) {
+    let start = (Local::now().date_naive() + chrono::Duration::days(2)).and_hms_opt(10, 0, 0).unwrap()
+        .and_local_timezone(Local).earliest().unwrap().fixed_offset();
+    let mut proposal = tomlook::scheduling::Proposal::new("owner@example.com", "Synthetic sync",
+        tomlook::attendees::parse_input("Alex Rivers <alex@example.com>").unwrap(), 30,
+        vec![tomlook::scheduling::Slot { start, end: start + chrono::Duration::minutes(30) }],
+        app.preferences.language, Local::now().fixed_offset()).unwrap();
+    let mut event = tomlook::calendar::fixture(1).remove(0);
+    event.id = "blocker-event".into();
+    event.title = "BLOCKER: Synthetic sync".into();
+    event.start = start;
+    event.end = start + chrono::Duration::minutes(30);
+    event.is_all_day = false;
+    event.attendees.clear();
+    event.extra.insert("isOrganizer".into(), true.into());
+    proposal.blockers = vec![tomlook::scheduling::Blocker {
+        start, end: event.end, title: event.title.clone(), transaction_id: "approval-blocker-0".into(),
+        event_id: Some(event.id.clone()), state: tomlook::scheduling::BlockerState::Held, message: String::new(),
+    }];
+    app.calendar = Arc::new(Calendar::build(vec![event.clone()], Default::default(), Vec::new()).unwrap());
+    app.activity = Arc::new(tomlook::worker::Activity {
+        task_account: Some("owner@example.com".into()),
+        proposals: Arc::new([(proposal.id.clone(), proposal.clone())].into()),
+        blockers: Arc::new([(event.id.clone(), proposal.id.clone())].into()),
+        ..Default::default()
+    });
+    (event, proposal)
+}
+
+#[test]
+fn blocker_details_confirm_the_time_or_release_every_blocker_with_an_explicit_deletion_approval() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, _, _) = task_fixture(language);
+        app.workiq_ready = true;
+        let (event, proposal) = blocker_activity(&mut app);
+        let context = egui::Context::default();
+        let details: Show = &|app, ui| { let event = app.calendar.events[0].clone(); app.details(ui, event) };
+        let text = settled(&context, &mut app, details);
+        for label in ["Proposed time", "Confirm this time", "Release all BLOCKERs"] {
+            assert!(text.contains(language.text(label).as_ref()), "Missing {label}\n{text}");
+        }
+        click_text(&context, &mut app, details, language.text("Release all BLOCKERs").as_ref());
+        assert!(app.blocker_release.as_ref().is_some_and(|draft| draft.cancel && draft.events == [event.id.clone()]));
+        let dialog: Show = &|app, ui| app.blocker_release_dialog(ui.ctx());
+        let text = settled(&context, &mut app, dialog);
+        assert!(text.contains(&tomlook::scheduling::release_notice(1, language)), "{text}");
+        assert!(receiver.try_recv().is_err(), "Opening the confirmation deletes nothing");
+        click_text(&context, &mut app, dialog, &tomlook::scheduling::release_button(1, language));
+        let Command::ReleaseBlockers { account, proposal: id, events, cancel } = receiver.try_recv().unwrap() else { panic!("Exact release approval") };
+        assert_eq!((account.as_str(), id.as_str(), events, cancel), ("owner@example.com", proposal.id.as_str(), vec![event.id.clone()], true));
+        click_text(&context, &mut app, details, language.text("Confirm this time").as_ref());
+        let draft = app.event_draft.as_ref().expect("The invitation editor opens");
+        assert_eq!((draft.title.as_str(), draft.attendees.len()), ("Synthetic sync", 1));
+        assert_eq!(draft.proposal, Some((proposal.id.clone(), event.id.clone())));
+        let record = tomlook::event_creation::Record::new("owner@example.com".into(), tomlook::event_creation::Draft {
+            title: "Synthetic sync".into(), description: String::new(), start: event.start, end: event.end, category: None,
+            private: false, teams: false, travel_minutes: None, language, attendees: draft.attendees.clone(),
+        }).unwrap();
+        let mut created = record.clone();
+        created.state = tomlook::event_creation::State::Created;
+        app.event_draft = None;
+        app.proposal_confirmation = Some((proposal.id.clone(), record.id.clone()));
+        let mut activity = (*app.activity).clone();
+        activity.event_creations = Arc::new([(record.id.clone(), created)].into());
+        app.activity = Arc::new(activity);
+        app.sync_proposal_confirmation();
+        let Command::ScheduleProposal { proposal: scheduled, record: confirmed, .. } = receiver.try_recv().unwrap() else { panic!("Scheduled after verification") };
+        assert_eq!((scheduled, confirmed), (proposal.id.clone(), record.id.clone()));
+        assert!(app.blocker_release.as_ref().is_some_and(|draft| !draft.cancel), "Deleting the BLOCKERs is offered, not done");
+        let text = settled(&context, &mut app, dialog);
+        assert!(text.contains(language.text("Keep them").as_ref()), "{text}");
+        app.messages_open = true;
+        let overlays: Show = &|app, ui| app.overlays(ui.ctx());
+        let text = settled(&context, &mut app, overlays);
+        assert!(text.contains(language.text("Scheduling proposals").as_ref()) && text.contains("Synthetic sync"), "{text}");
+    }
+}
+
+#[test]
+fn meeting_menu_finds_another_time_with_its_people_except_you() {
+    let (mut app, receiver, _, _) = task_fixture(tomlook::i18n::Language::En);
+    let mut event = tomlook::calendar::fixture(1).remove(0);
+    event.title = "Synthetic review".into();
+    event.organizer = "Alex Rivers <alex@example.com>".into();
+    event.attendees = vec!["Owner <owner@example.com>".into(), "Jamie Brooks <jamie@example.com>".into(), "Room 7 <room7@example.com>".into()];
+    event.extra.insert("tomlook_attendee_roles".into(), serde_json::json!({"jamie@example.com": "optional", "room7@example.com": "resource"}));
+    event.end = event.start + chrono::Duration::minutes(45);
+    event.is_all_day = false;
+    app.calendar = Arc::new(Calendar::build(vec![event], Default::default(), Vec::new()).unwrap());
+    let context = egui::Context::default();
+    let menu: Show = &|app, ui| app.meeting_actions(ui, 0);
+    click_text(&context, &mut app, menu, "Find another time with these people");
+    let find = app.find_time.as_ref().expect("Find a time opens");
+    assert_eq!(find.topic, "Synthetic review");
+    assert_eq!(find.search.minutes, 45);
+    assert_eq!(find.attendees.iter().map(|attendee| (attendee.email.as_str(), attendee.role)).collect::<Vec<_>>(),
+        [("alex@example.com", tomlook::attendees::Role::Required), ("jamie@example.com", tomlook::attendees::Role::Optional)],
+        "You and rooms are left out; roles are kept");
+    assert!(receiver.try_recv().is_err());
+}
+
+#[test]
+fn find_time_demo_scenes_show_fictional_candidates_and_a_disabled_teams_preview_without_workiq() {
+    for teams in [false, true] {
+        let (mut app, _, mut ai_commands) = assistant_fixture();
+        app.preview = true;
+        app.loading = false;
+        let now = Local::now();
+        let mut events = tomlook::showcase::preview_events(now, 198);
+        let blockers = tomlook::showcase::demo_blockers(now, &events, tomlook::i18n::Language::En);
+        events.extend(blockers);
+        app.calendar = Arc::new(Calendar::build(events, Default::default(), Vec::new()).unwrap());
+        let context = egui::Context::default();
+        let show: Show = &|app, ui| app.find_time_dialog(ui.ctx());
+        assert!(!app.demo_find_time_ready(teams));
+        draw_with(&context, &mut app, vec![], show);
+        app.find_time.as_mut().unwrap().availability.changed = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let mut ready = false;
+        for _ in 0..12 {
+            draw_with(&context, &mut app, vec![], show);
+            ready = app.demo_find_time_ready(teams);
+            if ready { break; }
+        }
+        assert!(ready, "The demo scene settles");
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains("Alex Rivers") && text.contains("Kim Lambert") != teams, "{text}");
+        assert_eq!(app.find_time.as_ref().unwrap().selected.len(), 2);
+        if teams {
+            assert!(text.contains("This creates a Teams chat and sends this message to 3 people."), "{text}");
+            assert!(text.contains("The offline demo never changes a calendar or contacts anyone."), "Writes are disabled with a reason\n{text}");
+        }
+        assert!(ai_commands.try_recv().is_err(), "The demo never calls WorkIQ or AI");
+    }
+}

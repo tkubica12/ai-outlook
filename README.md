@@ -37,9 +37,9 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The latest native Windows release is **[v0.13.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.13.0)**.
-Read the [release notes](docs/releases/v0.13.0.md) for changes since v0.12.0.
-Download **[Tomlook-v0.13.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.13.0/Tomlook-v0.13.0-win-x64.zip)**
+The latest native Windows release is **[v0.14.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.14.0)**.
+Read the [release notes](docs/releases/v0.14.0.md) for changes since v0.13.0.
+Download **[Tomlook-v0.14.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.14.0/Tomlook-v0.14.0-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable and unsigned.
 From v0.8.0, Tomlook checks GitHub Releases once a day and installs
@@ -218,22 +218,43 @@ sensitivity, including travel reserves. Delegates explicitly permitted to read
 private items may still see details. **Add travel blocks before and after**
 creates two adjacent busy appointments, 30 minutes each by default, adjustable
 from 15 to 180 minutes. Travel is uncategorized and has no Teams link.
-The editor warns about cached conflicts and missing coverage. No attendees,
-room reservations, recurrence or invitation sending are included.
-**Create event** is the explicit approval for the displayed event and both
-optional reserves. Teams uses Graph's calendar `isOnlineMeeting` /
+The editor warns about cached conflicts and missing coverage. **Attendees**
+(name or e-mail, suggested from people you meet and, when connected, a
+read-only directory search) can be added as required or optional; Tomlook then
+shows a scheduling grid with each person's free/busy for the day (Graph
+`getSchedule`, read-only), a summary such as "1 of 3 available · Jamie tentative",
+and optional **Suggest times**. With attendees the button becomes **Create and
+send invitations** and the dialog lists who receives an Outlook invitation;
+nothing is sent before that click. Room reservations and recurrence are not
+included.
+**Create event** (or **Create and send invitations**) is the explicit approval for the displayed event and both
+optional reserves; reserves never invite anyone. Teams uses Graph's calendar `isOnlineMeeting` /
 `teamsForBusiness` support, checked against the connected calendar before writing.
 The returned join URL appears in meeting details. Progress and exact/partial
-outcomes are saved under **Messages → Event creation**. Each write is read back;
+outcomes are saved under **Messages → Event creation**. Each write is read back,
+including the exact invited attendees and their types;
 unknown or interrupted outcomes are never automatically replayed, and successful
 earlier parts are not rolled back if a later reserve fails. Check Outlook before
-recreating anything after an uncertain result.
+recreating anything after an uncertain result; with attendees, invitations may
+already have been sent.
 For an existing owned, timed meeting, right-click and choose **Add travel blocks
 before and after**. Confirm the two displayed intervals (30 minutes each by
 default, adjustable to 15–180 minutes). This creates only the reserves, never
 another copy of the meeting. Privacy is inherited; a fresh meeting/availability
 check prevents writes against changed meetings or occupied intervals, including
 already existing travel blocks.
+
+**Find a time** (command palette, the new-event editor next to **Suggest times**,
+or **Find another time with these people** on a meeting) searches up to 15
+workdays of read-only free/busy for you and a group, ranks times where every
+required person is free (unknown is never treated as free) and lets you pick up
+to five. You can then create the meeting, **Hold with BLOCKERs** (busy
+"BLOCKER: topic" events in your own calendar only, no attendees), **Propose in a
+Teams group chat** (one new chat and one message, after an explicit **Create chat
+and send**) or **Propose by e-mail** (local text with Copy / Open in Outlook;
+Tomlook never sends e-mail). Each write is a single-use, read-back-verified
+approval; BLOCKERs offer **Confirm this time** and **Release all BLOCKERs**. See
+the native README for details.
 
 The neutral status-bar bell opens a larger recommendation list with one selected
 detail, clear action, meeting and rationale. Open Insights and Skip are at the
