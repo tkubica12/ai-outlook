@@ -95,6 +95,8 @@ impl Tomlook {
                 self.close_palette(context);
             } else if self.tasks_open {
                 self.tasks_open = false;
+            } else if self.weekly.open {
+                self.weekly.open = false;
             } else if self.myday.open {
                 self.myday.open = false;
             } else if self.insights_expanded {
@@ -139,6 +141,7 @@ impl Tomlook {
             || self.messages_open
             || self.tasks_open
             || self.myday.open
+            || self.weekly.open
             || self.meeting_action.is_some()
             || self.event_draft.is_some()
             || self.meeting_menu.is_some()
@@ -324,6 +327,23 @@ impl Tomlook {
                 language.range(days[0], *days.last().expect("view is nonempty"))
             };
             ui.label(RichText::new(language.text(&(label))).size(17.0).strong());
+            if matches!(self.preferences.view, View::Week | View::WorkWeek)
+                && self.date_selection.is_none()
+                && self.date_drag.is_none()
+            {
+                let week = tomlook::weekly::week_of(days[0]);
+                if ui
+                    .add_enabled(
+                        week <= self.current_week(),
+                        egui::Button::new(RichText::new(language.text("Weekly review")).small()),
+                    )
+                    .on_hover_text(language.text("Review the displayed week"))
+                    .on_disabled_hover_text(language.text("Future weeks cannot be reviewed yet."))
+                    .clicked()
+                {
+                    self.open_weekly(Some(week));
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if header_icon(ui, "Commands", HeaderIcon::Commands, language, false).clicked() {
                     self.open_palette();

@@ -1,9 +1,10 @@
-//! Pre-meeting reminders and the morning "My day" overview shown as native Windows toast
-//! notifications.
+//! Pre-meeting reminders, the morning "My day" overview and the weekly review shown as native
+//! Windows toast notifications.
 //!
 //! A dedicated thread owns all notification work: it registers the notification identity,
 //! computes the next due reminder from the cached calendar and waits on a channel until then.
-//! The UI thread only hands over calendar snapshots, My day inputs and preferences.
+//! The UI thread only hands over calendar snapshots, My day and weekly review inputs and
+//! preferences.
 
 use crate::{
     calendar::{Calendar, Event},
@@ -55,6 +56,12 @@ pub const MYDAY_ARGUMENT: &str = "myday";
 const MYDAY_TAG: &str = "myday";
 const MYDAY_TEST_TAG: &str = "myday-test";
 const MYDAY_GROUP: &str = "my-day";
+/// Activation argument prefix of the weekly review notification and its **Open** button,
+/// followed by the reviewed week's Monday: `weekly:2026-11-02`.
+pub const WEEKLY_ARGUMENT: &str = "weekly:";
+const WEEKLY_TAG: &str = "weekly-review";
+const WEEKLY_TEST_TAG: &str = "weekly-review-test";
+const WEEKLY_GROUP: &str = "weekly-review";
 
 /// What a notification click asks the UI to do; the window is already being restored.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +72,8 @@ pub enum Activation {
     Meeting(String),
     /// Open the My day panel.
     MyDay,
+    /// Open the weekly review of the week starting on this Monday.
+    WeeklyReview(chrono::NaiveDate),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -546,6 +555,28 @@ pub fn morning_xml(digest: &crate::myday::Digest, language: Language) -> String 
     xml
 }
 
+/// Activation argument that opens the weekly review of the week starting on `week`.
+pub fn weekly_argument(week: chrono::NaiveDate) -> String {
+    format!("{WEEKLY_ARGUMENT}{}", week.format("%Y-%m-%d"))
+}
+
+/// Toast XML for the weekly review: a title, the counts, the week, **Open** (also a body click,
+/// opening the review of that week) and the system dismiss button. Every dynamic value is escaped.
+pub fn weekly_xml(
+    digest: &crate::weekly::Digest,
+    week: chrono::NaiveDate,
+    language: Language,
+) -> String {
+    let arguments = escape(&weekly_argument(week));
+    format!(
+        r#"<toast activationType="foreground" launch="{arguments}"><visual><binding template="ToastGeneric"><text>{}</text><text hint-maxLines="2">{}</text><text>{}</text></binding></visual><actions><action content="{}" activationType="foreground" arguments="{arguments}"/><action content="" activationType="system" arguments="dismiss"/></actions></toast>"#,
+        escape(&digest.title),
+        escape(&digest.summary),
+        escape(&digest.range),
+        escape(&language.text("Open"))
+    )
+}
+
 /// The brand mark as a PNG for the registered notification identity.
 pub fn icon_png() -> Result<Vec<u8>, String> {
     use image::ImageEncoder;
@@ -600,10 +631,12 @@ pub struct Status {
     pub last_reminder: Option<DateTime<Utc>>,
     pub last_test: Option<DateTime<Utc>>,
     pub last_morning: Option<DateTime<Utc>>,
+    pub last_weekly: Option<DateTime<Utc>>,
 }
 
 type OpenHandler = Arc<dyn Fn(Activation) + Send + Sync>;
 type Morning = (Arc<crate::myday::Sources>, crate::myday::Schedule, Language);
+type Weekly = (Arc<crate::weekly::Sources>, crate::weekly::Schedule, Language);
 
 #[derive(Default)]
 struct Pending {
@@ -615,6 +648,9 @@ struct Pending {
     morning: Option<Morning>,
     morning_sent: Option<Morning>,
     morning_test: Option<(crate::myday::Digest, Language)>,
+    weekly: Option<Weekly>,
+    weekly_sent: Option<Weekly>,
+    weekly_test: Option<(crate::weekly::Digest, chrono::NaiveDate, Language)>,
 }
 
 struct Shared {
@@ -631,6 +667,15 @@ impl Shared {
     fn activate(&self, open: &OpenHandler, arguments: &str) {
         if arguments == MYDAY_ARGUMENT {
             open(Activation::MyDay);
+            return;
+        }
+        if let Some(week) = arguments.strip_prefix(WEEKLY_ARGUMENT) {
+            open(
+                chrono::NaiveDate::parse_from_str(week, "%Y-%m-%d")
+                    .map_or(Activation::Restore, |date| {
+                        Activation::WeeklyReview(crate::weekly::week_of(date))
+                    }),
+            );
             return;
         }
         let Some(tag) = activation_tag(arguments) else {
@@ -805,6 +850,43 @@ impl Reminders {
         self.wake();
     }
 
+    /// Hands over the weekly review inputs and schedule; unchanged input is ignored.
+    pub fn update_weekly(
+        &self,
+        sources: &Arc<crate::weekly::Sources>,
+        schedule: crate::weekly::Schedule,
+        language: Language,
+    ) {
+        {
+            let mut pending = self.shared.pending();
+            if pending
+                .weekly_sent
+                .as_ref()
+                .is_some_and(|(sent, sent_schedule, sent_language)| {
+                    Arc::ptr_eq(sent, sources)
+                        && *sent_schedule == schedule
+                        && *sent_language == language
+                })
+            {
+                return;
+            }
+            pending.weekly_sent = Some((sources.clone(), schedule, language));
+            pending.weekly = Some((sources.clone(), schedule, language));
+        }
+        self.wake();
+    }
+
+    /// Shows the weekly review notification of `week` now, labelled as a test.
+    pub fn test_weekly(
+        &self,
+        digest: crate::weekly::Digest,
+        week: chrono::NaiveDate,
+        language: Language,
+    ) {
+        self.shared.pending().weekly_test = Some((digest, week, language));
+        self.wake();
+    }
+
     /// Re-reads whether Windows allows Tomlook notifications.
     pub fn refresh(&self) {
         self.shared.pending().refresh = true;
@@ -845,6 +927,18 @@ struct Live {
     morning: Option<MorningState>,
     /// Local day the morning overview was last shown.
     morning_shown: Option<chrono::NaiveDate>,
+    weekly: Option<WeeklyState>,
+    /// Local day the weekly review was last shown.
+    weekly_shown: Option<chrono::NaiveDate>,
+}
+
+struct WeeklyState {
+    sources: Arc<crate::weekly::Sources>,
+    schedule: crate::weekly::Schedule,
+    language: Language,
+    /// Inputs and day already evaluated without a notification (too few synced workdays or no
+    /// meetings); the next evaluation waits for newer inputs or another day.
+    evaluated: Option<(Arc<crate::weekly::Sources>, chrono::NaiveDate)>,
 }
 
 struct MorningState {
@@ -868,6 +962,23 @@ impl Live {
             .is_some_and(|(sources, day)| Arc::ptr_eq(sources, &morning.sources) && *day == today);
         let handled = self.morning_shown.max(evaluated.then_some(today));
         let next = crate::myday::next_due(&morning.schedule, handled, local.naive_local())?;
+        Local
+            .from_local_datetime(&next)
+            .earliest()
+            .map(|at| at.with_timezone(&Utc).max(now))
+    }
+
+    /// When the weekly review should next be evaluated.
+    fn weekly_wake(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let weekly = self.weekly.as_ref()?;
+        let local = now.with_timezone(&Local);
+        let today = local.date_naive();
+        let evaluated = weekly
+            .evaluated
+            .as_ref()
+            .is_some_and(|(sources, day)| Arc::ptr_eq(sources, &weekly.sources) && *day == today);
+        let handled = self.weekly_shown.max(evaluated.then_some(today));
+        let next = crate::weekly::next_due(&weekly.schedule, handled, local.naive_local())?;
         Local
             .from_local_datetime(&next)
             .earliest()
@@ -900,6 +1011,7 @@ impl Runner {
                         .next_wake(now)
                         .into_iter()
                         .chain(live.morning_wake(now))
+                        .chain(live.weekly_wake(now))
                         .min()
                 })
                 .map(|at| (at - now).to_std().unwrap_or_default().min(MAX_WAIT));
@@ -914,7 +1026,7 @@ impl Runner {
             {
                 break;
             }
-            let (update, test, refresh, morning, morning_test) = {
+            let (update, test, refresh, morning, morning_test, weekly, weekly_test) = {
                 let mut pending = self.shared.pending();
                 (
                     pending.update.take(),
@@ -922,6 +1034,8 @@ impl Runner {
                     std::mem::take(&mut pending.refresh),
                     pending.morning.take(),
                     pending.morning_test.take(),
+                    pending.weekly.take(),
+                    pending.weekly_test.take(),
                 )
             };
             if refresh {
@@ -936,6 +1050,9 @@ impl Runner {
             }
             if let Some((digest, language)) = morning_test {
                 self.test_morning(&mut backend, digest, language);
+            }
+            if let Some((digest, week, language)) = weekly_test {
+                self.test_weekly(&mut backend, digest, week, language);
             }
             if let Some((calendar, settings)) = update
                 && self.mode == Mode::Live
@@ -966,9 +1083,21 @@ impl Runner {
                     evaluated: None,
                 });
             }
+            if let Some((sources, schedule, language)) = weekly
+                && self.mode == Mode::Live
+            {
+                let live = live.get_or_insert_with(|| self.open_live());
+                live.weekly = Some(WeeklyState {
+                    sources,
+                    schedule,
+                    language,
+                    evaluated: None,
+                });
+            }
             if let Some(live) = &mut live {
                 self.fire_due(&mut backend, live);
                 self.fire_morning(&mut backend, live);
+                self.fire_weekly(&mut backend, live);
                 let next = live.planner.next_wake(Utc::now());
                 self.shared.update(|status| status.next = next);
             }
@@ -1003,6 +1132,16 @@ impl Runner {
             }
             None => None,
         };
+        let weekly_shown = match store.as_ref().map(Store::weekly_review_shown) {
+            Some(Ok(shown)) => shown,
+            Some(Err(error)) => {
+                self.shared.update(|status| {
+                    status.error = Some(format!("Weekly review history is unavailable: {error}"))
+                });
+                None
+            }
+            None => None,
+        };
         Live {
             store,
             planner: Planner::with_fired(fired, now),
@@ -1010,7 +1149,97 @@ impl Runner {
             settings: None,
             morning: None,
             morning_shown,
+            weekly: None,
+            weekly_shown,
         }
+    }
+
+    /// Shows the weekly review once per reviewed week when it is due (the scheduled day until
+    /// 23:59), at least four of its five workdays are synchronized and it had meetings; otherwise
+    /// waits for newer inputs that day.
+    fn fire_weekly(&self, backend: &mut platform::Backend, live: &mut Live) {
+        let Some(weekly) = &mut live.weekly else {
+            return;
+        };
+        let now = Local::now();
+        let today = now.date_naive();
+        if !crate::weekly::due(&weekly.schedule, live.weekly_shown, now.naive_local())
+            || weekly
+                .evaluated
+                .as_ref()
+                .is_some_and(|(sources, day)| Arc::ptr_eq(sources, &weekly.sources) && *day == today)
+        {
+            return;
+        }
+        weekly.evaluated = Some((weekly.sources.clone(), today));
+        let week = crate::weekly::reviewed_week(&weekly.schedule, today);
+        let review = crate::weekly::review(&weekly.sources, week, now);
+        if !review.coverage.sufficient() || review.headline.meetings == 0 {
+            return;
+        }
+        // Recorded before showing: at most once per week, even after a crash.
+        live.weekly_shown = Some(today);
+        let saved = live
+            .store
+            .as_ref()
+            .map(|store| store.save_weekly_review_shown(today));
+        let digest = crate::weekly::digest(&review, week < crate::weekly::week_of(today), weekly.language);
+        let at = now.with_timezone(&Utc);
+        let expires = Local
+            .from_local_datetime(&(today + Duration::days(1)).and_time(chrono::NaiveTime::MIN))
+            .earliest()
+            .map_or(at + Duration::hours(12), |end| end.with_timezone(&Utc));
+        let shown = backend.show(platform::Request {
+            tag: WEEKLY_TAG.into(),
+            group: WEEKLY_GROUP,
+            xml: weekly_xml(&digest, week, weekly.language),
+            expires: expires.max(at + Duration::minutes(15)),
+            event: None,
+        });
+        let setting = backend.setting().ok().flatten();
+        self.shared.update(|status| {
+            status.windows = setting.or(status.windows);
+            match (&shown, &saved) {
+                (Err(error), _) => status.error = Some(error.clone()),
+                (Ok(()), Some(Err(error))) => {
+                    status.last_weekly = Some(at);
+                    status.error = Some(format!("Weekly review history could not be saved: {error}"));
+                }
+                (Ok(()), _) => {
+                    status.error = None;
+                    status.last_weekly = Some(at);
+                }
+            }
+        });
+    }
+
+    fn test_weekly(
+        &self,
+        backend: &mut platform::Backend,
+        mut digest: crate::weekly::Digest,
+        week: chrono::NaiveDate,
+        language: Language,
+    ) {
+        let now = Utc::now();
+        digest.title = format!("{} · {}", digest.title, language.text("Test notification"));
+        let shown = backend.show(platform::Request {
+            tag: WEEKLY_TEST_TAG.into(),
+            group: TEST_GROUP,
+            xml: weekly_xml(&digest, week, language),
+            expires: now + Duration::hours(1),
+            event: None,
+        });
+        let setting = backend.setting().ok().flatten();
+        self.shared.update(|status| {
+            status.windows = setting.or(status.windows);
+            match shown {
+                Ok(()) => {
+                    status.error = None;
+                    status.last_test = Some(now);
+                }
+                Err(error) => status.error = Some(error),
+            }
+        });
     }
 
     /// Shows the morning overview once per local day when it is due, today's calendar is
@@ -2223,5 +2452,75 @@ mod tests {
         );
         assert_eq!(without_next.matches("<text").count(), 2);
         assert!(without_next.contains(r#"content="Open""#));
+    }
+
+    #[test]
+    fn weekly_review_toast_opens_its_week_and_escapes_its_text() {
+        let week = chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        let digest = crate::weekly::Digest {
+            title: "Týdenní přehled".into(),
+            summary: "Váš týden: 18 schůzek · 22 h · 3 konflikty · 4 bez agendy".into(),
+            range: "2. 11. – 8. 11. 2026 · Zákazník <Contoso> & \"partneři\"".into(),
+        };
+        let xml = weekly_xml(&digest, week, Language::Cs);
+        assert!(xml.starts_with(r#"<toast activationType="foreground" launch="weekly:2026-11-02">"#));
+        assert!(xml.contains("<text>Týdenní přehled</text>"));
+        assert!(xml.contains("Váš týden: 18 schůzek · 22 h · 3 konflikty · 4 bez agendy"));
+        assert!(xml.contains("Zákazník &lt;Contoso&gt; &amp; &quot;partneři&quot;"));
+        assert!(xml.contains(r#"<action content="Otevřít" activationType="foreground" arguments="weekly:2026-11-02"/>"#));
+        assert!(xml.contains(r#"arguments="dismiss""#));
+        assert_eq!(xml.matches("<action ").count(), 2);
+        assert!(!xml.contains("scenario=") && !xml.contains("snooze"), "A quiet, ordinary toast");
+        assert_eq!(weekly_argument(week), "weekly:2026-11-02");
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let seen = opened.clone();
+        let open: OpenHandler = Arc::new(move |activation| seen.lock().unwrap().push(activation));
+        let shared = Shared {
+            status: Mutex::new(Status::default()),
+            pending: Mutex::new(Pending::default()),
+            stop: AtomicBool::new(false),
+            notify: Box::new(|| {}),
+            activations: Mutex::new(BTreeMap::new()),
+        };
+        for arguments in ["weekly:2026-11-02", "weekly:2026-11-05", "weekly:not-a-date", "weekly:"] {
+            shared.activate(&open, arguments);
+        }
+        assert_eq!(
+            *opened.lock().unwrap(),
+            [
+                Activation::WeeklyReview(week),
+                Activation::WeeklyReview(week),
+                Activation::Restore,
+                Activation::Restore,
+            ],
+            "Any date opens its Monday's week; invalid arguments only restore Tomlook"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn weekly_review_toast_xml_is_well_formed_for_windows() {
+        use windows::{Data::Xml::Dom::XmlDocument, core::HSTRING};
+        let digest = crate::weekly::Digest {
+            title: "Weekly review".into(),
+            summary: "Your week: 2 meetings · 3 h · 1 conflict".into(),
+            range: "2 Nov - 8 Nov 2026 · A & <B>".into(),
+        };
+        let document = XmlDocument::new().unwrap();
+        document
+            .LoadXml(&HSTRING::from(weekly_xml(
+                &digest,
+                chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap(),
+                Language::En,
+            )))
+            .unwrap();
+        let texts = document
+            .GetElementsByTagName(&HSTRING::from("text"))
+            .unwrap();
+        assert_eq!(texts.Length().unwrap(), 3);
+        assert_eq!(
+            texts.Item(2).unwrap().InnerText().unwrap().to_string(),
+            "2 Nov - 8 Nov 2026 · A & <B>"
+        );
     }
 }

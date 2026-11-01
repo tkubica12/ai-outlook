@@ -26,8 +26,9 @@ pub const DEFAULT_TIME: u16 = 480;
 pub const DEADLINE_HOUR: u32 = 12;
 /// Shortest free gap listed as focus time.
 pub const FOCUS_MINUTES: i64 = 30;
-const FOCUS_START: u32 = 8 * 60;
-const FOCUS_END: u32 = 18 * 60;
+/// Working hours in which focus time is looked for: 08:00–18:00 local time.
+pub const FOCUS_START: u32 = 8 * 60;
+pub const FOCUS_END: u32 = 18 * 60;
 const MENTION_LIMIT: usize = 10;
 const MENTION_CHARS: usize = 300;
 const TITLE_CHARS: usize = 120;
@@ -246,27 +247,31 @@ impl Overview {
     }
 }
 
-/// Local time `minutes` after midnight of `date`; skips forward over a DST gap.
-fn local_time(date: NaiveDate, minutes: u32) -> DateTime<FixedOffset> {
+/// Time `minutes` after midnight of `date` in `zone`; skips forward over a DST gap.
+pub fn local_time_in<Tz: TimeZone>(zone: &Tz, date: NaiveDate, minutes: u32) -> DateTime<FixedOffset> {
     let naive = date.and_time(NaiveTime::MIN) + Duration::minutes(i64::from(minutes));
     (0..=2)
         .find_map(|hours| {
-            Local
-                .from_local_datetime(&(naive + Duration::hours(hours)))
+            zone.from_local_datetime(&(naive + Duration::hours(hours)))
                 .earliest()
         })
         .map(|time| time.fixed_offset())
         .unwrap_or_else(|| naive.and_utc().fixed_offset())
 }
 
-fn cancelled(event: &Event) -> bool {
+/// Local time `minutes` after midnight of `date`; skips forward over a DST gap.
+fn local_time(date: NaiveDate, minutes: u32) -> DateTime<FixedOffset> {
+    local_time_in(&Local, date, minutes)
+}
+
+pub(crate) fn cancelled(event: &Event) -> bool {
     matches!(
         event.status.to_ascii_lowercase().as_str(),
         "cancelled" | "canceled" | "deleted"
     ) || event.extra.get("isCancelled").and_then(Value::as_bool) == Some(true)
 }
 
-fn tentative(event: &Event) -> bool {
+pub(crate) fn tentative(event: &Event) -> bool {
     !event.accepted()
         && !event.following()
         && !cancelled(event)
@@ -344,7 +349,12 @@ pub fn overview(sources: &Sources, now: DateTime<Local>, language: Language) -> 
         }
         covered = Some(covered.map_or(end, |covered| covered.max(end)));
     }
-    let conflicts = conflicts(calendar, &attended, day_start, day_end);
+    let conflicts = conflicts_between(
+        calendar,
+        attended.iter().map(|item| item.event_id.as_str()),
+        day_start,
+        day_end,
+    );
     let unprepared = agenda
         .iter()
         .filter(|item| item.unprepared())
@@ -383,17 +393,20 @@ pub fn overview(sources: &Sources, now: DateTime<Local>, language: Language) -> 
     }
 }
 
-fn conflicts(
+/// Confirmed overlaps of the given meetings with other timed busy items that intersect
+/// `[day_start, day_end)`, each pair once, ordered by the overlap start. Overlap times are not
+/// clipped to the window.
+pub fn conflicts_between<'a>(
     calendar: &Calendar,
-    attended: &[&Item],
+    ids: impl IntoIterator<Item = &'a str>,
     day_start: DateTime<FixedOffset>,
     day_end: DateTime<FixedOffset>,
 ) -> Vec<Conflict> {
     let mut seen = BTreeSet::new();
     let mut found = Vec::new();
-    for item in attended {
+    for id in ids {
         let Some(event) = calendar
-            .event_index(&item.event_id)
+            .event_index(id)
             .map(|index| &calendar.events[index])
         else {
             continue;
@@ -542,16 +555,32 @@ fn mentions(sources: &Sources, days: (NaiveDate, NaiveDate), language: Language)
 
 /// Free gaps of at least 30 minutes between 08:00 and 18:00 that no confirmed busy item covers.
 /// Free, tentative, followed, declined and cancelled items do not block time.
-fn focus(calendar: &Calendar, today: NaiveDate) -> Vec<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
-    let first = local_time(today, FOCUS_START);
-    let last = local_time(today, FOCUS_END);
-    let mut busy = day_events(calendar, today)
+pub fn focus(calendar: &Calendar, today: NaiveDate) -> Vec<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+    free_windows(
+        day_events(calendar, today),
+        today,
+        local_time(today, FOCUS_START),
+        local_time(today, FOCUS_END),
+    )
+}
+
+/// Free gaps of at least 30 minutes in `[first, last)` of `date` that none of `events` blocks:
+/// confirmed busy timed items cover their overlap, all-day busy items covering `date` the whole
+/// window. Free, tentative, followed, declined and cancelled items do not block time.
+pub fn free_windows<'a>(
+    events: impl Iterator<Item = &'a Event>,
+    date: NaiveDate,
+    first: DateTime<FixedOffset>,
+    last: DateTime<FixedOffset>,
+) -> Vec<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+    let mut busy = events
         .filter(|event| crate::recommendations::blocks_time(event))
-        .map(|event| {
+        .filter_map(|event| {
             if event.is_all_day {
-                (first, last)
+                let (from, through) = event.calendar_dates();
+                (from <= date && date <= through).then_some((first, last))
             } else {
-                (event.start.max(first), event.end.min(last))
+                Some((event.start.max(first), event.end.min(last)))
             }
         })
         .filter(|(start, end)| end > start)
@@ -589,6 +618,7 @@ pub enum Noun {
     Unprepared,
     Task,
     Mention,
+    WithoutAgenda,
 }
 
 /// Czech plural form index: 0 for one, 1 for two to four, 2 for zero and five or more.
@@ -609,6 +639,7 @@ pub fn count(count: usize, noun: Noun, language: Language) -> String {
         Noun::Unprepared => (["not prepared", "not prepared"], ["bez přípravy"; 3]),
         Noun::Task => (["task", "tasks"], ["úkol", "úkoly", "úkolů"]),
         Noun::Mention => (["mention", "mentions"], ["zmínka", "zmínky", "zmínek"]),
+        Noun::WithoutAgenda => (["without agenda"; 2], ["bez agendy"; 3]),
     };
     let word = match language {
         Language::En => english[usize::from(count != 1)],

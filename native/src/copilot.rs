@@ -1016,6 +1016,11 @@ fn followup_config() -> SessionConfig {
     tool_free_config(crate::chat::Mode::Fast, crate::followup::SYSTEM_MESSAGE)
 }
 
+/// Weekly summaries use the Quick model and effort with no tools, MCP servers or permissions.
+fn weekly_config() -> SessionConfig {
+    tool_free_config(crate::chat::Mode::Fast, crate::weekly::SYSTEM_MESSAGE)
+}
+
 pub struct Harness {
     pub client: Client,
     config: Config,
@@ -1595,6 +1600,18 @@ impl Harness {
             })
     }
 
+    /// Tool-free Quick-profile session that only summarizes a week from local metrics and notes.
+    pub async fn weekly_session(&self) -> Result<Session, String> {
+        self.verify_profile(crate::chat::Mode::Fast).await?;
+        self.client
+            .create_session(weekly_config())
+            .await
+            .map_err(|e| {
+                self.redactor
+                    .text(&format!("Create isolated weekly summary session: {e}"))
+            })
+    }
+
     async fn data_session(&self, instructions: &str) -> Result<(Session, Arc<Recorder>), String> {
         let mut config = SessionConfig::default().approve_permissions_if(|_| false);
         config.model = Some(self.config.model.clone());
@@ -1834,6 +1851,15 @@ mod tests {
         assert!(config.mcp_servers.as_ref().is_some_and(IndexMap::is_empty));
         assert_eq!(config.enable_config_discovery, Some(false));
         assert!(crate::followup::SYSTEM_MESSAGE.contains("Do not use tools"));
+        let config = weekly_config();
+        assert_eq!(config.model.as_deref(), Some(crate::chat::FAST_MODEL));
+        assert_eq!(config.allowed_models, Some(vec![crate::chat::FAST_MODEL.to_owned()]));
+        assert_eq!(config.available_tools, Some(Vec::new()));
+        assert!(config.tools.is_none());
+        assert!(config.mcp_servers.as_ref().is_some_and(IndexMap::is_empty));
+        assert_eq!(config.enable_config_discovery, Some(false));
+        assert!(crate::weekly::SYSTEM_MESSAGE.contains("Do not use tools"));
+        assert!(crate::weekly::SYSTEM_MESSAGE.contains("Use only the supplied data"));
     }
     use github_copilot_sdk::tool::ToolHandler;
 

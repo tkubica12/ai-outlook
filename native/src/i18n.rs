@@ -2738,6 +2738,232 @@ pub const TEXTS: &[(&str, &str)] = &[
         "Save morning overview history failed",
         "Uložení historie ranního přehledu se nezdařilo",
     ),
+    ("Weekly review", "Týdenní přehled"),
+    (
+        "Open the weekly review of this week",
+        "Otevřít týdenní přehled tohoto týdne",
+    ),
+    ("Review the displayed week", "Přehled zobrazeného týdne"),
+    (
+        "Future weeks cannot be reviewed yet.",
+        "Budoucí týdny zatím nelze vyhodnotit.",
+    ),
+    ("Previous week", "Předchozí týden"),
+    ("This week", "Tento týden"),
+    ("Copy summary", "Kopírovat shrnutí"),
+    (
+        "Copies a short Markdown summary of this week",
+        "Zkopíruje krátké shrnutí týdne ve formátu Markdown",
+    ),
+    ("Summary copied.", "Shrnutí bylo zkopírováno."),
+    (
+        "This week so far, including meetings still scheduled.",
+        "Dosavadní průběh týdne včetně schůzek, které teprve proběhnou.",
+    ),
+    (
+        "The numbers may be incomplete. Days that are not synced are never counted as free.",
+        "Čísla nemusí být úplná. Nenačtené dny se nikdy nepočítají jako volné.",
+    ),
+    (
+        "Fewer than 4 of 5 workdays are synced, so this week is not used for comparisons or the weekly notification.",
+        "Načteny jsou méně než 4 z 5 pracovních dnů, proto se tento týden nepoužije pro srovnání ani pro týdenní oznámení.",
+    ),
+    ("Meetings attended", "Vaše schůzky"),
+    ("Meeting time", "Čas na schůzkách"),
+    ("Overlaps count once", "Překryvy se počítají jednou"),
+    ("Per workday", "Na pracovní den"),
+    ("Monday to Friday", "Pondělí až pátek"),
+    ("Of working time", "Z pracovní doby"),
+    ("Mon–Fri 08:00–18:00", "Po–Pá 8:00–18:00"),
+    ("Longest free block", "Nejdelší volný blok"),
+    (
+        "No earlier weeks with enough synced days to compare with.",
+        "Pro srovnání chybí předchozí týdny s dostatkem načtených dnů.",
+    ),
+    ("Time by category", "Čas podle kategorií"),
+    ("No meetings this week.", "Tento týden žádné schůzky."),
+    (
+        "Each meeting counts toward its first category in full, so overlapping meetings can add up to more than the meeting time.",
+        "Každá schůzka se celá započítá do své první kategorie, takže překrývající se schůzky mohou dohromady dát víc než čas na schůzkách.",
+    ),
+    ("Uncategorized", "Bez kategorie"),
+    ("No conflicts this week.", "Tento týden žádné konflikty."),
+    ("Meetings without an agenda", "Schůzky bez agendy"),
+    (
+        "No meetings with other participants this week.",
+        "Tento týden žádné schůzky s dalšími účastníky.",
+    ),
+    (
+        "Meeting descriptions arrive with the next calendar refresh; agendas are checked after that.",
+        "Popisy schůzek přibudou při příští aktualizaci kalendáře; agenda se ověří potom.",
+    ),
+    (
+        "Every checked meeting has an agenda.",
+        "Všechny ověřené schůzky mají agendu.",
+    ),
+    ("You organize", "Pořádáte vy"),
+    (
+        "Add an agenda so participants can prepare.",
+        "Doplňte agendu, ať se účastníci mohou připravit.",
+    ),
+    ("Others organize", "Pořádají jiní"),
+    (
+        "Consider asking the organizer for an agenda.",
+        "Zvažte, zda organizátora nepožádat o agendu.",
+    ),
+    (
+        "An agenda is any description beyond the Teams join block, links and boilerplate (at least 20 letters or digits).",
+        "Agendou je jakýkoli popis kromě bloku pro připojení k Teams, odkazů a šablonového textu (alespoň 20 písmen nebo číslic).",
+    ),
+    ("Meeting load", "Zatížení schůzkami"),
+    (
+        "Back-to-back chains (3+ meetings, under 10 min apart)",
+        "Schůzky bez přestávky (3 a více, rozestup pod 10 min)",
+    ),
+    ("Longest chain", "Nejdelší řada"),
+    (
+        "Days with more than 6 h of meetings",
+        "Dny s více než 6 h schůzek",
+    ),
+    ("Short meetings (30 min or less)", "Krátké schůzky (nejvýše 30 min)"),
+    ("Long meetings (90 min or more)", "Dlouhé schůzky (alespoň 90 min)"),
+    ("People and customers", "Lidé a zákazníci"),
+    (
+        "No shared meetings with other people this week.",
+        "Tento týden žádné společné schůzky s dalšími lidmi.",
+    ),
+    ("Most time together", "Nejvíc společného času"),
+    ("External companies", "Externí firmy"),
+    (
+        "No meetings with external companies this week.",
+        "Tento týden žádné schůzky s externími firmami.",
+    ),
+    (
+        "Shared meeting time; you, your other mailboxes and rooms are excluded.",
+        "Společný čas na schůzkách; vy, vaše další schránky a místnosti se nepočítají.",
+    ),
+    ("Preparation and follow-through", "Příprava a dotažení"),
+    (
+        "Notes for ended Teams meetings",
+        "Zápisy ze skončených schůzek v Teams",
+    ),
+    ("Tasks created this week", "Úkoly vytvořené tento týden"),
+    ("Tasks completed this week", "Úkoly splněné tento týden"),
+    ("AI summary", "Shrnutí od AI"),
+    ("Highlights", "Hlavní body"),
+    ("Decisions", "Rozhodnutí"),
+    ("Open loops", "Nedotažené body"),
+    ("Suggestions", "Doporučení"),
+    ("Summarizing the week...", "Shrnuji týden…"),
+    ("Summarize the week with AI", "Shrnout týden pomocí AI"),
+    (
+        "One Quick AI request with this week's numbers and saved meeting notes; it counts toward the daily AI limit.",
+        "Jeden rychlý požadavek na AI s čísly tohoto týdne a uloženými zápisy ze schůzek; započítá se do denního limitu AI.",
+    ),
+    (
+        "Connect WorkIQ to your calendar account first.",
+        "Nejdřív připojte WorkIQ ke svému kalendářovému účtu.",
+    ),
+    (
+        "Never automatic. Only the computed numbers and this week's saved meeting notes are sent; the summary is kept on this computer.",
+        "Nikdy se nespouští automaticky. Odesílají se jen spočítaná čísla a uložené zápisy ze schůzek tohoto týdne; shrnutí zůstává v tomto počítači.",
+    ),
+    (
+        "Weekly summary cancelled; nothing was saved.",
+        "Shrnutí týdne bylo zrušeno; nic nebylo uloženo.",
+    ),
+    (
+        "Daily AI request limit reached; no weekly summary was requested.",
+        "Byl dosažen denní limit požadavků na AI; shrnutí týdne nebylo vyžádáno.",
+    ),
+    (
+        "AI returned an invalid weekly summary; nothing was saved.",
+        "AI vrátila neplatné shrnutí týdne; nic nebylo uloženo.",
+    ),
+    (
+        "AI returned an oversized weekly summary; nothing was saved.",
+        "AI vrátila příliš dlouhé shrnutí týdne; nic nebylo uloženo.",
+    ),
+    (
+        "AI returned an empty weekly summary; nothing was saved.",
+        "AI vrátila prázdné shrnutí týdne; nic nebylo uloženo.",
+    ),
+    (
+        "AI returned a weekly summary outside its limits; nothing was saved.",
+        "AI vrátila shrnutí týdne mimo povolené limity; nic nebylo uloženo.",
+    ),
+    (
+        "The weekly summary took too long; try again",
+        "Shrnutí týdne trvalo příliš dlouho; zkuste to znovu",
+    ),
+    (
+        "Copilot reported a session error; no weekly summary was produced.",
+        "Copilot ohlásil chybu relace; shrnutí týdne nevzniklo.",
+    ),
+    (
+        "Cancelled before the weekly summary was requested",
+        "Zrušeno před vyžádáním shrnutí týdne",
+    ),
+    (
+        "The weekly review contains an app credential; nothing was submitted",
+        "Týdenní přehled obsahuje přihlašovací údaj aplikace; nic nebylo odesláno",
+    ),
+    (
+        "The weekly review exceeds the AI summary input limit; nothing was submitted",
+        "Týdenní přehled překračuje vstupní limit shrnutí od AI; nic nebylo odesláno",
+    ),
+    ("Saved weekly summary is invalid", "Uložené shrnutí týdne je neplatné"),
+    (
+        "Saved weekly summary does not match its week",
+        "Uložené shrnutí neodpovídá svému týdnu",
+    ),
+    (
+        "Saved weekly summary exceeds its safety limit",
+        "Uložené shrnutí týdne překračuje bezpečnostní limit",
+    ),
+    (
+        "Weekly summary exceeds its safety limit",
+        "Shrnutí týdne překračuje bezpečnostní limit",
+    ),
+    ("Read weekly summaries failed", "Načtení shrnutí týdnů se nezdařilo"),
+    ("Encode weekly summary failed", "Zakódování shrnutí týdne se nezdařilo"),
+    (
+        "Begin weekly summary storage failed",
+        "Zahájení ukládání shrnutí týdne se nezdařilo",
+    ),
+    ("Save weekly summary failed", "Uložení shrnutí týdne se nezdařilo"),
+    ("Commit weekly summary failed", "Dokončení uložení shrnutí týdne se nezdařilo"),
+    (
+        "Show a weekly review notification",
+        "Zobrazovat oznámení s týdenním přehledem",
+    ),
+    ("Friday (this week)", "Pátek (tento týden)"),
+    ("Monday (previous week)", "Pondělí (minulý týden)"),
+    (
+        "Once a week with the number of meetings, meeting time, conflicts and meetings without an agenda. If Tomlook is not running at that time, it appears later the same day. It stays quiet unless at least 4 of the week's 5 workdays are synced.",
+        "Jednou týdně s počtem schůzek, časem na schůzkách, konflikty a schůzkami bez agendy. Pokud Tomlook v tu dobu neběží, ukáže se později téhož dne. Neozve se, pokud nejsou načteny alespoň 4 z 5 pracovních dnů týdne.",
+    ),
+    (
+        "The weekly review notification does not run in the offline demo; the test uses the demo's fictional calendar.",
+        "V offline ukázce se oznámení s týdenním přehledem nespouští; test použije smyšlený kalendář ukázky.",
+    ),
+    ("Weekly review is turned off.", "Týdenní přehled je vypnutý."),
+    (
+        "Shows the weekly review notification with the current counts.",
+        "Zobrazí oznámení s týdenním přehledem s aktuálními počty.",
+    ),
+    (
+        "Read weekly review history failed",
+        "Načtení historie týdenního přehledu se nezdařilo",
+    ),
+    (
+        "Saved weekly review history is invalid",
+        "Uložená historie týdenního přehledu je neplatná",
+    ),
+    (
+        "Save weekly review history failed",
+        "Uložení historie týdenního přehledu se nezdařilo",
+    ),
 ];
 
 const PATTERNS: &[(&str, &str)] = &[
@@ -2934,6 +3160,34 @@ const PATTERNS: &[(&str, &str)] = &[
         "Morning overview history is unavailable: {}",
         "Historie ranního přehledu není k dispozici: {0}",
     ),
+    (
+        "Compared with the average of earlier weeks: {}",
+        "Srovnání s průměrem předchozích týdnů: {0}",
+    ),
+    ("Synced workdays: {} of 5", "Načtené pracovní dny: {0} z 5"),
+    ("Overlapping time: {}", "Čas v překryvu: {0}"),
+    (
+        "Not checked (description arrives with the next calendar refresh): {}",
+        "Neověřeno (popis přibude při příští aktualizaci kalendáře): {0}",
+    ),
+    ("People from this company: {}", "Lidé z této firmy: {0}"),
+    ("Generated by AI: {}", "Vytvořila AI: {0}"),
+    (
+        "Notes of the oldest meetings left out for size: {}",
+        "Kvůli velikosti vynechané zápisy nejstarších schůzek: {0}",
+    ),
+    (
+        "Last weekly review shown: {}",
+        "Poslední týdenní přehled zobrazen: {0}",
+    ),
+    (
+        "Weekly review history could not be saved: {}",
+        "Historii týdenního přehledu nelze uložit: {0}",
+    ),
+    (
+        "Weekly review history is unavailable: {}",
+        "Historie týdenního přehledu není k dispozici: {0}",
+    ),
 ];
 
 #[cfg(test)]
@@ -2956,6 +3210,7 @@ mod tests {
             include_str!("app/recommendations.rs"),
             include_str!("app/settings.rs"),
             include_str!("app/tasks.rs"),
+            include_str!("app/weekly.rs"),
             include_str!("ask.rs"),
         ];
         for source in sources {

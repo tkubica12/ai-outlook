@@ -37,8 +37,9 @@ The demo window/header are explicitly labelled, connector controls are replaced
 by an offline-demo status, and sample Insights are marked as not AI-generated.
 Selecting a demo meeting asks the bounded storage worker for validated,
 hard-coded sample Insights, not the saved production briefing table or a model.
-Contacts use `example.invalid`; there are no source links or fabricated
-retrieval records. Existing preview guards still prohibit provider connections,
+Contacts use reserved `.invalid` domains (colleagues `example.invalid`,
+fictional customers such as `northstar.invalid`); there are no source links or
+fabricated retrieval records. Existing preview guards still prohibit provider connections,
 browser sign-in, live reads and calendar writes. No credentials or personal
 calendar data are required for README screenshots.
 
@@ -48,20 +49,23 @@ have loaded. It cannot be used in production or combined with measurements.
 Only the demo window content is captured, not other desktop windows or the
 Windows title bar. PNG encoding and exclusive-create file output run on the
 bounded storage worker. Existing images are never overwritten.
-`--demo-scene <details|feedback|prompts|tasks|followup|myday|notifications>` chooses what that screenshot shows:
+`--demo-scene <details|feedback|prompts|tasks|followup|myday|notifications|weekly>` chooses what that screenshot shows:
 the default details pane, expanded Insights with a saved rating and an open
 reason panel, **Settings > AI prompts** after fictional sample feedback is
 saved into the isolated demo profile through the normal storage path, the
 **Tasks** list, the saved follow-up e-mail of the fictional meeting that
-ended yesterday, the **My day** panel, or **Settings > Notifications** scrolled
-to the morning overview. The preview seeds fictional tasks (including tasks imported
+ended yesterday, the **My day** panel, **Settings > Notifications** scrolled
+to the morning overview, or the **Weekly review** of the current week. The preview seeds fictional tasks (including tasks imported
 from that meeting's sample notes) and a fictional follow-up draft into the
 isolated profile; it never requests AI or opens an e-mail link by itself.
 Today always has fictional meetings for My day: on a weekday one extra meeting
 overlaps the workweek agenda and has no sample Insights; on a weekend a short
 fictional agenda with a conflict, a tentative meeting and meetings without
 Insights replaces the empty day. Demo all-day items are shown as free, like
-Outlook's default.
+Outlook's default. The demo also fills the two previous weeks (synced, for the
+weekly review's comparison), gives meetings fictional invitation texts (real
+agendas, empty descriptions and Teams join blocks only) and adds a fictional
+customer contact to customer meetings.
 
 ## Native interaction measurement
 
@@ -1323,7 +1327,7 @@ executor, bounded request lanes/channels and coalesced notices and
 streaming. Calendar navigation does not wait for a model or briefing.
 Ctrl+Space opens the assistant, Enter submits a question from its editor,
 Shift+Enter inserts a newline, Ctrl+Shift+P opens searchable commands,
-Ctrl+D opens or closes **My day**,
+Ctrl+D opens or closes **My day** (the command palette also opens the **Weekly review**),
 and Escape dismisses command suggestions or hides it without cancellation.
 Only **Stop** requests cancellation. Global questions and captured
 meeting context are separate; changing a meeting invalidates its old answer.
@@ -1631,6 +1635,16 @@ and coalesced, so a hidden window cannot block a worker on notification delivery
 
 After WorkIQ connects, the storage worker independently backfills one calendar
 month behind and six months ahead, future first, in at most 42-day reads.
+Each read selects bounded metadata (`id`, `iCalUId`, `subject`, `start`, `end`,
+`categories`, `attendees`, `organizer`, `location`, `responseStatus`, `showAs`,
+`isAllDay`, `isOrganizer`, `webLink`, `isCancelled`, `type`, `sensitivity`,
+online-meeting fields) plus Graph's plain-text `bodyPreview` (at most 255
+characters, cached up to 1,000) for the weekly agenda check; full invitation
+bodies are never synchronized. `bodyPreview` is local-only: it is excluded from
+the preparation fingerprint, so it never marks a meeting as changed, expires
+proposals or approvals, or schedules AI work, and it is stripped from AI meeting
+context. A refreshed day replaces its cached meetings, so meetings cached by an
+older version get their preview with the next refresh of their day.
 Visible-range requests take priority over the next background batch. SQLite
 stores per-day successful-refresh timestamps atomically with the calendar;
 restart resumes from those timestamps, including empty days. Days within two
@@ -1764,6 +1778,115 @@ is shown. Preferences `morning_overview` (default on),
 current counts (the demo's fictional calendar in `--demo`). The morning
 overview never runs in `--demo`, `--stress`, measurements or the acceptance
 executable; the panel works in the demo with its fictional data.
+
+## Weekly review
+
+**Weekly review** / **Týdenní přehled** (command palette, the link at the
+bottom of **My day**, or the small button next to the date range in the Week
+and Work week views, which reviews the displayed week; Escape closes it) shows
+one week, Monday 00:00 to the next Monday 00:00 local time (167 or 169 hours in
+weeks with a DST change). It defaults to the current week; arrows move to
+earlier weeks but never past the current one. Everything is computed locally
+from the cached calendar, the worker's activity snapshot (Insights jobs, saved
+notes, tasks) and the account: no AI and no network. The review and its trend
+are cached and recomputed only when those inputs, the week or the minute change.
+
+- **Coverage**: days without a verified (synchronized) calendar are listed and
+  the numbers are marked partial. Unsynced days are never treated as free:
+  focus time is computed only for synced workdays. A week is *sufficient* with
+  at least 4 of its 5 workdays synced.
+- **Meetings attended**: timed meetings you organize or accepted (not followed,
+  tentative, declined, unanswered or cancelled; all-day items never count).
+  Tentatively accepted meetings are counted separately and not in any time.
+- **Meeting time** is wall-clock time: the union of the meetings clipped to
+  the week, so overlapping meetings count once. **Per workday** is the meeting
+  time on Monday to Friday divided by five; **of working time** is the meeting
+  time inside Monday–Friday 08:00–18:00 divided by those 50 hours.
+- **Focus time** reuses My day per synced workday: free gaps of at least 30
+  minutes between 08:00 and 18:00 not covered by confirmed busy items. The
+  longest such block is shown with its day and time.
+- **Time by category**: every meeting's full time (clipped to the week) counts
+  toward its first category, the one that colors its calendar card, so the
+  categories may add up to more than the wall-clock meeting time; percentages
+  are relative to the category total. Meetings without a category form
+  **Uncategorized**; the Follow marker is never a category (followed meetings
+  are not attended). Bars use the calendar's category colors.
+- **Conflicts**: confirmed overlaps of attended meetings with other timed busy
+  items (`recommendations::conflicts`, as in My day), each pair once with
+  local times; free, tentative and all-day items are not conflicts. The
+  overlapping time counts each moment once even when three meetings overlap.
+- **Meetings without an agenda**: attended meetings with at least one other
+  participant are checked against their cached description (the synchronized
+  Graph `bodyPreview`; a Graph `body` with `contentType`, a plain `body` or
+  `description` when cached, e.g. in the demo). HTML is converted to text; the
+  Teams join block in English and Czech, old and new layouts (separators, join
+  and help lines, meeting ID, passcode, dial-in numbers with their country and
+  city, video-device keys and IDs, organizer options), forwarded-invitation
+  headers, links and punctuation are removed; a line counts only if it has
+  words beyond that boilerplate. A preview cut inside a word or link at 255
+  characters does not count the cut fragment. Fewer than 20 remaining letters
+  or digits is no agenda, so an empty preview (no description) or one with only
+  the Teams block is missing an agenda, while an agenda written before the
+  Teams block counts even when the preview is cut; text written after a full
+  Teams block is beyond the preview. Meetings without a cached preview (cached
+  before previews were synchronized, until the next refresh of their day) are
+  reported as not checked, never as missing. Missing agendas are split into
+  **You organize** (add one) and **Others organize**; each opens the meeting.
+- **Meeting load**: back-to-back chains of three or more meetings with gaps
+  under 10 minutes (overlaps continue a chain), the longest chain, days with
+  more than 6 hours of meeting time and short (30 minutes or less) and long (90
+  minutes or more) meetings.
+- **People and customers**: the five people with the most shared meeting time
+  (the organizer unless you organize it, and attendees; your account, other
+  mailboxes and rooms are excluded; the e-mail address is on hover) and the
+  top external companies by e-mail domain, excluding your own domain; a meeting
+  counts once per company. Cached company icons are shown when present.
+- **Preparation and follow-through**: share of attended meetings with ready
+  Insights, share of ended Teams meetings (with a safe join link) that have
+  saved notes, and local tasks created and completed during the week.
+- **Trends**: meetings, meeting time, per-workday time, working-time share,
+  focus time and the longest free block are compared with the average of the
+  previous four weeks, using only sufficient weeks; painted arrows show the
+  change (no emoji fonts).
+
+**Copy summary** puts a short Markdown summary in the UI language on the
+clipboard. **Summarize the week with AI** / **Shrnout týden pomocí AI** is an
+optional, explicit, never automatic, tool-free Quick request (one per click,
+counted against the daily AI limit and in telemetry as `weekly_summary`). It
+receives only the computed metrics (names of people and companies, meeting
+titles, no addresses) and, for the week's meetings with saved notes, their
+summaries, decisions, talking points, my tasks and mentions, bounded per item;
+the prompt stays under 32 KB by dropping the oldest meetings' notes first. The
+prompt tells the model to use only the supplied data. The answer must be
+exactly `{highlights ≤ 5, decisions ≤ 8, open_loops ≤ 8, suggestions ≤ 3}` with
+one-line items of at most 300 characters; anything else is rejected. The last
+summary of each week is kept locally in the `weekly_summaries` table (up to 104
+weeks per account). It is disabled, with the reason shown, in the offline demo
+and before GitHub Copilot is connected.
+
+### Weekly notification
+
+By default on Fridays at 15:00 (**Settings → Notifications → Weekly review**:
+Friday reviews the current week, Monday the previous one; times from 08:00 to
+17:00), the
+`tomlook-reminders` thread shows one Windows notification titled **Weekly
+review** / **Týdenní přehled**, for example `Your week: 18 meetings · 22 h ·
+3 conflicts · 4 without agenda` (`Váš týden: 18 schůzek · 22 h · 3 konflikty ·
+4 bez agendy`; `Last week` / `Minulý týden` on Mondays) with the date range.
+The agenda count is left out while no meeting description is cached. **Open**
+and a body click open the review of that week through the activation argument
+`weekly:<Monday>`. It is shown at most once per ISO week and never twice for
+the same reviewed week, also after switching between Friday and Monday (the day
+is saved in the `weekly-review-shown-v1` setting before showing); a missed
+notification is caught up the same day until 23:59, otherwise that week is
+skipped. It is shown only when at least 4 of the week's 5 workdays are synced
+and the week had meetings. Preferences `weekly_review` (default on),
+`weekly_review_day` (ISO weekday 5 or 1, default 5) and `weekly_review_time`
+(minutes after midnight, default 900) default for older settings files.
+**Show now** opens the review of the week the notification would show; **Send
+test** shows the notification with the current counts. Like the other
+notifications it never runs in `--demo`, `--stress`, measurements or the
+acceptance executable; the panel works in the demo.
 
 ## Meeting reminders
 

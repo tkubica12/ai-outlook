@@ -47,7 +47,7 @@ fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
 }
 
 /// A section card in the style of the Insights section cards.
-fn card<R>(
+pub(super) fn card<R>(
     ui: &mut egui::Ui,
     accent: Color32,
     title: &str,
@@ -79,7 +79,7 @@ fn card<R>(
 }
 
 /// Fixed-width, left-aligned time column of a row.
-fn time_column(ui: &mut egui::Ui, text: String) {
+pub(super) fn time_column(ui: &mut egui::Ui, text: String) {
     ui.allocate_ui_with_layout(
         Vec2::new(84.0, 18.0),
         egui::Layout::left_to_right(egui::Align::Center),
@@ -361,6 +361,14 @@ impl Tomlook {
                 } else {
                     self.myday_meetings(ui, &overview, now);
                     self.myday_follow_up(ui, &overview, now);
+                }
+                if ui
+                    .link(language.text("Weekly review"))
+                    .on_hover_text(language.text("Open the weekly review of this week"))
+                    .clicked()
+                {
+                    self.myday.open = false;
+                    self.open_weekly(None);
                 }
             });
     }

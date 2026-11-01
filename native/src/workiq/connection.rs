@@ -25,7 +25,9 @@ mod meeting_notes;
 
 pub const SDK_TOOL: &str = "tomlook_workiq_fetch";
 pub const CONTEXT_TOOL: &str = "tomlook_workiq_context";
-const EVENT_FIELDS: &str = "id,iCalUId,subject,start,end,categories,attendees,organizer,location,responseStatus,showAs,isAllDay,isOrganizer,webLink,isCancelled,type,sensitivity,isOnlineMeeting,onlineMeetingProvider,onlineMeeting";
+const EVENT_FIELDS: &str = "id,iCalUId,subject,start,end,categories,attendees,organizer,location,responseStatus,showAs,isAllDay,isOrganizer,webLink,isCancelled,type,sensitivity,isOnlineMeeting,onlineMeetingProvider,onlineMeeting,bodyPreview";
+/// Graph previews are at most 255 characters; anything longer is cut defensively before caching.
+const PREVIEW_CHARS: usize = 1000;
 pub(crate) const CONTEXT_TIMEOUT: &str = "WorkIQ context read timed out";
 pub(super) const READ_TOO_LARGE: &str =
     "WorkIQ read exceeded its 1 MiB data limit; narrow the query";
@@ -801,6 +803,12 @@ fn parse_event(value: Value) -> Result<Event, String> {
         "transactionId", "body", "iCalUId",
     ].into_iter().filter_map(|key| value.get(key).map(|value| (key.to_owned(), value.clone())))
         .collect::<BTreeMap<_, _>>();
+    // Plain-text invitation preview for the local agenda check only; "" means no description.
+    // A missing or non-text preview stays absent, so the agenda is reported as not checked.
+    let preview = value
+        .get("bodyPreview")
+        .and_then(Value::as_str)
+        .map(|text| text.chars().take(PREVIEW_CHARS).collect::<String>());
     let event: GraphEvent =
         serde_json::from_value(value).map_err(|_| "WorkIQ calendar event has an invalid shape")?;
     if event.id.len() > 4000
@@ -851,6 +859,9 @@ fn parse_event(value: Value) -> Result<Event, String> {
         extra.insert("tomlook_attendee_roles".into(), json!(roles));
     }
     extra.extend(creation_metadata);
+    if let Some(preview) = preview {
+        extra.insert("bodyPreview".into(), json!(preview));
+    }
     if let Some(event_type) = event.event_type {
         extra.insert("type".into(), json!(event_type));
     }
@@ -1282,5 +1293,47 @@ mod tests {
         assert_eq!(calendar.events.len(), 1);
         assert_eq!(calendar.events[0].attendees.len(), 500);
         assert_eq!(calendar.events[0].attendee_count(), 604);
+    }
+
+    #[tokio::test]
+    async fn invitation_previews_are_requested_bounded_and_cached_without_changing_revisions() {
+        assert!(EVENT_FIELDS.split(',').any(|field| field == "bodyPreview"));
+        assert!(!EVENT_FIELDS.split(',').any(|field| field == "body"), "Full bodies are never synchronized");
+        let base = json!({"id":"fixture","subject":"Pilot review",
+            "start":{"dateTime":"2026-10-09T10:00:00Z","timeZone":"UTC"},
+            "end":{"dateTime":"2026-10-09T11:00:00Z","timeZone":"UTC"}});
+        let without = parse_event(base.clone()).unwrap();
+        assert!(!without.extra.contains_key("bodyPreview"), "A missing preview is never guessed as empty");
+        for (preview, cached) in [
+            (json!("Agenda: 1) pilot scope 2) owners"), Some("Agenda: 1) pilot scope 2) owners".to_owned())),
+            (json!(""), Some(String::new())),
+            (json!("ž".repeat(1500)), Some("ž".repeat(PREVIEW_CHARS))),
+            (Value::Null, None),
+            (json!({"content":"not text"}), None),
+        ] {
+            let mut row = base.clone();
+            row["bodyPreview"] = preview;
+            let event = parse_event(row).unwrap();
+            assert_eq!(event.extra.get("bodyPreview").and_then(Value::as_str).map(str::to_owned), cached);
+            assert_eq!(crate::scheduler::fingerprint(&event), crate::scheduler::fingerprint(&without));
+            assert_eq!(event.fingerprint(), without.fingerprint());
+        }
+        let day = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let resources = std::sync::Mutex::new(Vec::new());
+        let calendar = calendar_with(Range::new(day, day).unwrap(), |resource| {
+            resources.lock().unwrap().push(resource);
+            let mut row = base.clone();
+            row["bodyPreview"] = json!("Agenda: review the pilot");
+            let data = json!({"value":[row]});
+            async move { Ok(data) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calendar.events[0].extra["bodyPreview"], "Agenda: review the pilot");
+        let resources = resources.into_inner().unwrap();
+        let url = url::Url::parse(&format!("https://graph.microsoft.com{}", resources[0])).unwrap();
+        let select = url.query_pairs().find(|(key, _)| key == "$select").unwrap().1.into_owned();
+        assert_eq!(select, EVENT_FIELDS);
+        assert!(read_resource(&resources[0]).is_ok(), "The synchronized read stays within the read policy");
     }
 }

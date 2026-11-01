@@ -106,10 +106,17 @@ fn default_analysis_revision() -> String {
     PROFILE.into()
 }
 
+/// Provider fields cached for local, read-only metrics only. They never schedule preparation,
+/// expire proposals or invalidate approvals, so they are left out of the event revision.
+pub(crate) const LOCAL_ONLY_FIELDS: [&str; 1] = ["bodyPreview"];
+
 pub(crate) fn fingerprint_for(event: &Event, analysis_revision: &str) -> String {
     // Exclude preparation status: publishing a briefing must not schedule itself again.
     let mut input = event.clone();
     input.briefing_status.clear();
+    for field in LOCAL_ONLY_FIELDS {
+        input.extra.remove(field);
+    }
     let json = serde_json::to_vec(&input).expect("Event contains only JSON-serializable values");
     use sha2::{Digest, Sha256};
     format!(
@@ -800,6 +807,73 @@ mod tests {
             Vec::new(),
         )
         .unwrap()
+    }
+
+    /// A cached live meeting as saved before invitation previews were synchronized.
+    fn fingerprint_fixture() -> Event {
+        serde_json::from_value(serde_json::json!({
+            "id": "AAMkAGFixture=", "title": "Pilot review",
+            "start": "2026-10-12T10:00:00+02:00", "end": "2026-10-12T11:00:00+02:00",
+            "category": "Customer", "attendees": ["Riley Chen <riley@northstar.example>"],
+            "organizer": "Taylor Quinn <taylor@contoso.example>", "location": "Microsoft Teams Meeting",
+            "status": "accepted", "briefing_status": "ready", "is_all_day": false,
+            "source_url": "https://outlook.office.com/calendar/item/fixture",
+            "isCancelled": false, "isOrganizer": false, "showAs": "busy", "categories": ["Customer"],
+            "type": "singleInstance", "iCalUId": "040000008200E00074C5B7101A82E008",
+            "isOnlineMeeting": true, "onlineMeetingProvider": "teamsForBusiness",
+            "onlineMeeting": {"joinUrl": "https://teams.microsoft.com/l/meetup-join/fixture"},
+            "tomlook_attendee_roles": {"riley@northstar.example": "required"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn invitation_previews_never_change_preparation_fingerprints() {
+        // Computed before bodyPreview was synchronized: existing cached events keep these exactly.
+        const BEFORE: &str = "3177c067eb6b928deeb1bea95b26017aa4adc35f84c45808e182fa133a75e10d";
+        const BEFORE_REVISION: &str = "6370349a94c64acadb47a6e9295f90a5712775d38dc289df243afa5481782733";
+        let revision = "a".repeat(64);
+        let event = fingerprint_fixture();
+        assert_eq!(fingerprint(&event), BEFORE);
+        assert_eq!(fingerprint_for(&event, &revision), BEFORE_REVISION);
+        let mut previewed = event.clone();
+        for preview in ["Agenda: 1) pilot scope 2) owners", "", "Changed agenda"] {
+            previewed.extra.insert("bodyPreview".into(), serde_json::json!(preview));
+            assert_eq!(fingerprint(&previewed), BEFORE, "{preview:?}");
+            assert_eq!(fingerprint_for(&previewed, &revision), BEFORE_REVISION, "{preview:?}");
+        }
+        assert_eq!(previewed.extra["bodyPreview"], "Changed agenda", "The preview itself is kept");
+        let mut moved = previewed.clone();
+        moved.start += Duration::minutes(30);
+        assert_ne!(fingerprint(&moved), BEFORE, "Real meeting changes still schedule preparation");
+        let mut free = previewed;
+        free.extra.insert("showAs".into(), serde_json::json!("free"));
+        assert_ne!(fingerprint(&free), BEFORE, "Other provider fields still count");
+    }
+
+    #[test]
+    fn refreshed_invitation_previews_never_cancel_or_requeue_preparation() {
+        let now = Local::now().fixed_offset();
+        let calendar = review_calendar(now);
+        let with_preview = |preview: &str| {
+            let mut events = calendar.events.clone();
+            for event in &mut events {
+                event.extra.insert("bodyPreview".into(), serde_json::json!(preview));
+            }
+            Calendar::build(events, calendar.coverage.clone(), Vec::new()).unwrap()
+        };
+        let mut queue = Queue::default();
+        assert!(queue.reconcile(&calendar, now).is_empty());
+        let (id, flight) = queue.dispatch().unwrap();
+        assert!(queue.reconcile(&with_preview("Agenda: pilot scope"), now).is_empty(),
+            "Running research is not cancelled by a preview arriving with the next sync");
+        assert_eq!(queue.current(id), Some(&flight));
+        queue.finish(id, Ok(()));
+        let completed = queue.jobs[&flight.event_id].clone();
+        assert_eq!(completed.state, State::Completed);
+        let waiting = queue.jobs.clone();
+        queue.reconcile(&with_preview(""), now);
+        assert_eq!(queue.jobs, waiting, "No preparation is scheduled again for a changed preview");
     }
 
     #[test]

@@ -25,6 +25,7 @@ mod palette;
 mod recommendations;
 mod settings;
 mod tasks;
+mod weekly;
 
 use connections::status_text;
 use event_editor::EventDraft;
@@ -182,6 +183,7 @@ pub struct Tomlook {
     tasks_open: bool,
     tasks: tasks::TasksUi,
     myday: myday::MyDayUi,
+    weekly: weekly::WeeklyUi,
     followup: followup::FollowUpUi,
     preview: bool,
     demo_screenshot: Option<std::path::PathBuf>,
@@ -473,6 +475,7 @@ impl Tomlook {
             tasks_open: false,
             tasks: Default::default(),
             myday: Default::default(),
+            weekly: Default::default(),
             followup: Default::default(),
             preview: false,
             demo_screenshot: None,
@@ -964,9 +967,11 @@ impl Tomlook {
                     self.receive_prompt_suggestion(id, result)
                 }
                 ai::Notice::FollowUp { id, result } => self.receive_followup(id, result),
+                ai::Notice::WeeklySummary { id, result } => self.receive_weekly_summary(id, result),
                 ai::Notice::Stopped => {
                     self.stop_prompt_suggestion();
                     self.stop_followup();
+                    self.stop_weekly_summary();
                     if !self.ai_ready && self.connection != "Not connected" {
                         self.error = Some(format!("AI stopped: {}", self.connection));
                     }
@@ -1158,6 +1163,7 @@ impl Tomlook {
             );
         }
         self.sync_morning();
+        self.sync_weekly_notification();
     }
 
     fn receive_reminders(&mut self) {
@@ -1180,6 +1186,12 @@ impl Tomlook {
                 }
                 tomlook::reminders::Activation::MyDay => {
                     self.open_myday();
+                    if !self.assistant_detached {
+                        self.assistant = false;
+                    }
+                }
+                tomlook::reminders::Activation::WeeklyReview(week) => {
+                    self.open_weekly(Some(week));
                     if !self.assistant_detached {
                         self.assistant = false;
                     }
@@ -1218,6 +1230,7 @@ impl eframe::App for Tomlook {
         self.receive_update();
         self.receive_reminders();
         self.sync_myday();
+        self.sync_weekly();
         self.receive_ask_inputs(context);
         self.sync_detached_ask(context);
         if let Some(trace) = &self.startup
@@ -1349,12 +1362,14 @@ impl eframe::App for Tomlook {
             } else if !self.loading {
                 if self.selected.is_none() && self.demo_scene.selects_meeting() {
                     let title = self.demo_scene.meeting();
-                    if let Some(index) = self
-                        .calendar
-                        .events
-                        .iter()
-                        .position(|event| event.title == title)
-                    {
+                    // The demo also has earlier weeks; scenes show this week's occurrence.
+                    let monday = tomlook::calendar::monday(Local::now().date_naive());
+                    let find = |this_week: bool| {
+                        self.calendar.events.iter().position(|event| {
+                            event.title == title && (!this_week || event.calendar_dates().0 >= monday)
+                        })
+                    };
+                    if let Some(index) = find(true).or_else(|| find(false)) {
                         if self.demo_scene.meeting() == tomlook::showcase::ENDED_MEETING {
                             self.anchor = self.calendar.events[index].calendar_dates().0;
                         }

@@ -37,5 +37,6 @@ pub mod storage;
 pub mod tasks;
 pub mod telemetry;
 pub mod updater;
+pub mod weekly;
 pub mod worker;
 pub mod workiq;

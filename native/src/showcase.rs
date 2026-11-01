@@ -2,6 +2,8 @@ use crate::calendar::Event;
 use chrono::{DateTime, Datelike, Duration, Local, Utc};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 /// What `--demo-screenshot` captures; chosen with `--demo-scene`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -21,6 +23,8 @@ pub enum Scene {
     MyDay,
     /// Settings > Notifications with meeting reminders and the morning overview.
     Notifications,
+    /// The weekly review of the demo's current week.
+    Weekly,
 }
 
 impl Scene {
@@ -33,13 +37,14 @@ impl Scene {
             "followup" => Ok(Self::FollowUp),
             "myday" => Ok(Self::MyDay),
             "notifications" => Ok(Self::Notifications),
-            _ => Err("--demo-scene must be details, feedback, prompts, tasks, followup, myday or notifications".into()),
+            "weekly" => Ok(Self::Weekly),
+            _ => Err("--demo-scene must be details, feedback, prompts, tasks, followup, myday, notifications or weekly".into()),
         }
     }
 
     /// Whether the scene first selects [`Scene::meeting`] and waits for its saved document.
     pub fn selects_meeting(self) -> bool {
-        !matches!(self, Self::MyDay | Self::Notifications)
+        !matches!(self, Self::MyDay | Self::Notifications | Self::Weekly)
     }
 
     /// The sample meeting whose details the scene shows.
@@ -357,9 +362,64 @@ const MEETINGS: &[(i64, u32, i64, &str, &str, &str, &str)] = &[
         "Weekly wrap-up",
         "Office",
         "Studio / Room 2",
-        "accepted",
+        "organizer",
     ),
 ];
+
+/// Meetings the demo user organizes with colleagues (other organized items are solo blocks).
+const HOSTED: &[&str] = &["Weekly wrap-up"];
+
+/// Weeks of the preview, relative to the current one, in the order the meeting cycles fill them:
+/// two earlier weeks give the weekly review something to compare with.
+const WEEKS: [i64; 6] = [0, -1, 1, -2, 2, 3];
+
+/// A fictional Teams join block with no agenda of its own.
+const TEAMS_BLOCK: &str = "<div>________________________________________________________________________________</div><div>Microsoft Teams meeting</div><div>Join on your computer, mobile app or room device</div><div><a href=\"https://example.invalid/teams/join\">Click here to join the meeting</a></div><div>Meeting ID: 000 000 000 000</div><div>Passcode: demo00</div><div>________________________________________________________________________________</div>";
+
+/// Fictional invitation texts: agendas, empty descriptions and Teams join blocks only. Meetings
+/// not listed have no cached description, so their agenda is unknown.
+const DESCRIPTIONS: &[(&str, &str)] = &[
+    ("Weekly planning", "<p>Agenda:</p><ol><li>Review last week's outcomes</li><li>Agree on this week's priorities</li><li>Confirm owners for open items</li></ol>"),
+    ("Cedar / Discovery call", ""),
+    ("Product design review", "<p>Walk through the new onboarding screens and decide which variant goes to usability testing.</p>"),
+    ("Northstar / Architecture workshop", "<p>Agenda: compare the two architecture options, demo the prototype and agree on pilot success criteria.</p>"),
+    ("Workshop follow-up", "<p>Collect open questions from the workshop and assign owners.</p>"),
+    ("Engineering sync", "<p>Program: stav buildu, rizika vydání a další kroky.</p>"),
+    ("Orbit / Project kickoff", "<p>Introductions, project goals, timeline and the first milestone.</p>"),
+    ("Cedar / Solution review", ""),
+    ("Team learning lab", "<p>Hands-on session: prompt patterns for meeting preparation.</p>"),
+    ("Coffee & roadmap", "<p>Agenda: TBD</p>"),
+    ("Orbit / Hands-on lab", "<p>Guided lab: deploy the sample app, then review costs and monitoring.</p>"),
+    ("Cedar / Checkpoint", ""),
+    ("Northstar / Pilot review", "<p>Review pilot metrics against the three success criteria and decide on phase two.</p>"),
+    ("Demo day / Show & tell", "<p>Five-minute demos from each team, then voting.</p>"),
+    ("Weekly wrap-up", "<p>&nbsp;</p>"),
+    ("Northstar / Escalation check-in", ""),
+    (ENDED_MEETING, "<p>Agenda: agree on the pilot scope, success criteria and owners.</p>"),
+];
+
+/// A fictional customer contact for meetings with one of the demo's customers.
+fn customer_contact(title: &str) -> Option<&'static str> {
+    [
+        ("Northstar /", "Dana Novak <dana@northstar.invalid>"),
+        ("Cedar /", "Sam Ortiz <sam@cedar.invalid>"),
+        ("Orbit /", "Kim Lambert <kim@orbit.invalid>"),
+    ]
+    .into_iter()
+    .find(|(prefix, _)| title.starts_with(prefix))
+    .map(|(_, contact)| contact)
+}
+
+/// The fictional cached description of a demo meeting: an agenda, an empty text or only the
+/// Teams join block.
+fn description(title: &str) -> Option<Value> {
+    DESCRIPTIONS
+        .iter()
+        .find(|(name, _)| *name == title)
+        .map(|(_, agenda)| {
+            json!({"contentType": "html", "content": format!("<html><body>{agenda}{TEAMS_BLOCK}</body></html>")})
+        })
+}
 
 pub fn events(now: DateTime<Local>, count: usize) -> Vec<Event> {
     let monday = crate::calendar::monday(now.date_naive());
@@ -367,7 +427,7 @@ pub fn events(now: DateTime<Local>, count: usize) -> Vec<Event> {
         .map(|index| {
             let (day, minute, duration, title, category, location, status) =
                 MEETINGS[index % MEETINGS.len()];
-            let date = monday + Duration::days(day + ((index / MEETINGS.len()) % 6) as i64 * 7);
+            let date = monday + Duration::days(day + WEEKS[(index / MEETINGS.len()) % WEEKS.len()] * 7);
             let start = date
                 .and_hms_opt(minute / 60, minute % 60, 0)
                 .expect("valid demo time")
@@ -381,14 +441,18 @@ pub fn events(now: DateTime<Local>, count: usize) -> Vec<Event> {
                 start,
                 end: start + Duration::minutes(duration),
                 category: category.into(),
-                attendees: if status == "organizer" || minute == 0 {
+                attendees: if (status == "organizer" && !HOSTED.contains(&title)) || minute == 0 {
                     Vec::new()
                 } else {
-                    vec![
-                        "Alex Rivers <alex@example.invalid>".into(),
-                        "Jamie Brooks <jamie@example.invalid>".into(),
-                        "Morgan Lee <morgan@example.invalid>".into(),
+                    [
+                        "Alex Rivers <alex@example.invalid>",
+                        "Jamie Brooks <jamie@example.invalid>",
+                        "Morgan Lee <morgan@example.invalid>",
                     ]
+                    .into_iter()
+                    .chain(customer_contact(title))
+                    .map(Into::into)
+                    .collect()
                 },
                 organizer: "Taylor Quinn <taylor@example.invalid>".into(),
                 location: location.into(),
@@ -405,6 +469,7 @@ pub fn events(now: DateTime<Local>, count: usize) -> Vec<Event> {
                 .into_iter()
                 // Like Outlook's default, all-day items are shown as free, so they leave focus time.
                 .chain((minute == 0).then(|| ("showAs".into(), json!("free"))))
+                .chain(description(title).map(|body| ("body".into(), body)))
                 .collect(),
             }
         })
@@ -538,11 +603,15 @@ fn today_events(today: chrono::NaiveDate) -> Vec<Event> {
                     attendees: if *status == "organizer" {
                         Vec::new()
                     } else {
-                        vec![
-                            "Alex Rivers <alex@example.invalid>".into(),
-                            "Jamie Brooks <jamie@example.invalid>".into(),
-                            "Riley Chen <riley@example.invalid>".into(),
+                        [
+                            "Alex Rivers <alex@example.invalid>",
+                            "Jamie Brooks <jamie@example.invalid>",
+                            "Riley Chen <riley@example.invalid>",
                         ]
+                        .into_iter()
+                        .chain(customer_contact(title))
+                        .map(Into::into)
+                        .collect()
                     },
                     organizer: "Taylor Quinn <taylor@example.invalid>".into(),
                     location: (*location).into(),
@@ -555,7 +624,10 @@ fn today_events(today: chrono::NaiveDate) -> Vec<Event> {
                         ("type".into(), json!("singleInstance")),
                         ("isOrganizer".into(), json!(*status == "organizer")),
                         ("categories".into(), json!([category])),
-                    ]),
+                    ])
+                    .into_iter()
+                    .chain(description(title).map(|body| ("body".into(), body)))
+                    .collect(),
                 }
             },
         )
@@ -604,7 +676,12 @@ pub fn preview_events(now: DateTime<Local>, count: usize) -> Vec<Event> {
                 ("type".into(), json!("singleInstance")),
                 ("isOrganizer".into(), json!(false)),
                 ("categories".into(), json!(["Customer"])),
-            ]),
+                // A fictional Teams link of an ended meeting; Join is never offered for it.
+                ("onlineMeeting".into(), json!({"joinUrl": "https://example.invalid/teams/pilot-planning"})),
+            ])
+            .into_iter()
+            .chain(description(ENDED_MEETING).map(|body| ("body".into(), body)))
+            .collect(),
         });
     }
     events
@@ -803,7 +880,7 @@ mod tests {
                 && event
                     .attendees
                     .iter()
-                    .all(|name| name.ends_with("@example.invalid>"))
+                    .all(|name| name.ends_with(".invalid>"))
         }));
     }
 
@@ -820,12 +897,13 @@ mod tests {
         assert_eq!(summary.preparation.reasons[0], (crate::feedback::Reason::TooVague, 2));
         for (value, scene) in [("details", Scene::Details), ("feedback", Scene::Feedback), ("prompts", Scene::Prompts),
             ("tasks", Scene::Tasks), ("followup", Scene::FollowUp), ("myday", Scene::MyDay),
-            ("notifications", Scene::Notifications)] {
+            ("notifications", Scene::Notifications), ("weekly", Scene::Weekly)] {
             assert_eq!(Scene::parse(value).unwrap(), scene);
         }
         assert!(Scene::parse("settings").is_err());
         assert_eq!(Scene::FollowUp.meeting(), ENDED_MEETING);
         assert!(Scene::Details.selects_meeting() && !Scene::MyDay.selects_meeting() && !Scene::Notifications.selects_meeting());
+        assert!(!Scene::Weekly.selects_meeting());
     }
 
     #[test]
@@ -887,6 +965,48 @@ mod tests {
             assert!(overview.agenda.iter().any(|item| item.title == "Northstar / Escalation check-in" && item.unprepared()));
             assert!(overview.focus.as_ref().is_some_and(|focus| !focus.is_empty()));
             assert_eq!(overview.mentions.len(), 1, "Yesterday's sample notes mention me");
+        }
+    }
+
+    #[test]
+    fn demo_week_has_categories_a_conflict_meetings_without_agenda_customers_and_a_trend() {
+        use chrono::TimeZone;
+        use std::sync::Arc;
+        for day in [11, 15] {
+            let now = Local.with_ymd_and_hms(2026, 11, day, 16, 0, 0).earliest().unwrap();
+            let events = preview_events(now, 200);
+            assert_eq!(events.len(), 200);
+            let monday = crate::calendar::monday(now.date_naive());
+            let coverage = (-14..42).map(|offset| monday + Duration::days(offset)).collect();
+            let calendar = crate::calendar::Calendar::build(events, coverage, vec![]).unwrap();
+            let ended = calendar.events.iter().find(|event| event.title == ENDED_MEETING).unwrap();
+            assert!(ended.join_url().is_some() && ended.end < now.fixed_offset());
+            let sources = crate::weekly::Sources {
+                own_domains: ["example.invalid".to_owned()].into(),
+                ready: Arc::new(calendar.events.iter().filter(|event| event.briefing_status == "ready").map(|event| event.id.clone()).collect()),
+                notes: Arc::new([ended.id.clone()].into()),
+                calendar: Arc::new(calendar),
+                ..Default::default()
+            };
+            let review = crate::weekly::review(&sources, monday, now);
+            assert!(review.coverage.sufficient() && !review.coverage.partial(), "{day}");
+            assert!(review.headline.meetings > 20 && review.headline.focus_minutes.is_some_and(|minutes| minutes > 0), "{day}");
+            assert!(review.categories.len() >= 5, "{day}: {:?}", review.categories);
+            assert!(!review.conflicts.is_empty(), "{day}: today's extra meeting overlaps");
+            assert!(review.agenda.organized().count() >= 1 && review.agenda.others().count() >= 3, "{day}: {:?}", review.agenda);
+            assert!(review.agenda.missing.iter().any(|item| item.title == "Coffee & roadmap"));
+            assert!(review.agenda.unknown > 0 && review.agenda.checked > review.agenda.missing.len());
+            assert_eq!(
+                review.companies.iter().map(|company| company.domain.as_str()).collect::<BTreeSet<_>>(),
+                ["cedar.invalid", "northstar.invalid", "orbit.invalid"].into(),
+                "Customers are external companies; the demo's colleagues are not"
+            );
+            assert!(review.people.iter().any(|person| person.name == "Alex Rivers"));
+            assert_eq!((review.preparation.teams_ended, review.preparation.notes), (1, 1));
+            assert!(review.load.short > 0 && review.load.long > 0);
+            let trend = crate::weekly::trend(&sources, monday).unwrap();
+            assert_eq!(trend.weeks, [monday - Duration::days(7), monday - Duration::days(14)]);
+            assert!(trend.meetings > 20.0);
         }
     }
 

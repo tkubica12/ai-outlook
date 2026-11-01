@@ -5746,3 +5746,279 @@ fn morning_overview_settings_save_preferences_show_now_and_report_status() {
         assert!(receiver.try_iter().all(|command| !matches!(command, Command::PrepareNow(_))));
     }
 }
+
+/// Week of Monday 9 November 2026, seen on Wednesday at noon: an overlapping customer review
+/// (Teams block only) and architecture sync I organize (empty description), a stand-up with an
+/// agenda and an uncategorized planning meeting without a cached description.
+fn weekly_fixture(language: tomlook::i18n::Language) -> (
+    Tomlook,
+    mpsc::Receiver<Command>,
+    tokio::sync::mpsc::Receiver<ai::Command>,
+    Arc<ai::Notices>,
+) {
+    let (mut app, receiver, ai_commands, notices) = task_fixture(language);
+    let account = "owner@example.com";
+    let monday = myday_day(9);
+    app.weekly.now = Some(myday_at(myday_day(11), 12, 0));
+    let body = |content: &str| serde_json::json!({"contentType": "html", "content": content});
+    let teams = "<div>________________</div><div>Microsoft Teams meeting</div><div>Join on your computer, mobile app or room device</div><div>Meeting ID: 312 449 845 811</div><div>Passcode: 7tBHx2</div>";
+    let mut review = myday_meeting("review", "Customer review", myday_at(monday, 10, 0), 60, "accepted");
+    review.organizer = "Taylor Quinn <taylor@contoso.example>".into();
+    review.attendees = vec![format!("Owner <{account}>"), "Riley Chen <riley@northstar.example>".into()];
+    review.extra.insert("categories".into(), serde_json::json!(["Customer"]));
+    review.extra.insert("body".into(), body(teams));
+    let mut architecture = myday_meeting("architecture", "Architecture sync", myday_at(monday, 10, 30), 60, "organizer");
+    architecture.organizer = format!("Owner <{account}>");
+    architecture.attendees = vec!["Alex Rivers <alex@example.com>".into()];
+    architecture.extra.insert("isOrganizer".into(), serde_json::json!(true));
+    architecture.extra.insert("categories".into(), serde_json::json!(["Customer"]));
+    architecture.extra.insert("body".into(), body(""));
+    let mut standup = myday_meeting("standup", "Morning standup", myday_at(monday, 8, 30), 15, "accepted");
+    standup.extra.insert("categories".into(), serde_json::json!(["Office"]));
+    standup.extra.insert("body".into(), body("<p>Agenda: blockers, release status and today's priorities</p>"));
+    let mut planning = myday_meeting("planning", "Planning", myday_at(monday + chrono::Duration::days(1), 9, 0), 60, "accepted");
+    planning.extra.insert("categories".into(), serde_json::json!([]));
+    planning.category.clear();
+    let coverage = (0..7).map(|offset| monday + chrono::Duration::days(offset)).collect();
+    app.calendar = Arc::new(Calendar::build(vec![review, architecture, standup, planning], coverage, vec![]).unwrap());
+    let created = myday_at(monday + chrono::Duration::days(1), 9, 0).to_utc();
+    let mut task = tomlook::tasks::New::manual("Send the deck", None, language).unwrap().task(account, created).unwrap();
+    task.id = 1;
+    app.activity = Arc::new(tomlook::worker::Activity {
+        task_account: Some(account.into()),
+        tasks: Arc::new(vec![task]),
+        ..Default::default()
+    });
+    app.weekly.open = true;
+    (app, receiver, ai_commands, notices)
+}
+
+#[test]
+fn weekly_review_panel_shows_metrics_opens_meetings_copies_and_summarizes_on_request() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let czech = language == tomlook::i18n::Language::Cs;
+        let (mut app, receiver, mut ai_commands, notices) = weekly_fixture(language);
+        let context = egui::Context::default();
+        let show: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| app.weekly_panel(ui);
+        draw_with(&context, &mut app, vec![], show);
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        for label in [
+            "Time by category", "Conflicts", "Meetings without an agenda", "You organize", "Others organize",
+            "Meeting load", "People and customers", "Preparation and follow-through", "AI summary",
+            "Summarize the week with AI", "Meetings attended", "Meeting time", "Focus time", "Longest free block",
+            "Uncategorized", "External companies", "Copy summary", "This week so far, including meetings still scheduled.",
+            "No earlier weeks with enough synced days to compare with.",
+        ] {
+            assert!(text.contains(language.text(label).as_ref()), "{language:?}: missing {label}\n{text}");
+        }
+        for expected in [
+            language.range(myday_day(9), myday_day(15)),
+            if czech { "2,8 h".into() } else { "2.8 h".into() },
+            "33 min".into(),
+            "Customer".into(), "Riley Chen".into(), "contoso.example".into(), "northstar.example".into(),
+            "Customer review".into(), "Architecture sync".into(),
+            if czech { "Neověřeno (popis přibude při příští aktualizaci kalendáře): 1".into() } else { "Not checked (description arrives with the next calendar refresh): 1".into() },
+            if czech { "Čas v překryvu: 30 min".into() } else { "Overlapping time: 30 min".into() },
+        ] {
+            assert!(text.contains(&expected), "{language:?}: missing {expected}\n{text}");
+        }
+        assert!(!text.contains("example.com"), "My own domain is not an external company and addresses are only shown on hover");
+        assert!(ai_commands.try_recv().is_err(), "The weekly review never asks AI by itself");
+        let output = click_text(&context, &mut app, show, language.text("Copy summary").as_ref());
+        let copied = copied(&output);
+        assert_eq!(copied.len(), 1);
+        assert!(copied[0].starts_with(&format!("**{} · ", language.text("Weekly review"))), "{}", copied[0]);
+        assert!(output_text(&draw_with(&context, &mut app, vec![], show)).contains(language.text("Summary copied.").as_ref()));
+        click_text(&context, &mut app, show, "Customer review");
+        assert_eq!(app.selected, app.calendar.event_index("review"), "A meeting opens its details");
+        assert!(app.weekly.open, "The review stays open");
+        click_text(&context, &mut app, show, "<");
+        assert_eq!(app.weekly.week, Some(myday_day(2)));
+        let earlier = output_text(&draw_with(&context, &mut app, vec![], show));
+        assert!(earlier.contains(language.text("No meetings this week.").as_ref()) && earlier.contains(language.text("Not synced").as_ref()));
+        click_text(&context, &mut app, show, ">");
+        assert_eq!(app.weekly.week, None, "Back to the current week; there is no future week");
+        click_text(&context, &mut app, show, language.text("Summarize the week with AI").as_ref());
+        let mut requests = Vec::new();
+        while let Ok(command) = ai_commands.try_recv() {
+            if let ai::Command::WeeklySummary(request) = command { requests.push(request); }
+        }
+        assert_eq!(requests.len(), 1, "One explicit request");
+        let request = requests.remove(0);
+        assert_eq!((request.week, request.language, request.account.as_str()), (myday_day(9), language, "owner@example.com"));
+        assert!(request.prompt().unwrap().len() <= tomlook::weekly::INPUT_LIMIT);
+        assert!(output_text(&draw_with(&context, &mut app, vec![], show)).contains(language.text("Summarizing the week...").as_ref()));
+        notices.send(ai::Notice::WeeklySummary { id: request.id + 100, result: Ok(tomlook::weekly::AiSummary {
+            highlights: vec!["Stale".into()], ..Default::default() }) }).unwrap();
+        app.receive();
+        assert!(app.weekly.running.is_some(), "Unknown results are ignored");
+        notices.send(ai::Notice::WeeklySummary { id: request.id, result: Ok(tomlook::weekly::AiSummary {
+            highlights: vec!["Customer meetings took most of the week.".into()],
+            suggestions: vec!["Add an agenda to the architecture sync.".into()],
+            ..Default::default() }) }).unwrap();
+        app.receive();
+        let saved = receiver.try_iter().find_map(|command| match command {
+            Command::SaveWeeklySummary(saved) => Some(saved),
+            _ => None,
+        }).expect("The validated summary is saved locally");
+        assert_eq!((saved.week, saved.account.as_str()), (myday_day(9), "owner@example.com"));
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        for expected in ["Customer meetings took most of the week.", "Add an agenda to the architecture sync."] {
+            assert!(text.contains(expected), "{expected}\n{text}");
+        }
+        assert!(text.contains(language.text("Highlights").as_ref()) && text.contains(language.text("Regenerate").as_ref()));
+        click_text(&context, &mut app, show, language.text("Regenerate").as_ref());
+        let request = loop {
+            if let ai::Command::WeeklySummary(request) = ai_commands.try_recv().unwrap() { break request; }
+        };
+        notices.send(ai::Notice::WeeklySummary { id: request.id,
+            result: Err("Daily AI request limit reached; no weekly summary was requested.".into()) }).unwrap();
+        app.receive();
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        assert!(text.contains(language.text("Daily AI request limit reached; no weekly summary was requested.").as_ref()));
+        assert!(text.contains("Customer meetings took most of the week."), "A failed regeneration keeps the saved summary");
+        let partial = Calendar::build(app.calendar.events.clone(), [myday_day(9), myday_day(10)].into(), vec![]).unwrap();
+        app.calendar = Arc::new(partial);
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        assert!(text.contains(language.text("The numbers may be incomplete. Days that are not synced are never counted as free.").as_ref()));
+        assert!(text.contains(language.text("Fewer than 4 of 5 workdays are synced, so this week is not used for comparisons or the weekly notification.").as_ref()));
+        assert!(text.contains(&format!("{}: {}", language.text("Not synced"), language.date(myday_day(11), false).trim())));
+    }
+}
+
+#[test]
+fn weekly_review_opens_from_palette_my_day_week_header_and_notification_and_escape_closes_it() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, _, mut ai_commands, _) = weekly_fixture(language);
+        app.weekly.open = false;
+        let matches = command_matches_in(if language == tomlook::i18n::Language::Cs { "týdenní" } else { "weekly review" }, language);
+        assert_eq!(matches.first(), Some(&PaletteCommand::WeeklyReview));
+        let context = egui::Context::default();
+        app.weekly.week = Some(myday_day(2));
+        app.run_palette_command(PaletteCommand::WeeklyReview, &context);
+        assert!(app.weekly.open && app.weekly.week.is_none(), "The palette opens the current week");
+        let mut text = String::new();
+        for _ in 0..2 {
+            let mut output = context.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1600.0, 900.0))),
+                ..Default::default()
+            }, |ui| app.weekly_window(ui.ctx()));
+            output.textures_delta.clear();
+            text = output_text(&output);
+        }
+        assert!(text.contains(language.text("Weekly review").as_ref()) && text.contains("Customer review"), "{text}");
+        let key = |key, modifiers| egui::RawInput {
+            events: vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }],
+            ..Default::default()
+        };
+        let mut output = context.run_ui(key(Key::ArrowDown, Modifiers::NONE), |ui| app.shortcuts(ui.ctx()));
+        output.textures_delta.clear();
+        assert!(app.selected.is_none(), "Calendar navigation pauses while the review is open");
+        let mut output = context.run_ui(key(Key::Escape, Modifiers::NONE), |ui| app.shortcuts(ui.ctx()));
+        output.textures_delta.clear();
+        assert!(!app.weekly.open, "Escape closes the weekly review");
+        app.myday.now = app.weekly.now;
+        app.myday.open = true;
+        let myday: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| app.myday_panel(ui);
+        click_text(&context, &mut app, myday, language.text("Weekly review").as_ref());
+        assert!(app.weekly.open && !app.myday.open && app.weekly.week.is_none(), "My day links to this week's review");
+        app.weekly.open = false;
+        let header: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| app.header(ui);
+        app.preferences.view = View::Week;
+        app.anchor = myday_day(4);
+        click_text(&context, &mut app, header, language.text("Weekly review").as_ref());
+        assert!(app.weekly.open);
+        assert_eq!(app.weekly.week, Some(myday_day(2)), "The header reviews the displayed week");
+        app.weekly.open = false;
+        app.preferences.view = View::WorkWeek;
+        app.anchor = myday_day(25);
+        click_text(&context, &mut app, header, language.text("Weekly review").as_ref());
+        assert!(!app.weekly.open, "Future weeks cannot be reviewed");
+        app.preferences.view = View::Month;
+        assert!(!output_text(&draw_with(&context, &mut app, vec![], header)).contains(language.text("Weekly review").as_ref()),
+            "Only week views offer the button");
+        let (opened, reminder_open) = mpsc::sync_channel(8);
+        app.reminder_open = Some(reminder_open);
+        app.assistant = true;
+        opened.send(tomlook::reminders::Activation::WeeklyReview(myday_day(2))).unwrap();
+        app.receive_reminders();
+        assert!(app.weekly.open && !app.assistant);
+        assert_eq!(app.weekly.week, Some(myday_day(2)), "The notification opens the week it reviewed");
+        while let Ok(command) = ai_commands.try_recv() {
+            assert!(matches!(command, ai::Command::RefreshCalendarAvailability | ai::Command::Companies(_)),
+                "Opening the weekly review never asks AI");
+        }
+    }
+}
+
+#[test]
+fn weekly_review_settings_save_preferences_show_now_and_report_status() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, _, _) = weekly_fixture(language);
+        app.weekly.open = false;
+        let context = egui::Context::default();
+        let show: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| {
+            let status = app.reminder_status.clone();
+            app.weekly_preferences(ui, &status);
+        };
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        for label in ["Weekly review", "Show a weekly review notification", "Day", "Friday (this week)",
+            "Monday (previous week)", "Time", "Show now", "Send test"] {
+            assert!(text.contains(language.text(label).as_ref()), "{language:?}: missing {label}");
+        }
+        for time in ["08:00", "12:00", "15:00", "17:00"] {
+            assert!(text.contains(time), "{time}");
+        }
+        click_text(&context, &mut app, show, "16:00");
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Preferences(preferences)
+            if preferences.weekly_review_time == 960 && preferences.weekly_review && preferences.weekly_review_day == 5));
+        click_text(&context, &mut app, show, language.text("Monday (previous week)").as_ref());
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Preferences(preferences) if preferences.weekly_review_day == 1));
+        click_text(&context, &mut app, show, language.text("Show now").as_ref());
+        assert!(app.weekly.open);
+        assert_eq!(app.weekly.week, Some(myday_day(2)), "A Monday notification reviews the previous week");
+        click_text(&context, &mut app, show, language.text("Show a weekly review notification").as_ref());
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Preferences(preferences) if !preferences.weekly_review));
+        app.reminder_status.last_weekly = Some(chrono::Utc::now());
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        assert!(text.contains(language.text("Weekly review is turned off.").as_ref()));
+        assert!(text.contains(if language == tomlook::i18n::Language::Cs { "Poslední týdenní přehled zobrazen: " } else { "Last weekly review shown: " }), "{text}");
+        assert!(receiver.try_iter().all(|command| !matches!(command, Command::PrepareNow(_))));
+    }
+}
+
+#[test]
+fn demo_weekly_review_shows_fictional_numbers_and_never_requests_ai() {
+    use chrono::TimeZone;
+    for (date, language) in [(11, tomlook::i18n::Language::En), (15, tomlook::i18n::Language::Cs)] {
+        let (mut app, receiver, mut ai_commands, _) = task_fixture(language);
+        app.preview = true;
+        app.calendar_owner = None;
+        let now = Local.with_ymd_and_hms(2026, 11, date, 16, 0, 0).earliest().unwrap();
+        app.weekly.now = Some(now);
+        let monday = tomlook::calendar::monday(now.date_naive());
+        let coverage = (-14..42).map(|offset| monday + chrono::Duration::days(offset)).collect();
+        app.calendar = Arc::new(Calendar::build(tomlook::showcase::preview_events(now, 200), coverage, vec![]).unwrap());
+        app.activity = Arc::new(tomlook::worker::Activity {
+            task_account: Some(tomlook::feedback::PREVIEW_ACCOUNT.into()), ..Default::default()
+        });
+        app.weekly.open = true;
+        let context = egui::Context::default();
+        let show: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| app.weekly_panel(ui);
+        draw_with(&context, &mut app, vec![], show);
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        for expected in ["northstar.invalid", "Coffee & roadmap", "Weekly wrap-up", "Alex Rivers"] {
+            assert!(text.contains(expected), "{date}: missing {expected}\n{text}");
+        }
+        for label in ["Offline demo - fictional calendar", "Offline demo never sends AI requests.", "Summarize the week with AI"] {
+            assert!(text.contains(language.text(label).as_ref()), "{date}: missing {label}");
+        }
+        assert!(!text.contains(language.text("No earlier weeks with enough synced days to compare with.").as_ref()),
+            "The demo's earlier weeks give a comparison");
+        assert!(!text.contains(language.text("No conflicts this week.").as_ref()), "The demo week has a conflict");
+        click_text(&context, &mut app, show, language.text("Summarize the week with AI").as_ref());
+        assert!(app.weekly.running.is_none());
+        assert!(ai_commands.try_recv().is_err(), "The demo never requests AI");
+        assert!(receiver.try_iter().all(|command| !matches!(command, Command::SaveWeeklySummary(_))));
+    }
+}

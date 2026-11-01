@@ -741,6 +741,18 @@ impl Tomlook {
                 self.preferences_section = PreferencesSection::Notifications;
                 self.demo_frames > 8
             }
+            Scene::Weekly => {
+                if !self.weekly.open {
+                    self.open_weekly(None);
+                }
+                let ready = self
+                    .weekly_review()
+                    .is_some_and(|(review, _)| review.headline.meetings > 0);
+                if !ready {
+                    self.demo_frames = 0;
+                }
+                ready && self.demo_frames > 5
+            }
         }
     }
 }

@@ -1497,6 +1497,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invitation_previews_never_make_an_approval_stale_or_fail_read_back() {
+        let operation = operation(false);
+        assert!(!operation.event.extra.contains_key("bodyPreview"), "Approved from a cache without previews");
+        let mut api = Fake::new(&operation);
+        api.current.extra.insert("bodyPreview".into(), json!("Agenda: confirm the rollout owner"));
+        let Outcome::Applied(applied) = execute(&api, &operation).await else {
+            panic!("A preview from the live read must not make the approval stale");
+        };
+        assert_eq!(api.writes.load(Ordering::SeqCst), 1);
+        let mut returned = *applied;
+        returned.extra.insert("bodyPreview".into(), json!("Agenda changed by the organizer"));
+        assert!(verified(&returned, &operation), "Read-back ignores the preview, not the change");
+        returned.title.push_str(" moved");
+        assert!(!verified(&returned, &operation));
+    }
+
+    #[tokio::test]
     async fn a_travel_buffer_inherits_only_its_uncertain_parent_category() {
         let mut operation = operation(true);
         operation.event.category = "nejist\u{e9}".into();

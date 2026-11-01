@@ -97,6 +97,7 @@ pub enum Command {
         account: String,
         key: String,
     },
+    SaveWeeklySummary(Box<crate::weekly::Saved>),
     AttachAi {
         commands: tokio::sync::mpsc::Sender<ai::Command>,
         ready: Arc<AtomicBool>,
@@ -337,10 +338,13 @@ pub struct Activity {
     pub identity: Option<Arc<crate::workiq::connection::Identity>>,
     pub event_creations: Arc<std::collections::BTreeMap<String, crate::event_creation::Record>>,
     pub recaps: Arc<crate::recaps::Ledger>,
-    /// Account of `tasks` and `followups`: the calendar owner, or the demo account in previews.
+    /// Account of `tasks`, `followups` and `weekly_summaries`: the calendar owner, or the demo
+    /// account in previews.
     pub task_account: Option<String>,
     pub tasks: Arc<Vec<crate::tasks::Task>>,
     pub followups: Arc<std::collections::BTreeMap<String, crate::followup::Saved>>,
+    /// Saved AI summaries of weekly reviews by Monday.
+    pub weekly_summaries: Arc<std::collections::BTreeMap<chrono::NaiveDate, crate::weekly::Saved>>,
 }
 
 pub struct Shutdown {
@@ -388,6 +392,7 @@ fn task_owner(store: &Store, demo: bool, account: &str) -> Result<(), String> {
 type TaskViews = (
     Arc<Vec<crate::tasks::Task>>,
     Arc<std::collections::BTreeMap<String, crate::followup::Saved>>,
+    Arc<std::collections::BTreeMap<chrono::NaiveDate, crate::weekly::Saved>>,
 );
 
 fn import_note_tasks(
@@ -450,6 +455,7 @@ fn load_tasks(
     Ok((
         Arc::new(store.tasks(account)?),
         Arc::new(store.followups(account)?),
+        Arc::new(store.weekly_summaries(account)?),
     ))
 }
 
@@ -458,6 +464,7 @@ fn reload_tasks(store: &Store, account: Option<&str>, views: &mut TaskViews) -> 
         Some(account) => (
             Arc::new(store.tasks(account)?),
             Arc::new(store.followups(account)?),
+            Arc::new(store.weekly_summaries(account)?),
         ),
         None => Default::default(),
     };
@@ -940,7 +947,8 @@ fn load(store: &mut Store, options: &Options) -> Result<(Arc<Calendar>, Preferen
     let preferences = store.preferences()?;
     let calendar = if let Some(count) = options.demo {
         let now = chrono::Local::now();
-        let coverage = (0..42)
+        // Two earlier weeks give the weekly review's trends something to compare with.
+        let coverage = (-14..42)
             .map(|i| calendar::monday(now.date_naive()) + chrono::Duration::days(i))
             .collect();
         Calendar::build(
@@ -1542,7 +1550,7 @@ impl Worker {
                         revision += 1;
                         let recap_snapshot = if recaps_revision != published_recaps_revision { Arc::new(recaps.clone()) } else { previous.recaps.clone() };
                         let next = Activity { revision, queue: queue.clone(), index, enabled: preferences.prepare_enabled, paused: preferences.paused, error: failure.clone(), sync, recommendations: Arc::new(inbox.clone()), recommendation_view: recommendation_view.clone(), identity: identity.clone(), event_creations: Arc::new(event_creations.clone()), recaps: recap_snapshot,
-                            task_account: task_account.clone(), tasks: task_views.0.clone(), followups: task_views.1.clone(),
+                            task_account: task_account.clone(), tasks: task_views.0.clone(), followups: task_views.1.clone(), weekly_summaries: task_views.2.clone(),
                             queued: queue.jobs.values().filter(|job| job.state == crate::scheduler::State::Queued).count(),
                             deferred: queue.jobs.values().filter(|job| job.state == crate::scheduler::State::Deferred).count() };
                         *state.lock().map_err(|_| "Preparation state is unavailable")? = Arc::new(next);
@@ -2026,6 +2034,16 @@ impl Worker {
                         Command::DiscardFollowUp { account, key } => {
                             let outcome = task_owner(&store, options.demo.is_some(), &account)
                                 .and_then(|()| store.delete_followup(&account, &key));
+                            if let Err(error) = reload_tasks(&store, task_account.as_deref(), &mut task_views) {
+                                notify(Notice::Error(error));
+                            }
+                            tasks_revision += 1;
+                            if let Err(error) = outcome { notify(Notice::Error(error)); }
+                            Ok(())
+                        }
+                        Command::SaveWeeklySummary(saved) => {
+                            let outcome = task_owner(&store, options.demo.is_some(), &saved.account)
+                                .and_then(|()| store.save_weekly_summary(&saved));
                             if let Err(error) = reload_tasks(&store, task_account.as_deref(), &mut task_views) {
                                 notify(Notice::Error(error));
                             }
@@ -2757,6 +2775,13 @@ mod tests {
         let saved = crate::followup::Saved::new(&request, crate::followup::Draft { subject: "S".into(), body: "B".into() }, chrono::Utc::now());
         worker.commands.send(Command::SaveFollowUp(Box::new(saved.clone()))).unwrap();
         wait(&worker, &|activity| activity.followups.get(&saved.key) == Some(&saved));
+        let week = crate::weekly::Saved { account: account.into(), week: chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap(),
+            language: crate::i18n::Language::En, meetings: 1, omitted: 0, created_at: chrono::Utc::now(),
+            summary: crate::weekly::AiSummary { highlights: vec!["Fixture highlight.".into()], ..Default::default() } };
+        worker.commands.send(Command::SaveWeeklySummary(Box::new(crate::weekly::Saved { account: "intruder@example.com".into(), ..week.clone() }))).unwrap();
+        worker.commands.send(Command::SaveWeeklySummary(Box::new(week.clone()))).unwrap();
+        wait(&worker, &|activity| activity.weekly_summaries.get(&week.week) == Some(&week));
+        assert_eq!(worker.activity.lock().unwrap().weekly_summaries.len(), 1, "A foreign weekly summary is refused");
         assert!(activity.error.is_none(), "Task commands never stop preparation");
         worker.commands.send(Command::Exit).unwrap();
         worker.done.take().unwrap().recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
@@ -2764,6 +2789,7 @@ mod tests {
         let activity = wait(&worker, &|activity| activity.task_account.as_deref() == Some(account) && !activity.tasks.is_empty());
         assert_eq!(activity.tasks.len(), 3, "Restart neither re-imports deleted or completed tasks nor loses manual ones");
         assert_eq!(activity.followups.get(&saved.key), Some(&saved));
+        assert_eq!(activity.weekly_summaries.get(&week.week), Some(&week), "The weekly AI summary survives restart");
         worker.commands.send(Command::DiscardFollowUp { account: account.into(), key: saved.key.clone() }).unwrap();
         wait(&worker, &|activity| activity.followups.is_empty());
         worker.commands.send(Command::Exit).unwrap();

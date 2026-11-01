@@ -265,6 +265,7 @@ impl Tomlook {
             ui.colored_label(ui.visuals().error_fg_color, language.text(error));
         }
         self.morning_preferences(ui, &status);
+        self.weekly_preferences(ui, &status);
         ui.add_space(20.0);
         ui.weak(language.text("Tomlook is listed in Windows Settings > System > Notifications, where you can turn its notifications off or change how they appear."));
     }
@@ -341,6 +342,82 @@ impl Tomlook {
         {
             ui.scroll_to_cursor(Some(egui::Align::Max));
         }
+    }
+
+    pub(super) fn weekly_preferences(&mut self, ui: &mut egui::Ui, status: &tomlook::reminders::Status) {
+        let language = self.preferences.language;
+        ui.add_space(20.0);
+        ui.separator();
+        ui.add_space(12.0);
+        ui.strong(language.text("Weekly review"));
+        let mut changed = ui
+            .checkbox(
+                &mut self.preferences.weekly_review,
+                language.text("Show a weekly review notification"),
+            )
+            .changed();
+        ui.add_enabled_ui(self.preferences.weekly_review, |ui| {
+            ui.add_space(8.0);
+            ui.label(language.text("Day"));
+            ui.horizontal_wrapped(|ui| {
+                for (day, label) in [(5, "Friday (this week)"), (1, "Monday (previous week)")] {
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.preferences.weekly_review_day,
+                            day,
+                            language.text(label),
+                        )
+                        .changed();
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(language.text("Time"));
+            ui.horizontal_wrapped(|ui| {
+                for minutes in tomlook::weekly::TIMES {
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.preferences.weekly_review_time,
+                            minutes,
+                            format!("{:02}:{:02}", minutes / 60, minutes % 60),
+                        )
+                        .changed();
+                }
+            });
+        });
+        if changed {
+            self.save_preferences();
+        }
+        ui.add_space(8.0);
+        ui.weak(language.text("Once a week with the number of meetings, meeting time, conflicts and meetings without an agenda. If Tomlook is not running at that time, it appears later the same day. It stays quiet unless at least 4 of the week's 5 workdays are synced."));
+        if self.preview {
+            ui.weak(language.text("The weekly review notification does not run in the offline demo; the test uses the demo's fictional calendar."));
+        } else if !self.preferences.weekly_review {
+            ui.weak(language.text("Weekly review is turned off."));
+        }
+        if let Some(at) = status.last_weekly {
+            ui.weak(language.text(&format!(
+                "Last weekly review shown: {}",
+                at.with_timezone(&Local).format("%d.%m.%Y %H:%M")
+            )));
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(language.text("Show now")).clicked() {
+                let schedule = tomlook::weekly::Schedule::from_preferences(&self.preferences);
+                let week = tomlook::weekly::reviewed_week(&schedule, self.weekly_now().date_naive());
+                self.open_weekly(Some(week));
+            }
+            if ui
+                .add_enabled(
+                    self.reminders.is_some() && !self.loading,
+                    egui::Button::new(language.text("Send test")),
+                )
+                .clicked()
+            {
+                self.send_weekly_test();
+            }
+        });
+        ui.weak(language.text("Shows the weekly review notification with the current counts."));
     }
 
     fn update_preferences(&mut self, ui: &mut egui::Ui) {
@@ -465,6 +542,7 @@ impl Tomlook {
         self.assistant_dialog(context);
         self.tasks_window(context);
         self.myday_window(context);
+        self.weekly_window(context);
         if self.messages_open {
             let calendar = self.calendar.clone();
             let mut open = true;

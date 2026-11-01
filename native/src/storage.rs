@@ -54,6 +54,13 @@ pub struct Preferences {
     /// Minutes after local midnight of the morning overview (07:00–10:00 in 30-minute steps).
     pub morning_overview_time: u16,
     pub morning_overview_weekends: bool,
+    /// Weekly review notification.
+    pub weekly_review: bool,
+    /// ISO weekday of the weekly review notification: 5 (Friday, this week) or 1 (Monday, the
+    /// previous week).
+    pub weekly_review_day: u8,
+    /// Minutes after local midnight of the weekly review notification.
+    pub weekly_review_time: u16,
 }
 
 impl Default for Preferences {
@@ -82,6 +89,9 @@ impl Default for Preferences {
             morning_overview: true,
             morning_overview_time: crate::myday::DEFAULT_TIME,
             morning_overview_weekends: false,
+            weekly_review: true,
+            weekly_review_day: crate::weekly::DEFAULT_DAY,
+            weekly_review_time: crate::weekly::DEFAULT_TIME,
         }
     }
 }
@@ -532,7 +542,10 @@ impl Store {
                    PRIMARY KEY(account,import_key));
                  CREATE TABLE IF NOT EXISTS followup_drafts(
                    account TEXT NOT NULL,meeting_key TEXT NOT NULL,updated_at TEXT NOT NULL,
-                   payload TEXT NOT NULL,PRIMARY KEY(account,meeting_key));",
+                   payload TEXT NOT NULL,PRIMARY KEY(account,meeting_key));
+                 CREATE TABLE IF NOT EXISTS weekly_summaries(
+                   account TEXT NOT NULL,week TEXT NOT NULL,updated_at TEXT NOT NULL,
+                   payload TEXT NOT NULL,PRIMARY KEY(account,week));",
             )
             .map_err(|e| e.to_string())?;
         Ok(Self {
@@ -771,6 +784,36 @@ impl Store {
                 [date.format("%Y-%m-%d").to_string()],
             )
             .map_err(|_| "Save morning overview history failed")?;
+        Ok(())
+    }
+
+    /// Local day the weekly review notification was last shown.
+    pub fn weekly_review_shown(&self) -> Result<Option<NaiveDate>> {
+        let payload: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT payload FROM settings WHERE key='weekly-review-shown-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "Read weekly review history failed")?;
+        payload
+            .map(|value| {
+                NaiveDate::parse_from_str(&value, "%Y-%m-%d")
+                    .map_err(|_| "Saved weekly review history is invalid".to_string())
+            })
+            .transpose()
+    }
+
+    pub fn save_weekly_review_shown(&self, date: NaiveDate) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO settings VALUES('weekly-review-shown-v1',?1)
+                 ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                [date.format("%Y-%m-%d").to_string()],
+            )
+            .map_err(|_| "Save weekly review history failed")?;
         Ok(())
     }
 
@@ -1728,6 +1771,79 @@ impl Store {
             .map(|count| count > 0)
             .map_err(|_| "Discard follow-up e-mail failed".into())
     }
+
+    /// Saved AI summaries of an account's weeks by Monday, the newest weeks within the limit.
+    pub fn weekly_summaries(
+        &self,
+        account: &str,
+    ) -> Result<std::collections::BTreeMap<NaiveDate, crate::weekly::Saved>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT week,payload FROM weekly_summaries WHERE account=?1
+                 ORDER BY week DESC LIMIT ?2",
+            )
+            .map_err(|_| "Read weekly summaries failed")?;
+        let rows = statement
+            .query_map(
+                params![account, crate::weekly::SAVED_LIMIT as i64],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|_| "Read weekly summaries failed")?;
+        let mut summaries = std::collections::BTreeMap::new();
+        for row in rows {
+            let (week, payload) = row.map_err(|_| "Read weekly summaries failed")?;
+            if payload.len() > 64 * 1024 {
+                return Err("Saved weekly summary exceeds its safety limit".into());
+            }
+            let saved: crate::weekly::Saved =
+                serde_json::from_str(&payload).map_err(|_| "Saved weekly summary is invalid")?;
+            saved.validate()?;
+            if saved.account != account || saved.week.format("%Y-%m-%d").to_string() != week {
+                return Err("Saved weekly summary does not match its week".into());
+            }
+            summaries.insert(saved.week, saved);
+        }
+        Ok(summaries)
+    }
+
+    /// Saves the latest AI summary of a week; summaries of the oldest weeks beyond the limit are
+    /// removed.
+    pub fn save_weekly_summary(&self, saved: &crate::weekly::Saved) -> Result<()> {
+        saved.validate()?;
+        let payload = serde_json::to_string(saved).map_err(|_| "Encode weekly summary failed")?;
+        if payload.len() > 64 * 1024 {
+            return Err("Weekly summary exceeds its safety limit".into());
+        }
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| "Begin weekly summary storage failed")?;
+        transaction
+            .execute(
+                "INSERT INTO weekly_summaries VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(account,week) DO UPDATE SET
+                   updated_at=excluded.updated_at,payload=excluded.payload",
+                params![
+                    saved.account,
+                    saved.week.format("%Y-%m-%d").to_string(),
+                    feedback_time(saved.created_at),
+                    payload
+                ],
+            )
+            .map_err(|_| "Save weekly summary failed")?;
+        transaction
+            .execute(
+                "DELETE FROM weekly_summaries WHERE account=?1 AND week NOT IN (
+                   SELECT week FROM weekly_summaries WHERE account=?1
+                   ORDER BY week DESC LIMIT ?2)",
+                params![saved.account, crate::weekly::SAVED_LIMIT as i64],
+            )
+            .map_err(|_| "Save weekly summary failed")?;
+        transaction
+            .commit()
+            .map_err(|_| "Commit weekly summary failed".into())
+    }
 }
 
 #[cfg(test)]
@@ -1829,6 +1945,26 @@ mod document_edit_tests {
             [changed.start.with_timezone(&chrono::Local).date_naive()].into(), vec![]).unwrap();
         store.save_workiq_calendar(&calendar, "owner").unwrap();
         assert!(store.apply_document_recommendation(&proposal, &event).is_err());
+    }
+
+    #[test]
+    fn a_refresh_adds_invitation_previews_without_expiring_approvals_or_insights() {
+        let (_root, mut store, event, proposal) = fixture(Document::Insights);
+        assert!(!event.extra.contains_key("bodyPreview"), "Cached before previews were synchronized");
+        let mut refreshed = event.clone();
+        refreshed.extra.insert("bodyPreview".into(), json!("Agenda: confirm the pilot scope"));
+        let day = refreshed.start.with_timezone(&chrono::Local).date_naive();
+        let calendar = Calendar::build(vec![refreshed], [day].into(), vec![]).unwrap();
+        store.save_workiq_calendar(&calendar, "owner").unwrap();
+        let cached = store.calendar().unwrap();
+        let saved = &cached.events[cached.event_index(&event.id).unwrap()];
+        assert_eq!(saved.extra["bodyPreview"], "Agenda: confirm the pilot scope",
+            "A refreshed day replaces its cached meetings, so the preview appears after the next sync");
+        assert_eq!(crate::scheduler::fingerprint(saved), crate::scheduler::fingerprint(&event));
+        assert_eq!(saved.fingerprint(), event.fingerprint(), "Insights stay current");
+        assert!(proposal.current(&cached, Some("owner"), chrono::Local::now().fixed_offset()).is_some());
+        assert_eq!(store.apply_document_recommendation(&proposal, &event).unwrap()[&proposal.id].state,
+            State::Applied, "An approval confirmed before the refresh still applies");
     }
 
     #[test]

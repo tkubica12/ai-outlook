@@ -37,9 +37,9 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The latest native Windows release is **[v0.12.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.12.0)**.
-Read the [release notes](docs/releases/v0.12.0.md) for changes since v0.11.0.
-Download **[Tomlook-v0.12.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.12.0/Tomlook-v0.12.0-win-x64.zip)**
+The latest native Windows release is **[v0.13.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.13.0)**.
+Read the [release notes](docs/releases/v0.13.0.md) for changes since v0.12.0.
+Download **[Tomlook-v0.13.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.13.0/Tomlook-v0.13.0-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable and unsigned.
 From v0.8.0, Tomlook checks GitHub Releases once a day and installs
@@ -128,7 +128,7 @@ Run native checks from `native\` with `cargo test --locked --offline` and
 
 The gear opens a larger **Settings** window with left-hand navigation:
 **Display** contains language, theme and accent; **Notifications** contains
-meeting reminders, the morning **My day** overview and test notifications; **AI prompts** contains five
+meeting reminders, the morning **My day** overview, the weekly review and test notifications; **AI prompts** contains five
 editable guidance prompts with per-prompt default restoration; **Updates** shows
 the version, update checks and a verified update ready to install.
 Save prompt edits explicitly; source boundaries, structured output and write
@@ -163,6 +163,18 @@ plus tasks and mentions from the previous workday's notes, free focus time,
 recommendations waiting for approval and tomorrow. On workdays at 08:00 (07:00–10:00,
 optionally weekends) one **My day** notification summarizes the day; see
 [My day](native/README.md#my-day).
+
+**Weekly review** (command palette, a link in My day, or the button next to the
+week's dates) looks back at one week from cached data only: meeting time
+(overlaps counted once) and its share of working hours, focus time, time by
+category, conflicts, meetings without an agenda (from the synchronized
+invitation previews), back-to-back chains, the people and customers you met most,
+preparation and notes coverage, tasks, and trends against the previous four
+weeks. **Copy summary** copies it as Markdown, and an optional, explicit
+**Summarize the week with AI** makes one tool-free Quick request from those
+numbers and the week's meeting notes. An optional Friday 15:00 notification
+("Your week: 18 meetings · 22 h · 3 conflicts · 4 without agenda") opens it; see
+[Weekly review](native/README.md#weekly-review).
 
 After a meeting, Tomlook closes the loop locally: personal tasks from the
 post-meeting notes join a **Tasks** list on this computer (manual tasks and Ask
