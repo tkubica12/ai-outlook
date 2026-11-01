@@ -1,22 +1,26 @@
-# Security and responsible AI
+# Security policy
 
-- External content is data, never an instruction. The versioned meeting skill says this explicitly.
-- All external-system operations are read-only in the current implementation.
-- Briefing/chat CLI sessions expose only named read tools, not the shell or file mutation tools.
-  Remote session export is disabled for these background runs.
-- Skill proposals remain pending until a user explicitly approves or rejects them.
-- The frontend receives no credentials or connector tokens.
-- Pydantic validates API and agent-runtime inputs and outputs.
-- Source records carry provenance, timestamp, and evidence type.
-- Logging includes correlation ID, path, status, and duration but not request bodies or secrets.
-- Sources without a link render as plain text rather than as an anchor to `#`, and every
-  external link uses `rel="noreferrer noopener"`.
-- Source URLs are restricted to HTTP(S) without embedded credentials. Unknown citation IDs and
-  confidence without supporting sources are not displayed as verified evidence.
-- Task proposals are review-only. An unknown task-ownership lookup never authorizes a create.
-- Runtime errors do not return raw CLI stderr to the browser; it can contain source data or URLs.
-- Missing MCP data is surfaced as unavailable; the application does not manufacture a fallback.
-- Production work still requires Entra authentication, per-user authorization, encrypted token
-  storage, rate limits, CSP/CSRF hardening, durable audit storage, connector timeouts, deletion
-  controls, and redaction policies.
-- Bind the development API to loopback only. CORS is not authentication or a network access control.
+Tomlook is a single-user Windows desktop app. Its security model is described
+in [docs/privacy-and-safety.md](docs/privacy-and-safety.md): local storage,
+DPAPI-protected sign-ins and memory-only tokens, read-only AI tools,
+single-use approvals with read-back for every write, and Ed25519-signed
+updates.
+
+## Supported versions
+
+Only the [latest release](https://github.com/tkubica12/ai-outlook/releases/latest)
+receives fixes. Automatic updates install them.
+
+## Reporting a vulnerability
+
+Please do not publish exploit details, tokens, calendar content or customer
+data in a public issue. Open a short GitHub issue that only says you want to
+report a security problem, or contact the maintainer
+([@tkubica12](https://github.com/tkubica12)) directly, and details will be
+exchanged privately. Ordinary bugs can be reported as regular
+[issues](https://github.com/tkubica12/ai-outlook/issues).
+
+Useful information: the Tomlook version (**Settings → Updates**), what you
+did, what happened, and whether a write was approved. Remove personal data
+from screenshots and logs; `diagnostics.jsonl` contains reason codes only,
+but review it before sharing.
