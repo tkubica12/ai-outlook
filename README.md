@@ -37,9 +37,9 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The latest native Windows release is **[v0.11.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.11.0)**.
-Read the [release notes](docs/releases/v0.11.0.md) for changes since v0.10.0.
-Download **[Tomlook-v0.11.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.11.0/Tomlook-v0.11.0-win-x64.zip)**
+The latest native Windows release is **[v0.12.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.12.0)**.
+Read the [release notes](docs/releases/v0.12.0.md) for changes since v0.11.0.
+Download **[Tomlook-v0.12.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.12.0/Tomlook-v0.12.0-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable and unsigned.
 From v0.8.0, Tomlook checks GitHub Releases once a day and installs
@@ -128,7 +128,7 @@ Run native checks from `native\` with `cargo test --locked --offline` and
 
 The gear opens a larger **Settings** window with left-hand navigation:
 **Display** contains language, theme and accent; **Notifications** contains
-meeting reminders and a test notification; **AI prompts** contains five
+meeting reminders, the morning **My day** overview and test notifications; **AI prompts** contains five
 editable guidance prompts with per-prompt default restoration; **Updates** shows
 the version, update checks and a verified update ready to install.
 Save prompt edits explicitly; source boundaries, structured output and write
@@ -154,6 +154,15 @@ notification such as "In 5 min · 09:15–10:45" with the meeting title, up to
 three points from saved Insights, **Join** for a Teams link and **Open** for
 the meeting details. Lead time and tentative meetings are configurable in
 Settings → Notifications; see [meeting reminders](native/README.md#meeting-reminders).
+
+**My day** (sunrise header icon, Ctrl+D or the command palette) is a proactive
+overview of today built only from cached data, without AI or network calls:
+meetings and the next one with **Join**, conflicts, meetings without Insights
+(**Research now** / **Research all**), missing materials, overdue and due tasks
+plus tasks and mentions from the previous workday's notes, free focus time,
+recommendations waiting for approval and tomorrow. On workdays at 08:00 (07:00–10:00,
+optionally weekends) one **My day** notification summarizes the day; see
+[My day](native/README.md#my-day).
 
 After a meeting, Tomlook closes the loop locally: personal tasks from the
 post-meeting notes join a **Tasks** list on this computer (manual tasks and Ask

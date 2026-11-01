@@ -20,6 +20,7 @@ mod event_editor;
 mod feedback;
 mod followup;
 mod meeting;
+mod myday;
 mod palette;
 mod recommendations;
 mod settings;
@@ -180,6 +181,7 @@ pub struct Tomlook {
     feedback: FeedbackUi,
     tasks_open: bool,
     tasks: tasks::TasksUi,
+    myday: myday::MyDayUi,
     followup: followup::FollowUpUi,
     preview: bool,
     demo_screenshot: Option<std::path::PathBuf>,
@@ -262,7 +264,7 @@ pub struct Tomlook {
     update_configured: bool,
     reminders: Option<tomlook::reminders::Reminders>,
     reminder_status: tomlook::reminders::Status,
-    reminder_open: Option<mpsc::Receiver<Option<String>>>,
+    reminder_open: Option<mpsc::Receiver<tomlook::reminders::Activation>>,
 }
 
 impl Tomlook {
@@ -383,9 +385,9 @@ impl Tomlook {
                 reminder_state,
                 mode,
                 move || repaint.request_repaint(),
-                move |meeting| {
+                move |activation| {
                     // Runs on a Windows notification thread; the UI applies it in `logic`.
-                    let _ = opened.try_send(meeting);
+                    let _ = opened.try_send(activation);
                     crate::tray::restore(&restore);
                 },
             ) {
@@ -470,6 +472,7 @@ impl Tomlook {
             feedback: FeedbackUi::default(),
             tasks_open: false,
             tasks: Default::default(),
+            myday: Default::default(),
             followup: Default::default(),
             preview: false,
             demo_screenshot: None,
@@ -1154,6 +1157,7 @@ impl Tomlook {
                 tomlook::reminders::Settings::from_preferences(&self.preferences),
             );
         }
+        self.sync_morning();
     }
 
     fn receive_reminders(&mut self) {
@@ -1164,13 +1168,24 @@ impl Tomlook {
         {
             self.reminder_status = status;
         }
-        let opened: Vec<Option<String>> = self
+        let opened: Vec<tomlook::reminders::Activation> = self
             .reminder_open
             .as_ref()
             .map(|opened| opened.try_iter().take(8).collect())
             .unwrap_or_default();
-        for meeting in opened.into_iter().flatten() {
-            self.open_reminder_meeting(&meeting);
+        for activation in opened {
+            match activation {
+                tomlook::reminders::Activation::Meeting(meeting) => {
+                    self.open_reminder_meeting(&meeting)
+                }
+                tomlook::reminders::Activation::MyDay => {
+                    self.open_myday();
+                    if !self.assistant_detached {
+                        self.assistant = false;
+                    }
+                }
+                tomlook::reminders::Activation::Restore => {}
+            }
         }
     }
 
@@ -1202,6 +1217,7 @@ impl eframe::App for Tomlook {
         self.receive();
         self.receive_update();
         self.receive_reminders();
+        self.sync_myday();
         self.receive_ask_inputs(context);
         self.sync_detached_ask(context);
         if let Some(trace) = &self.startup
@@ -1331,7 +1347,7 @@ impl eframe::App for Tomlook {
                     self.command(Command::DemoScreenshot { path, image });
                 }
             } else if !self.loading {
-                if self.selected.is_none() {
+                if self.selected.is_none() && self.demo_scene.selects_meeting() {
                     let title = self.demo_scene.meeting();
                     if let Some(index) = self
                         .calendar
@@ -1344,7 +1360,7 @@ impl eframe::App for Tomlook {
                         }
                         self.select(index);
                     }
-                } else if self.briefing.is_some() {
+                } else if self.briefing.is_some() || !self.demo_scene.selects_meeting() {
                     if self.demo_scene_ready() {
                         context.send_viewport_cmd(egui::ViewportCommand::Screenshot(
                             Default::default(),

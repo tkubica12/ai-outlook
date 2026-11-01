@@ -894,7 +894,8 @@ fn travel_buffer(event: &Event) -> bool {
         .any(|prefix| first.starts_with(prefix))
 }
 
-fn blocks_time(event: &Event) -> bool {
+/// Confirmed, noncancelled items that are not shown as free.
+pub fn blocks_time(event: &Event) -> bool {
     !event.unconfirmed()
         && !cancelled(event)
         && event

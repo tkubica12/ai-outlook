@@ -4799,16 +4799,21 @@ fn reminder_activation_opens_meeting_details_without_ai_or_calendar_writes() {
     app.query = "unrelated".into();
     let (opened, reminder_open) = mpsc::sync_channel(8);
     app.reminder_open = Some(reminder_open);
-    opened.send(None).unwrap();
-    opened.send(Some(target.id.clone())).unwrap();
+    opened.send(tomlook::reminders::Activation::Restore).unwrap();
+    opened.send(tomlook::reminders::Activation::Meeting(target.id.clone())).unwrap();
     app.receive_reminders();
     assert_eq!(app.selected, app.calendar.event_index(&target.id));
     assert_eq!(app.anchor, target.calendar_dates().0);
     assert!(app.scroll_meeting && !app.insights_expanded && !app.assistant && app.query.is_empty());
+    assert!(!app.myday.open);
     assert!(receiver.try_iter().any(|command| matches!(command, Command::Detail { id, .. } if id == target.id)));
-    opened.send(Some("missing-meeting".into())).unwrap();
+    opened.send(tomlook::reminders::Activation::Meeting("missing-meeting".into())).unwrap();
     app.receive_reminders();
     assert_eq!(app.error.as_deref(), Some("Meeting is no longer in the current calendar."));
+    app.assistant = true;
+    opened.send(tomlook::reminders::Activation::MyDay).unwrap();
+    app.receive_reminders();
+    assert!(app.myday.open && !app.assistant, "The morning notification opens My day");
     assert!(receiver.try_iter().all(|command| matches!(command, Command::Detail { .. } | Command::Preferences(_))));
     assert!(ai_commands.try_recv().is_err());
 }
@@ -5454,5 +5459,290 @@ fn ask_task_and_email_drafts_add_linked_local_tasks_and_open_only_validated_mail
         assert_eq!(copied(&output), vec![tomlook::followup::clipboard_text("Pilot next steps", "Hi Alex,\nthe next steps.", language)]);
         assert!(receiver.try_recv().is_err());
         assert!(ai_commands.try_recv().is_err(), "Local drafts never send AI requests");
+    }
+}
+fn myday_day(number: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 11, number).unwrap()
+}
+
+fn myday_at(date: NaiveDate, hour: u32, minute: u32) -> chrono::DateTime<Local> {
+    use chrono::TimeZone;
+    Local.from_local_datetime(&date.and_hms_opt(hour, minute, 0).unwrap()).earliest().unwrap()
+}
+
+fn myday_meeting(id: &str, title: &str, start: chrono::DateTime<Local>, minutes: i64, status: &str) -> Event {
+    let mut event = tomlook::calendar::fixture(1).remove(0);
+    event.id = id.into();
+    event.title = title.into();
+    event.status = status.into();
+    event.start = start.fixed_offset();
+    event.end = event.start + chrono::Duration::minutes(minutes);
+    event.is_all_day = false;
+    event
+}
+
+/// Wednesday 11 November 2026, 09:00: a finished stand-up, two overlapping meetings without
+/// Insights (one on Teams), a tentative chat, yesterday's notes with tasks and a mention, a
+/// missing-materials recommendation and one meeting tomorrow.
+fn myday_fixture(language: tomlook::i18n::Language) -> (
+    Tomlook,
+    mpsc::Receiver<Command>,
+    tokio::sync::mpsc::Receiver<ai::Command>,
+    String,
+) {
+    use tomlook::recommendations::{InboxEntry, Kind as RecommendationKind, Recommendation, Suggestion};
+    let (mut app, receiver, ai_commands, _) = task_fixture(language);
+    let account = "owner@example.com";
+    let wednesday = myday_day(11);
+    let now = myday_at(wednesday, 9, 0);
+    app.myday.now = Some(now);
+    let mut review = myday_meeting("review", "Customer review", myday_at(wednesday, 10, 0), 60, "accepted");
+    review.extra.insert("onlineMeeting".into(), serde_json::json!({"joinUrl": "https://teams.microsoft.com/l/meetup-join/fixture"}));
+    let pilot = myday_meeting("pilot", "Pilot planning", myday_at(myday_day(10), 14, 0), 60, "accepted");
+    let events = vec![
+        myday_meeting("standup", "Morning standup", myday_at(wednesday, 8, 30), 15, "accepted"),
+        review.clone(),
+        myday_meeting("architecture", "Architecture sync", myday_at(wednesday, 10, 30), 60, "organizer"),
+        myday_meeting("optional", "Optional chat", myday_at(wednesday, 13, 0), 30, "tentativelyAccepted"),
+        pilot.clone(),
+        myday_meeting("planning", "Thursday planning", myday_at(myday_day(12), 9, 0), 30, "accepted"),
+    ];
+    app.calendar = Arc::new(Calendar::build(events, [wednesday, myday_day(12)].into(), vec![]).unwrap());
+    let created = now.to_utc();
+    let manual = |id: i64, title: &str, due: NaiveDate| {
+        let mut task = tomlook::tasks::New::manual(title, Some(due), language).unwrap().task(account, created).unwrap();
+        task.id = id;
+        task
+    };
+    let mut tasks = vec![manual(1, "Overdue fixture", myday_day(10)), manual(2, "Today fixture", wednesday)];
+    for (index, mut task) in tomlook::tasks::from_notes(account, &pilot, &notes_payload(), language, created)
+        .unwrap().into_iter().enumerate() {
+        task.id = 3 + index as i64;
+        tasks.push(task);
+    }
+    let recommendation = Recommendation::from_insights(&review, account, Suggestion {
+        kind: RecommendationKind::MissingMaterials,
+        reason: "No agenda was shared.".into(),
+        reason_cs: "Nebyl sdílen program.".into(),
+        category: None,
+        minutes: None,
+    }, now.fixed_offset()).unwrap();
+    let id = recommendation.id.clone();
+    let recaps = tomlook::recaps::Ledger { records: [(tomlook::recaps::key(account, &pilot), tomlook::recaps::Record {
+        account: account.into(), event_id: pilot.id.clone(), checking: false, next_check: now.fixed_offset(),
+        message: String::new(), failures: 0, payload: Some(notes_payload()),
+    })].into() };
+    app.activity = Arc::new(tomlook::worker::Activity {
+        enabled: true,
+        queue: {
+            let mut queue = tomlook::scheduler::Queue::default();
+            queue.jobs.insert("standup".into(), activity_fixture_job("standup", tomlook::scheduler::State::Completed));
+            queue
+        },
+        task_account: Some(account.into()),
+        tasks: Arc::new(tasks),
+        recommendations: Arc::new([(id.clone(), recommendation)].into()),
+        recommendation_view: Arc::new(vec![InboxEntry { id: id.clone(), conflicts: vec![] }]),
+        recaps: Arc::new(recaps),
+        ..Default::default()
+    });
+    app.myday.open = true;
+    (app, receiver, ai_commands, id)
+}
+
+#[test]
+fn my_day_panel_lists_today_and_reuses_existing_actions_in_both_languages() {
+    use tomlook::worker::TaskCommand;
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let czech = language == tomlook::i18n::Language::Cs;
+        let (mut app, receiver, mut ai_commands, recommendation) = myday_fixture(language);
+        let context = egui::Context::default();
+        let show: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| app.myday_panel(ui);
+        draw_with(&context, &mut app, vec![], show);
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        for expected in [
+            if czech { "3 schůzky · 1 h 45 min · 08:30–11:30 · 1 nezávazná" } else { "3 meetings · 1 h 45 min · 08:30–11:30 · 1 tentative" },
+            if czech { "za 1 h" } else { "in 1 h" },
+            if czech { "Jamie se ptal na rozpočet" } else { "Jamie asked about the budget" },
+            if czech { "Poslat Alexovi porovnání" } else { "Send the comparison to Alex" },
+            if czech { "1 schůzka · první v 09:00" } else { "1 meeting · first at 09:00" },
+            "Customer review", "Architecture sync", "Optional chat", "Overdue fixture", "Today fixture", "Teams",
+            "09:00–10:00", "11:30–18:00",
+        ] {
+            assert!(text.contains(expected), "{language:?}: missing {expected}\n{text}");
+        }
+        for label in [
+            "Next meeting", "Today's agenda", "Conflicts", "Not prepared", "Missing materials", "Tasks",
+            "Mentions of me", "Focus time", "Waiting for approval", "Tomorrow", "Insights ready",
+            "Connect AI and WorkIQ to research these meetings.", "Overdue", "Due today", "Open in Messages",
+        ] {
+            assert!(text.contains(language.text(label).as_ref()), "{language:?}: missing {label}");
+        }
+        assert!(text.contains(&format!("{}: 10:30 – 11:00", language.text("Overlap"))), "Conflicts use local times");
+        assert!(text.contains(&format!("{} · Pilot planning", language.text("From meeting notes"))), "Tasks from yesterday's notes");
+        click_text(&context, &mut app, show, language.text("Research now").as_ref());
+        assert!(matches!(receiver.try_recv().unwrap(), Command::PrepareNow(id) if id == "review" || id == "architecture"));
+        app.workiq_ready = true;
+        click_text(&context, &mut app, show, language.text("Research all").as_ref());
+        let requested = receiver.try_iter().filter_map(|command| match command {
+            Command::PrepareNow(id) => Some(id),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(requested, ["architecture", "review"], "Later meetings first, so the earliest is dispatched first");
+        app.activity = Arc::new(tomlook::worker::Activity { paused: true, ..(*app.activity).clone() });
+        assert!(output_text(&draw_with(&context, &mut app, vec![], show)).contains(language.text("Automatic Insights are paused.").as_ref()));
+        click_text(&context, &mut app, show, "Overdue fixture");
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Task(TaskCommand::SetDone { account, id: 1, done: true })
+            if account == "owner@example.com"));
+        click_text(&context, &mut app, show, language.text("Open").as_ref());
+        assert_eq!(app.selected, app.calendar.event_index("review"));
+        assert_eq!(app.anchor, myday_day(11));
+        assert!(receiver.try_iter().any(|command| matches!(command, Command::Detail { id, .. } if id == "review")));
+        click_text(&context, &mut app, show, "Pilot planning");
+        assert_eq!(app.selected, app.calendar.event_index("pilot"), "A mention opens its meeting");
+        click_text(&context, &mut app, show, language.text("Open in Messages").as_ref());
+        assert!(app.messages_open && app.recommendations_tab && !app.myday.open);
+        assert_eq!(app.recommendation_selected.as_deref(), Some(recommendation.as_str()));
+        app.myday.open = true;
+        click_text(&context, &mut app, show, language.text("Open tasks").as_ref());
+        assert!(app.tasks_open && !app.myday.open);
+        while let Ok(command) = ai_commands.try_recv() {
+            assert!(matches!(command, ai::Command::RefreshCalendarAvailability), "My day never asks AI");
+        }
+        let unsynced = Calendar::build(app.calendar.events.clone(), Default::default(), vec![]).unwrap();
+        app.calendar = Arc::new(unsynced);
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        for label in [
+            "Today's calendar is not synced yet; the overview may be incomplete.",
+            "Today's calendar is not synced yet, so free time is not shown.",
+            "Tomorrow's calendar is not synced yet.",
+        ] {
+            assert!(text.contains(language.text(label).as_ref()), "{language:?}: missing {label}");
+        }
+        assert!(!text.contains("11:30–18:00"), "Free time is never claimed for an unsynced day");
+    }
+}
+
+#[test]
+fn my_day_opens_from_palette_ctrl_d_and_notification_and_escape_closes_it() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, _, mut ai_commands, _) = myday_fixture(language);
+        app.myday.open = false;
+        let matches = command_matches_in(if language == tomlook::i18n::Language::Cs { "můj den" } else { "my day" }, language);
+        assert_eq!(matches.first(), Some(&PaletteCommand::MyDay));
+        let context = egui::Context::default();
+        app.run_palette_command(PaletteCommand::MyDay, &context);
+        assert!(app.myday.open);
+        let mut text = String::new();
+        for _ in 0..2 {
+            let mut output = context.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1600.0, 900.0))),
+                ..Default::default()
+            }, |ui| app.myday_window(ui.ctx()));
+            output.textures_delta.clear();
+            text = output_text(&output);
+        }
+        assert!(text.contains(language.text("My day").as_ref()) && text.contains("Customer review"), "{text}");
+        let key = |key, modifiers| egui::RawInput {
+            events: vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }],
+            ..Default::default()
+        };
+        let mut output = context.run_ui(key(Key::ArrowDown, Modifiers::NONE), |ui| app.shortcuts(ui.ctx()));
+        output.textures_delta.clear();
+        assert!(app.selected.is_none(), "Calendar navigation pauses while My day is open");
+        let mut output = context.run_ui(key(Key::Escape, Modifiers::NONE), |ui| app.shortcuts(ui.ctx()));
+        output.textures_delta.clear();
+        assert!(!app.myday.open, "Escape closes My day");
+        for open in [true, false] {
+            let mut output = context.run_ui(key(Key::D, Modifiers::CTRL), |ui| app.shortcuts(ui.ctx()));
+            output.textures_delta.clear();
+            assert_eq!(app.myday.open, open, "Ctrl+D toggles My day");
+        }
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.header(ui));
+        output.textures_delta.clear();
+        assert!(ai_commands.try_recv().is_err());
+    }
+}
+
+#[test]
+fn demo_my_day_renders_fictional_agenda_tasks_and_mentions_without_research() {
+    use chrono::TimeZone;
+    for (date, language) in [
+        (11, tomlook::i18n::Language::En),
+        (15, tomlook::i18n::Language::Cs),
+        (16, tomlook::i18n::Language::En),
+    ] {
+        let (mut app, receiver, mut ai_commands, _) = task_fixture(language);
+        app.preview = true;
+        app.calendar_owner = None;
+        let now = Local.with_ymd_and_hms(2026, 11, date, 7, 30, 0).earliest().unwrap();
+        app.myday.now = Some(now);
+        let coverage = (0..42).map(|offset| tomlook::calendar::monday(now.date_naive()) + chrono::Duration::days(offset)).collect();
+        app.calendar = Arc::new(Calendar::build(tomlook::showcase::preview_events(now, 200), coverage, vec![]).unwrap());
+        let ended = app.calendar.events.iter().find(|event| event.title == tomlook::showcase::ENDED_MEETING).unwrap().clone();
+        let account = tomlook::feedback::PREVIEW_ACCOUNT;
+        let created = now.to_utc();
+        let mut tasks = tomlook::showcase::sample_tasks(account, &ended, language, created).unwrap();
+        tasks.extend(tomlook::tasks::from_notes(account, &ended, &tomlook::showcase::notes(&ended).unwrap(), language, created).unwrap());
+        for (index, task) in tasks.iter_mut().enumerate() {
+            task.id = index as i64 + 1;
+        }
+        app.activity = Arc::new(tomlook::worker::Activity {
+            task_account: Some(account.into()), tasks: Arc::new(tasks), ..Default::default()
+        });
+        let context = egui::Context::default();
+        let show: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| app.myday_panel(ui);
+        draw_with(&context, &mut app, vec![], show);
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        let mention = if language == tomlook::i18n::Language::Cs {
+            "Jamie vás požádal, abyste na revizi pilotu znovu prošli kompromisy"
+        } else {
+            "Jamie asked you to walk through the trade-offs again at the pilot review"
+        };
+        for expected in ["Northstar / Escalation check-in", mention, tomlook::showcase::ENDED_MEETING] {
+            assert!(text.contains(expected), "{date}: missing {expected}\n{text}");
+        }
+        for label in ["Offline demo - fictional calendar", "Research is not available in the offline demo.", "Not prepared", "Insights ready"] {
+            assert!(text.contains(language.text(label).as_ref()), "{date}: missing {label}");
+        }
+        assert!(!text.contains(language.text("No conflicts today.").as_ref()), "The demo shows a conflict");
+        draw_with(&context, &mut app, vec![], show);
+        assert!(receiver.try_iter().all(|command| !matches!(command, Command::PrepareNow(_))));
+        assert!(ai_commands.try_recv().is_err(), "The demo never requests AI");
+    }
+}
+
+#[test]
+fn morning_overview_settings_save_preferences_show_now_and_report_status() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, _, _) = task_fixture(language);
+        let context = egui::Context::default();
+        let show: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| {
+            let status = app.reminder_status.clone();
+            app.morning_preferences(ui, &status);
+        };
+        draw_with(&context, &mut app, vec![], show);
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        for label in ["Morning overview", "Show my day in the morning", "Time", "Also on weekends", "Show now", "Send test"] {
+            assert!(text.contains(language.text(label).as_ref()), "{language:?}: missing {label}");
+        }
+        for time in ["07:00", "07:30", "08:00", "09:30", "10:00"] {
+            assert!(text.contains(time), "{time}");
+        }
+        assert!(!text.contains("10:30"), "Only 07:00–10:00 is offered");
+        click_text(&context, &mut app, show, "08:30");
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Preferences(preferences)
+            if preferences.morning_overview_time == 510 && preferences.morning_overview && !preferences.morning_overview_weekends));
+        click_text(&context, &mut app, show, language.text("Also on weekends").as_ref());
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Preferences(preferences) if preferences.morning_overview_weekends));
+        click_text(&context, &mut app, show, language.text("Show my day in the morning").as_ref());
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Preferences(preferences) if !preferences.morning_overview));
+        app.reminder_status.last_morning = Some(chrono::Utc::now());
+        let text = output_text(&draw_with(&context, &mut app, vec![], show));
+        assert!(text.contains(language.text("Morning overview is turned off.").as_ref()));
+        assert!(text.contains(if language == tomlook::i18n::Language::Cs { "Poslední ranní přehled zobrazen: " } else { "Last morning overview shown: " }), "{text}");
+        click_text(&context, &mut app, show, language.text("Show now").as_ref());
+        assert!(app.myday.open, "Show now opens the My day panel");
+        assert!(receiver.try_iter().all(|command| !matches!(command, Command::PrepareNow(_))));
     }
 }

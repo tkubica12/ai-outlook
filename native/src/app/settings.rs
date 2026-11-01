@@ -264,8 +264,83 @@ impl Tomlook {
         if let Some(error) = &status.error {
             ui.colored_label(ui.visuals().error_fg_color, language.text(error));
         }
+        self.morning_preferences(ui, &status);
         ui.add_space(20.0);
         ui.weak(language.text("Tomlook is listed in Windows Settings > System > Notifications, where you can turn its notifications off or change how they appear."));
+    }
+
+    pub(super) fn morning_preferences(&mut self, ui: &mut egui::Ui, status: &tomlook::reminders::Status) {
+        let language = self.preferences.language;
+        ui.add_space(20.0);
+        ui.separator();
+        ui.add_space(12.0);
+        ui.strong(language.text("Morning overview"));
+        let mut changed = ui
+            .checkbox(
+                &mut self.preferences.morning_overview,
+                language.text("Show my day in the morning"),
+            )
+            .changed();
+        ui.add_enabled_ui(self.preferences.morning_overview, |ui| {
+            ui.add_space(8.0);
+            ui.label(language.text("Time"));
+            ui.horizontal_wrapped(|ui| {
+                for minutes in tomlook::myday::TIMES {
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.preferences.morning_overview_time,
+                            minutes,
+                            format!("{:02}:{:02}", minutes / 60, minutes % 60),
+                        )
+                        .changed();
+                }
+            });
+            ui.add_space(4.0);
+            changed |= ui
+                .checkbox(
+                    &mut self.preferences.morning_overview_weekends,
+                    language.text("Also on weekends"),
+                )
+                .changed();
+        });
+        if changed {
+            self.save_preferences();
+        }
+        ui.add_space(8.0);
+        ui.weak(language.text("Once a day (on workdays unless weekends are included) with today's meetings, conflicts, meetings without Insights and tasks. If Tomlook is not running at that time, it appears at the next opportunity before 12:00. It stays quiet when today's calendar is not synced or there is nothing to act on."));
+        if self.preview {
+            ui.weak(language.text("The morning overview does not run in the offline demo; the test uses the demo's fictional calendar."));
+        } else if !self.preferences.morning_overview {
+            ui.weak(language.text("Morning overview is turned off."));
+        }
+        if let Some(at) = status.last_morning {
+            ui.weak(language.text(&format!(
+                "Last morning overview shown: {}",
+                at.with_timezone(&Local).format("%d.%m.%Y %H:%M")
+            )));
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(language.text("Show now")).clicked() {
+                self.open_myday();
+            }
+            if ui
+                .add_enabled(
+                    self.reminders.is_some() && !self.loading,
+                    egui::Button::new(language.text("Send test")),
+                )
+                .clicked()
+            {
+                self.send_morning_test();
+            }
+        });
+        ui.weak(language.text("Shows the My day notification with the current counts."));
+        if self.preview
+            && self.demo_screenshot.is_some()
+            && self.demo_scene == tomlook::showcase::Scene::Notifications
+        {
+            ui.scroll_to_cursor(Some(egui::Align::Max));
+        }
     }
 
     fn update_preferences(&mut self, ui: &mut egui::Ui) {
@@ -389,6 +464,7 @@ impl Tomlook {
         self.event_creation_dialog(context);
         self.assistant_dialog(context);
         self.tasks_window(context);
+        self.myday_window(context);
         if self.messages_open {
             let calendar = self.calendar.clone();
             let mut open = true;

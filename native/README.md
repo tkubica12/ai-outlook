@@ -48,14 +48,20 @@ have loaded. It cannot be used in production or combined with measurements.
 Only the demo window content is captured, not other desktop windows or the
 Windows title bar. PNG encoding and exclusive-create file output run on the
 bounded storage worker. Existing images are never overwritten.
-`--demo-scene <details|feedback|prompts|tasks|followup>` chooses what that screenshot shows:
+`--demo-scene <details|feedback|prompts|tasks|followup|myday|notifications>` chooses what that screenshot shows:
 the default details pane, expanded Insights with a saved rating and an open
 reason panel, **Settings > AI prompts** after fictional sample feedback is
 saved into the isolated demo profile through the normal storage path, the
-**Tasks** list, or the saved follow-up e-mail of the fictional meeting that
-ended yesterday. The preview seeds fictional tasks (including tasks imported
+**Tasks** list, the saved follow-up e-mail of the fictional meeting that
+ended yesterday, the **My day** panel, or **Settings > Notifications** scrolled
+to the morning overview. The preview seeds fictional tasks (including tasks imported
 from that meeting's sample notes) and a fictional follow-up draft into the
 isolated profile; it never requests AI or opens an e-mail link by itself.
+Today always has fictional meetings for My day: on a weekday one extra meeting
+overlaps the workweek agenda and has no sample Insights; on a weekend a short
+fictional agenda with a conflict, a tentative meeting and meetings without
+Insights replaces the empty day. Demo all-day items are shown as free, like
+Outlook's default.
 
 ## Native interaction measurement
 
@@ -1317,6 +1323,7 @@ executor, bounded request lanes/channels and coalesced notices and
 streaming. Calendar navigation does not wait for a model or briefing.
 Ctrl+Space opens the assistant, Enter submits a question from its editor,
 Shift+Enter inserts a newline, Ctrl+Shift+P opens searchable commands,
+Ctrl+D opens or closes **My day**,
 and Escape dismisses command suggestions or hides it without cancellation.
 Only **Stop** requests cancellation. Global questions and captured
 meeting context are separate; changing a meeting invalidates its old answer.
@@ -1689,6 +1696,74 @@ matrix still require their recorded product observations.
 Acceptance still requires the full cold/warm/interaction/DPI/input matrix,
 saturated live AI comparison, actual isolation/tray observations and owner
 approval. A small test corpus or one idle measurement is not that acceptance.
+
+## My day
+
+**My day** (sunrise icon in the header, command palette **My day** / **Můj den**,
+or Ctrl+D; Escape closes it) is a proactive overview of the local day computed
+only from cached data: no AI request, no network. The overview is cached and
+recomputed only when the calendar, the worker's activity snapshot (queue,
+tasks, recommendations, notes), the account, the language, the day or the
+minute changes; the panel repaints every 30 seconds for the countdown. It shows:
+
+- **Summary**: timed meetings you organize or accepted, their total time
+  (overlaps count once), the first start and the last end; tentatively accepted
+  meetings are counted separately. All-day items are listed but not counted.
+- **Next meeting** / **Current meeting** with a countdown (`in 25 min` /
+  `za 25 min`, `now` / `právě probíhá`), **Join** for a safe online-meeting link
+  and **Open** for the details.
+- **Today's agenda**: meetings you attend or tentatively accepted (followed,
+  declined, unanswered and cancelled items are omitted) with badges for ready
+  Insights, missing preparation, ready notes, tentative and Teams. A title opens
+  the meeting details and moves the calendar to that day.
+- **Conflicts**: confirmed overlaps between timed meetings
+  (`recommendations::conflicts`, local times), each meeting clickable.
+- **Not prepared**: meetings eligible for automatic preparation (organized or
+  accepted, not followed, not ended) without ready Insights. **Research now**
+  is the meeting details' explicit request; **Research all** submits them so the
+  earliest meeting is dispatched first. It is disabled, with the reason shown,
+  in the offline demo, before AI and WorkIQ are connected, while automatic
+  Insights are disabled or paused, or when everything is already queued.
+- **Missing materials**: pending missing-materials and preparation
+  recommendations for today's meetings; **Open in Messages** selects the item.
+- **Tasks**: open tasks that are overdue or due today and tasks imported from
+  notes of meetings that ended on the previous workday (yesterday; Friday through
+  Sunday on Mondays), with completion checkboxes and **Open tasks**.
+- **Mentions of me** from the same notes (`open_questions`, Czech when saved).
+- **Focus time**: free gaps of at least 30 minutes between 08:00 and 18:00 not
+  covered by confirmed busy items; free, tentative, followed, declined and
+  cancelled items and all-day free items do not block time. Only when today's
+  calendar coverage is synchronized; otherwise the panel says so and claims no
+  free time.
+- **Waiting for approval** (the Messages recommendation count) and
+  **Tomorrow** (meetings and first start, or that it is not synced yet).
+
+### Morning overview
+
+Once per local day at a configurable time (**Settings → Notifications →
+Morning overview**: 07:00–10:00 in 30-minute steps, default 08:00; workdays
+only unless **Also on weekends**), the `tomlook-reminders` thread shows one
+Windows notification titled **My day** / **Můj den**, for example
+`6 meetings · 1 conflict · 2 not prepared · 3 tasks` (`6 schůzek · 1 konflikt ·
+2 bez přípravy · 3 úkoly`, with Czech forms for 1, 2–4 and 5+), and the first
+(or, when shown later, the next) meeting. **Open** and a body click restore
+Tomlook and open the panel through the in-process activation argument `myday`;
+the system button dismisses it. The UI hands the thread an `Arc` snapshot of the
+overview inputs whenever they change; the thread computes the counts itself at
+the due time, so a date change while hidden is handled. Waits use the reminder
+timer (capped at 30 seconds, no polling of data). If Tomlook was not running or
+the PC slept, the overview is shown at the first opportunity before 12:00 the
+same day; after noon that day is skipped. It is shown only when today's calendar
+coverage is synchronized (otherwise it waits for a sync until noon) and stays
+quiet when there are no meetings, tasks or anything else to act on. The shown
+day is saved in the `morning-overview-shown-v1` setting before the notification
+is shown. Preferences `morning_overview` (default on),
+`morning_overview_time` (minutes after midnight, default 480) and
+`morning_overview_weekends` (default off) default for older settings files.
+**Show now** opens the panel; **Send test** shows the notification with the
+current counts (the demo's fictional calendar in `--demo`). The morning
+overview never runs in `--demo`, `--stress`, measurements or the acceptance
+executable; the panel works in the demo with its fictional data.
 
 ## Meeting reminders
 

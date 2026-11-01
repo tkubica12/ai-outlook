@@ -70,6 +70,10 @@ impl Tomlook {
         if consume(Modifiers::CTRL, Key::Space) {
             self.toggle_assistant(context);
         }
+        if consume(Modifiers::CTRL, Key::D) {
+            self.close_palette(context);
+            self.toggle_myday();
+        }
         let slash_menu = self.assistant
             && !self.assistant_detached
             && !self.ask_menu_dismissed
@@ -91,6 +95,8 @@ impl Tomlook {
                 self.close_palette(context);
             } else if self.tasks_open {
                 self.tasks_open = false;
+            } else if self.myday.open {
+                self.myday.open = false;
             } else if self.insights_expanded {
                 self.insights_expanded = false;
             } else if self.messages_open {
@@ -132,6 +138,7 @@ impl Tomlook {
             || self.settings
             || self.messages_open
             || self.tasks_open
+            || self.myday.open
             || self.meeting_action.is_some()
             || self.event_draft.is_some()
             || self.meeting_menu.is_some()
@@ -348,6 +355,12 @@ impl Tomlook {
                     } else {
                         self.open_tasks(false);
                     }
+                }
+                if header_icon(ui, "My day", HeaderIcon::MyDay, language, false)
+                    .on_hover_text("Ctrl+D")
+                    .clicked()
+                {
+                    self.toggle_myday();
                 }
             });
         });
@@ -1181,7 +1194,7 @@ impl Tomlook {
 }
 
 #[derive(Clone, Copy)]
-enum HeaderIcon { Settings, Ask, Commands, Tasks }
+enum HeaderIcon { Settings, Ask, Commands, Tasks, MyDay }
 
 /// Number of open tasks on a header icon; text uses the panel color for contrast with the accent.
 fn count_badge(ui: &egui::Ui, rect: egui::Rect, count: usize) {
@@ -1232,6 +1245,23 @@ fn header_icon(ui: &mut egui::Ui, label: &str, icon: HeaderIcon,
             ui.painter().rect_stroke(egui::Rect::from_min_max(point(0.08, 0.58), point(0.42, 0.92)),
                 2, stroke, egui::StrokeKind::Inside);
             for y in [0.29, 0.75] { ui.painter().line_segment([point(0.55, y), point(0.94, y)], stroke); }
+        }
+        HeaderIcon::MyDay => {
+            // A sun rising over the horizon.
+            let horizon = point(0.5, 0.74);
+            let radius = rect.width() * 0.22;
+            ui.painter().line_segment([point(0.04, 0.74), point(0.96, 0.74)], stroke);
+            let arc = (0..=16).map(|step| {
+                let angle = std::f32::consts::PI * (1.0 + step as f32 / 16.0);
+                horizon + Vec2::new(angle.cos(), angle.sin()) * radius
+            }).collect();
+            ui.painter().add(egui::Shape::line(arc, stroke));
+            for index in 0..5 {
+                let angle = std::f32::consts::PI * (1.1 + index as f32 * 0.2);
+                let direction = Vec2::new(angle.cos(), angle.sin());
+                ui.painter().line_segment([horizon + direction * (radius + 2.5), horizon + direction * (radius + 5.5)], stroke);
+            }
+            ui.painter().line_segment([point(0.3, 0.9), point(0.7, 0.9)], stroke);
         }
     }
     if attention { ui.painter().circle_filled(response.rect.right_top() + Vec2::new(-3.0, 4.0), 3.0, ui.visuals().selection.stroke.color); }

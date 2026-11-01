@@ -1,8 +1,9 @@
-//! Pre-meeting reminders shown as native Windows toast notifications.
+//! Pre-meeting reminders and the morning "My day" overview shown as native Windows toast
+//! notifications.
 //!
 //! A dedicated thread owns all notification work: it registers the notification identity,
 //! computes the next due reminder from the cached calendar and waits on a channel until then.
-//! The UI thread only hands over calendar snapshots and preferences.
+//! The UI thread only hands over calendar snapshots, My day inputs and preferences.
 
 use crate::{
     calendar::{Calendar, Event},
@@ -49,6 +50,22 @@ const SAMPLE_BULLETS: [&str; 3] = [
     "Question: Who owns the follow-up?",
 ];
 pub const PREVIEW_DISABLED: &str = "Meeting reminders are disabled in the offline demo; the test notification uses fictional content.";
+/// Activation argument of the morning "My day" notification and its **Open** button.
+pub const MYDAY_ARGUMENT: &str = "myday";
+const MYDAY_TAG: &str = "myday";
+const MYDAY_TEST_TAG: &str = "myday-test";
+const MYDAY_GROUP: &str = "my-day";
+
+/// What a notification click asks the UI to do; the window is already being restored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Activation {
+    /// Only restore Tomlook (test notification or a toast from an earlier run).
+    Restore,
+    /// Open this meeting's details.
+    Meeting(String),
+    /// Open the My day panel.
+    MyDay,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -511,6 +528,24 @@ pub fn toast_xml(toast: &Toast) -> String {
     xml
 }
 
+/// Toast XML for the morning "My day" overview: a title, the counts, the first or next meeting,
+/// **Open** (also a body click) and the system dismiss button. Every dynamic value is escaped.
+pub fn morning_xml(digest: &crate::myday::Digest, language: Language) -> String {
+    let mut xml = format!(
+        r#"<toast activationType="foreground" launch="{MYDAY_ARGUMENT}"><visual><binding template="ToastGeneric"><text>{}</text><text hint-maxLines="2">{}</text>"#,
+        escape(&digest.title),
+        escape(&digest.summary)
+    );
+    if let Some(next) = &digest.next {
+        xml.push_str(&format!("<text>{}</text>", escape(next)));
+    }
+    xml.push_str(&format!(
+        r#"</binding></visual><actions><action content="{}" activationType="foreground" arguments="{MYDAY_ARGUMENT}"/><action content="" activationType="system" arguments="dismiss"/></actions></toast>"#,
+        escape(&language.text("Open"))
+    ));
+    xml
+}
+
 /// The brand mark as a PNG for the registered notification identity.
 pub fn icon_png() -> Result<Vec<u8>, String> {
     use image::ImageEncoder;
@@ -564,9 +599,11 @@ pub struct Status {
     pub next: Option<DateTime<Utc>>,
     pub last_reminder: Option<DateTime<Utc>>,
     pub last_test: Option<DateTime<Utc>>,
+    pub last_morning: Option<DateTime<Utc>>,
 }
 
-type OpenHandler = Arc<dyn Fn(Option<String>) + Send + Sync>;
+type OpenHandler = Arc<dyn Fn(Activation) + Send + Sync>;
+type Morning = (Arc<crate::myday::Sources>, crate::myday::Schedule, Language);
 
 #[derive(Default)]
 struct Pending {
@@ -575,6 +612,9 @@ struct Pending {
     sent: Option<(Arc<Calendar>, Settings)>,
     test: Option<Language>,
     refresh: bool,
+    morning: Option<Morning>,
+    morning_sent: Option<Morning>,
+    morning_test: Option<(crate::myday::Digest, Language)>,
 }
 
 struct Shared {
@@ -589,6 +629,10 @@ struct Shared {
 impl Shared {
     /// Opens Tomlook for a toast click; unknown tags (for example after a restart) only restore it.
     fn activate(&self, open: &OpenHandler, arguments: &str) {
+        if arguments == MYDAY_ARGUMENT {
+            open(Activation::MyDay);
+            return;
+        }
         let Some(tag) = activation_tag(arguments) else {
             return;
         };
@@ -599,7 +643,7 @@ impl Shared {
             .get(tag)
             .cloned()
             .flatten();
-        open(meeting);
+        open(meeting.map_or(Activation::Restore, Activation::Meeting));
     }
 
     fn update(&self, change: impl FnOnce(&mut Status)) {
@@ -660,12 +704,12 @@ impl Shutdown {
 
 impl Reminders {
     /// Starts the reminder thread. `notify` requests a repaint after status changes;
-    /// `open` runs on a Windows thread when a toast asks to open Tomlook or a meeting.
+    /// `open` runs on a Windows thread when a toast asks to open Tomlook, a meeting or My day.
     pub fn start(
         state: PathBuf,
         mode: Mode,
         notify: impl Fn() + Send + Sync + 'static,
-        open: impl Fn(Option<String>) + Send + Sync + 'static,
+        open: impl Fn(Activation) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let shared = Arc::new(Shared {
             status: Mutex::new(Status::default()),
@@ -729,6 +773,38 @@ impl Reminders {
         self.wake();
     }
 
+    /// Hands over the My day inputs and the morning schedule; unchanged input is ignored.
+    pub fn update_morning(
+        &self,
+        sources: &Arc<crate::myday::Sources>,
+        schedule: crate::myday::Schedule,
+        language: Language,
+    ) {
+        {
+            let mut pending = self.shared.pending();
+            if pending
+                .morning_sent
+                .as_ref()
+                .is_some_and(|(sent, sent_schedule, sent_language)| {
+                    Arc::ptr_eq(sent, sources)
+                        && *sent_schedule == schedule
+                        && *sent_language == language
+                })
+            {
+                return;
+            }
+            pending.morning_sent = Some((sources.clone(), schedule, language));
+            pending.morning = Some((sources.clone(), schedule, language));
+        }
+        self.wake();
+    }
+
+    /// Shows the morning overview notification now, labelled as a test.
+    pub fn test_morning(&self, digest: crate::myday::Digest, language: Language) {
+        self.shared.pending().morning_test = Some((digest, language));
+        self.wake();
+    }
+
     /// Re-reads whether Windows allows Tomlook notifications.
     pub fn refresh(&self) {
         self.shared.pending().refresh = true;
@@ -766,6 +842,37 @@ struct Live {
     planner: Planner,
     calendar: Arc<Calendar>,
     settings: Option<Settings>,
+    morning: Option<MorningState>,
+    /// Local day the morning overview was last shown.
+    morning_shown: Option<chrono::NaiveDate>,
+}
+
+struct MorningState {
+    sources: Arc<crate::myday::Sources>,
+    schedule: crate::myday::Schedule,
+    language: Language,
+    /// Inputs and day already evaluated without a notification (not synced or nothing to act
+    /// on); the next evaluation waits for newer inputs or the next day.
+    evaluated: Option<(Arc<crate::myday::Sources>, chrono::NaiveDate)>,
+}
+
+impl Live {
+    /// When the morning overview should next be evaluated.
+    fn morning_wake(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let morning = self.morning.as_ref()?;
+        let local = now.with_timezone(&Local);
+        let today = local.date_naive();
+        let evaluated = morning
+            .evaluated
+            .as_ref()
+            .is_some_and(|(sources, day)| Arc::ptr_eq(sources, &morning.sources) && *day == today);
+        let handled = self.morning_shown.max(evaluated.then_some(today));
+        let next = crate::myday::next_due(&morning.schedule, handled, local.naive_local())?;
+        Local
+            .from_local_datetime(&next)
+            .earliest()
+            .map(|at| at.with_timezone(&Utc).max(now))
+    }
 }
 
 impl Runner {
@@ -788,7 +895,13 @@ impl Runner {
             let now = Utc::now();
             let wait = live
                 .as_ref()
-                .and_then(|live| live.planner.next_wake(now))
+                .and_then(|live| {
+                    live.planner
+                        .next_wake(now)
+                        .into_iter()
+                        .chain(live.morning_wake(now))
+                        .min()
+                })
                 .map(|at| (at - now).to_std().unwrap_or_default().min(MAX_WAIT));
             let received = match wait {
                 Some(wait) => inbox.recv_timeout(wait),
@@ -801,12 +914,14 @@ impl Runner {
             {
                 break;
             }
-            let (update, test, refresh) = {
+            let (update, test, refresh, morning, morning_test) = {
                 let mut pending = self.shared.pending();
                 (
                     pending.update.take(),
                     pending.test.take(),
                     std::mem::take(&mut pending.refresh),
+                    pending.morning.take(),
+                    pending.morning_test.take(),
                 )
             };
             if refresh {
@@ -818,6 +933,9 @@ impl Runner {
             }
             if let Some(language) = test {
                 self.test(&mut backend, language);
+            }
+            if let Some((digest, language)) = morning_test {
+                self.test_morning(&mut backend, digest, language);
             }
             if let Some((calendar, settings)) = update
                 && self.mode == Mode::Live
@@ -837,8 +955,20 @@ impl Runner {
                 live.calendar = calendar;
                 live.settings = Some(settings);
             }
+            if let Some((sources, schedule, language)) = morning
+                && self.mode == Mode::Live
+            {
+                let live = live.get_or_insert_with(|| self.open_live());
+                live.morning = Some(MorningState {
+                    sources,
+                    schedule,
+                    language,
+                    evaluated: None,
+                });
+            }
             if let Some(live) = &mut live {
                 self.fire_due(&mut backend, live);
+                self.fire_morning(&mut backend, live);
                 let next = live.planner.next_wake(Utc::now());
                 self.shared.update(|status| status.next = next);
             }
@@ -863,12 +993,111 @@ impl Runner {
                 (None, BTreeMap::new())
             }
         };
+        let morning_shown = match store.as_ref().map(Store::morning_overview_shown) {
+            Some(Ok(shown)) => shown,
+            Some(Err(error)) => {
+                self.shared.update(|status| {
+                    status.error = Some(format!("Morning overview history is unavailable: {error}"))
+                });
+                None
+            }
+            None => None,
+        };
         Live {
             store,
             planner: Planner::with_fired(fired, now),
             calendar: Arc::new(Calendar::default()),
             settings: None,
+            morning: None,
+            morning_shown,
         }
+    }
+
+    /// Shows the morning overview once per local day when it is due, today's calendar is
+    /// synchronized and there is something to act on; otherwise waits for newer inputs.
+    fn fire_morning(&self, backend: &mut platform::Backend, live: &mut Live) {
+        let Some(morning) = &mut live.morning else {
+            return;
+        };
+        let now = Local::now();
+        let today = now.date_naive();
+        if !crate::myday::due(&morning.schedule, live.morning_shown, now.naive_local())
+            || morning
+                .evaluated
+                .as_ref()
+                .is_some_and(|(sources, day)| Arc::ptr_eq(sources, &morning.sources) && *day == today)
+        {
+            return;
+        }
+        morning.evaluated = Some((morning.sources.clone(), today));
+        let overview = crate::myday::overview(&morning.sources, now, morning.language);
+        if !overview.verified || !overview.actionable() {
+            return;
+        }
+        // Recorded before showing: the overview is shown at most once a day, even after a crash.
+        live.morning_shown = Some(today);
+        let saved = live
+            .store
+            .as_ref()
+            .map(|store| store.save_morning_overview_shown(today));
+        let digest = crate::myday::digest(&overview, now, morning.language);
+        let at = now.with_timezone(&Utc);
+        let expires = Local
+            .from_local_datetime(&(today + Duration::days(1)).and_time(chrono::NaiveTime::MIN))
+            .earliest()
+            .map_or(at + Duration::hours(12), |end| end.with_timezone(&Utc));
+        let shown = backend.show(platform::Request {
+            tag: MYDAY_TAG.into(),
+            group: MYDAY_GROUP,
+            xml: morning_xml(&digest, morning.language),
+            expires: expires.max(at + Duration::minutes(15)),
+            event: None,
+        });
+        let setting = backend.setting().ok().flatten();
+        self.shared.update(|status| {
+            status.windows = setting.or(status.windows);
+            match (&shown, &saved) {
+                (Err(error), _) => status.error = Some(error.clone()),
+                (Ok(()), Some(Err(error))) => {
+                    status.last_morning = Some(at);
+                    status.error = Some(format!(
+                        "Morning overview history could not be saved: {error}"
+                    ));
+                }
+                (Ok(()), _) => {
+                    status.error = None;
+                    status.last_morning = Some(at);
+                }
+            }
+        });
+    }
+
+    fn test_morning(
+        &self,
+        backend: &mut platform::Backend,
+        mut digest: crate::myday::Digest,
+        language: Language,
+    ) {
+        let now = Utc::now();
+        digest.title = format!("{} · {}", digest.title, language.text("Test notification"));
+        let shown = backend.show(platform::Request {
+            tag: MYDAY_TEST_TAG.into(),
+            group: TEST_GROUP,
+            xml: morning_xml(&digest, language),
+            expires: now + Duration::hours(1),
+            event: None,
+        });
+        let setting = backend.setting().ok().flatten();
+        self.shared.update(|status| {
+            status.windows = setting.or(status.windows);
+            match shown {
+                Ok(()) => {
+                    status.error = None;
+                    status.last_test = Some(now);
+                }
+                Err(error) => status.error = Some(error),
+            }
+        });
     }
 
     fn fire_due(&self, backend: &mut platform::Backend, live: &mut Live) {
@@ -1821,7 +2050,7 @@ mod tests {
     fn toast_clicks_open_the_shown_meeting_or_only_restore_tomlook() {
         let opened = Arc::new(Mutex::new(Vec::new()));
         let seen = opened.clone();
-        let open: OpenHandler = Arc::new(move |meeting| seen.lock().unwrap().push(meeting));
+        let open: OpenHandler = Arc::new(move |activation| seen.lock().unwrap().push(activation));
         let shared = Shared {
             status: Mutex::new(Status::default()),
             pending: Mutex::new(Pending::default()),
@@ -1838,12 +2067,19 @@ mod tests {
             format!("open:{}", "b".repeat(32)),
             String::new(),
             "snooze".into(),
+            MYDAY_ARGUMENT.into(),
         ] {
             shared.activate(&open, &arguments);
         }
         assert_eq!(
             *opened.lock().unwrap(),
-            [Some("meeting-id".to_string()), None, None, None]
+            [
+                Activation::Meeting("meeting-id".to_string()),
+                Activation::Restore,
+                Activation::Restore,
+                Activation::Restore,
+                Activation::MyDay
+            ]
         );
         assert_eq!(activation_tag("open:abc"), Some("abc"));
         assert_eq!(activation_tag("dismiss"), None);
@@ -1946,5 +2182,46 @@ mod tests {
                 assert!(texts.Length().unwrap() >= 3);
             }
         }
+        let digest = crate::myday::Digest {
+            title: "My day".into(),
+            summary: "2 meetings · 1 conflict".into(),
+            next: Some("First meeting 08:30 · A & <B>".into()),
+        };
+        let document = XmlDocument::new().unwrap();
+        document
+            .LoadXml(&HSTRING::from(morning_xml(&digest, Language::Cs)))
+            .unwrap();
+        let texts = document
+            .GetElementsByTagName(&HSTRING::from("text"))
+            .unwrap();
+        assert_eq!(texts.Length().unwrap(), 3);
+        assert_eq!(
+            texts.Item(2).unwrap().InnerText().unwrap().to_string(),
+            "First meeting 08:30 · A & <B>"
+        );
+    }
+
+    #[test]
+    fn morning_overview_toast_opens_my_day_and_escapes_its_text() {
+        let digest = crate::myday::Digest {
+            title: "Můj den".into(),
+            summary: "6 schůzek · 1 konflikt · 2 bez přípravy · 3 úkoly".into(),
+            next: Some("První schůzka 08:30 · Zákazník <Contoso> & \"partneři\"".into()),
+        };
+        let xml = morning_xml(&digest, Language::Cs);
+        assert!(xml.starts_with(r#"<toast activationType="foreground" launch="myday">"#));
+        assert!(xml.contains("<text>Můj den</text>"));
+        assert!(xml.contains("6 schůzek · 1 konflikt · 2 bez přípravy · 3 úkoly"));
+        assert!(xml.contains("Zákazník &lt;Contoso&gt; &amp; &quot;partneři&quot;"));
+        assert!(xml.contains(r#"<action content="Otevřít" activationType="foreground" arguments="myday"/>"#));
+        assert!(xml.contains(r#"arguments="dismiss""#));
+        assert_eq!(xml.matches("<action ").count(), 2);
+        assert!(!xml.contains("scenario=") && !xml.contains("snooze"), "A quiet, ordinary toast");
+        let without_next = morning_xml(
+            &crate::myday::Digest { next: None, ..digest },
+            Language::En,
+        );
+        assert_eq!(without_next.matches("<text").count(), 2);
+        assert!(without_next.contains(r#"content="Open""#));
     }
 }

@@ -420,7 +420,7 @@ pub fn from_notes(
 
 /// Notes items start with a short heading such as "My task:"; the task title keeps only the
 /// capitalized text after it. URLs and longer leading clauses are left unchanged.
-fn without_label(text: &str) -> String {
+pub(crate) fn without_label(text: &str) -> String {
     match text.split_once(':') {
         Some((label, rest))
             if !rest.trim().is_empty()

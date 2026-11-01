@@ -49,6 +49,11 @@ pub struct Preferences {
     pub meeting_reminders: bool,
     pub reminder_minutes: u8,
     pub remind_tentative: bool,
+    /// Morning "My day" notification.
+    pub morning_overview: bool,
+    /// Minutes after local midnight of the morning overview (07:00–10:00 in 30-minute steps).
+    pub morning_overview_time: u16,
+    pub morning_overview_weekends: bool,
 }
 
 impl Default for Preferences {
@@ -74,6 +79,9 @@ impl Default for Preferences {
             meeting_reminders: true,
             reminder_minutes: crate::reminders::DEFAULT_MINUTES,
             remind_tentative: false,
+            morning_overview: true,
+            morning_overview_time: crate::myday::DEFAULT_TIME,
+            morning_overview_weekends: false,
         }
     }
 }
@@ -733,6 +741,36 @@ impl Store {
                 [json],
             )
             .map_err(|_| "Save meeting reminder history failed")?;
+        Ok(())
+    }
+
+    /// Local day the morning overview was last shown.
+    pub fn morning_overview_shown(&self) -> Result<Option<NaiveDate>> {
+        let payload: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT payload FROM settings WHERE key='morning-overview-shown-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "Read morning overview history failed")?;
+        payload
+            .map(|value| {
+                NaiveDate::parse_from_str(&value, "%Y-%m-%d")
+                    .map_err(|_| "Saved morning overview history is invalid".to_string())
+            })
+            .transpose()
+    }
+
+    pub fn save_morning_overview_shown(&self, date: NaiveDate) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO settings VALUES('morning-overview-shown-v1',?1)
+                 ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                [date.format("%Y-%m-%d").to_string()],
+            )
+            .map_err(|_| "Save morning overview history failed")?;
         Ok(())
     }
 

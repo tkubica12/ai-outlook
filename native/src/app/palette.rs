@@ -4,6 +4,7 @@ use super::*;
 pub(super) enum PaletteCommand {
     View(View),
     Today,
+    MyDay,
     Search,
     Ask,
     Tasks,
@@ -23,6 +24,7 @@ impl PaletteCommand {
             Self::View(View::Week) => "Show week",
             Self::View(View::Month) => "Show month",
             Self::Today => "Go to today",
+            Self::MyDay => "My day",
             Self::Search => "Search meetings",
             Self::Ask => "Ask a question",
             Self::Tasks => "Open tasks",
@@ -49,6 +51,7 @@ pub(super) fn command_matches_in(query: &str, language: tomlook::i18n::Language)
         PaletteCommand::View(View::Week),
         PaletteCommand::View(View::Month),
         PaletteCommand::Today,
+        PaletteCommand::MyDay,
         PaletteCommand::Search,
         PaletteCommand::Ask,
         PaletteCommand::Tasks,
@@ -91,6 +94,7 @@ impl Tomlook {
                 self.choose_view(view);
             }
             PaletteCommand::Today => self.go_today(),
+            PaletteCommand::MyDay => self.open_myday(),
             PaletteCommand::Search => {
                 self.focus_search = true;
                 context.request_repaint();

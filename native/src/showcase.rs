@@ -17,6 +17,10 @@ pub enum Scene {
     Tasks,
     /// Details of the ended sample meeting: notes, its tasks and a saved follow-up e-mail.
     FollowUp,
+    /// The My day panel for the demo's today.
+    MyDay,
+    /// Settings > Notifications with meeting reminders and the morning overview.
+    Notifications,
 }
 
 impl Scene {
@@ -27,8 +31,15 @@ impl Scene {
             "prompts" => Ok(Self::Prompts),
             "tasks" => Ok(Self::Tasks),
             "followup" => Ok(Self::FollowUp),
-            _ => Err("--demo-scene must be details, feedback, prompts, tasks or followup".into()),
+            "myday" => Ok(Self::MyDay),
+            "notifications" => Ok(Self::Notifications),
+            _ => Err("--demo-scene must be details, feedback, prompts, tasks, followup, myday or notifications".into()),
         }
+    }
+
+    /// Whether the scene first selects [`Scene::meeting`] and waits for its saved document.
+    pub fn selects_meeting(self) -> bool {
+        !matches!(self, Self::MyDay | Self::Notifications)
     }
 
     /// The sample meeting whose details the scene shows.
@@ -390,7 +401,11 @@ pub fn events(now: DateTime<Local>, count: usize) -> Vec<Event> {
                     ("type".into(), json!("singleInstance")),
                     ("isOrganizer".into(), json!(status == "organizer")),
                     ("categories".into(), json!([category])),
-                ]),
+                ])
+                .into_iter()
+                // Like Outlook's default, all-day items are shown as free, so they leave focus time.
+                .chain((minute == 0).then(|| ("showAs".into(), json!("free"))))
+                .collect(),
             }
         })
         .collect()
@@ -448,10 +463,116 @@ pub fn insights(event: &Event) -> Result<Value, String> {
     Ok(value)
 }
 
-/// The offline preview calendar: `count` meetings, the last of which is the fictional
+// Start minute, duration, title, category, location, response, sample Insights saved.
+type Extra = (u32, i64, &'static str, &'static str, &'static str, &'static str, bool);
+
+/// Extra fictional meeting on the demo's weekday today: it overlaps the workweek agenda and has
+/// no sample Insights, so My day shows a conflict and a meeting to prepare.
+const TODAY_WEEKDAY: &[Extra] = &[(
+    600,
+    45,
+    "Northstar / Escalation check-in",
+    "Customer",
+    "Online",
+    "accepted",
+    false,
+)];
+
+/// A short fictional agenda when the demo runs on a weekend, so My day is never empty.
+const TODAY_WEEKEND: &[Extra] = &[
+    (540, 45, "Launch readiness check", "Office", "Online", "accepted", true),
+    (
+        600,
+        45,
+        "Northstar / Escalation check-in",
+        "Customer",
+        "Online",
+        "accepted",
+        false,
+    ),
+    (630, 60, "Focus / Launch checklist", "Focus", "", "organizer", true),
+    (
+        780,
+        30,
+        "Partner office hours",
+        "Video calls",
+        "Online",
+        "tentativelyAccepted",
+        true,
+    ),
+    (
+        900,
+        45,
+        "Orbit / Release review",
+        "Customer",
+        "Online",
+        "accepted",
+        false,
+    ),
+];
+
+fn today_events(today: chrono::NaiveDate) -> Vec<Event> {
+    let extras = if today.weekday().num_days_from_monday() < 5 {
+        TODAY_WEEKDAY
+    } else {
+        TODAY_WEEKEND
+    };
+    extras
+        .iter()
+        .enumerate()
+        .map(
+            |(index, (minute, duration, title, category, location, status, ready))| {
+                let start = today
+                    .and_hms_opt(minute / 60, minute % 60, 0)
+                    .expect("valid demo time")
+                    .and_local_timezone(Local)
+                    .earliest()
+                    .expect("demo daytime exists")
+                    .fixed_offset();
+                Event {
+                    id: format!("synthetic-today-{index}"),
+                    title: (*title).into(),
+                    start,
+                    end: start + Duration::minutes(*duration),
+                    category: (*category).into(),
+                    attendees: if *status == "organizer" {
+                        Vec::new()
+                    } else {
+                        vec![
+                            "Alex Rivers <alex@example.invalid>".into(),
+                            "Jamie Brooks <jamie@example.invalid>".into(),
+                            "Riley Chen <riley@example.invalid>".into(),
+                        ]
+                    },
+                    organizer: "Taylor Quinn <taylor@example.invalid>".into(),
+                    location: (*location).into(),
+                    status: (*status).into(),
+                    briefing_status: if *ready { "ready" } else { "not_ready" }.into(),
+                    is_all_day: false,
+                    source_url: None,
+                    extra: BTreeMap::from([
+                        ("synthetic".into(), json!(true)),
+                        ("type".into(), json!("singleInstance")),
+                        ("isOrganizer".into(), json!(*status == "organizer")),
+                        ("categories".into(), json!([category])),
+                    ]),
+                }
+            },
+        )
+        .collect()
+}
+
+/// The offline preview calendar: `count` meetings. Today gets a few extra fictional meetings
+/// (see [`TODAY_WEEKDAY`] and [`TODAY_WEEKEND`]) and the last meeting is the fictional
 /// [`ENDED_MEETING`] that ended yesterday and has sample notes, tasks and a follow-up e-mail.
 pub fn preview_events(now: DateTime<Local>, count: usize) -> Vec<Event> {
-    let mut events = events(now, count.saturating_sub(1));
+    let today = if count > 40 {
+        today_events(now.date_naive())
+    } else {
+        Vec::new()
+    };
+    let mut events = events(now, count.saturating_sub(1 + today.len()));
+    events.extend(today);
     if count > 0 {
         let start = (now.date_naive() - Duration::days(1))
             .and_hms_opt(14, 0, 0)
@@ -489,13 +610,15 @@ pub fn preview_events(now: DateTime<Local>, count: usize) -> Vec<Event> {
     events
 }
 
-/// The saved document a preview meeting shows: sample notes for the ended meeting, otherwise
-/// sample Insights.
-pub fn detail(event: &Event) -> Result<Value, String> {
+/// The saved document a preview meeting shows: sample notes for the ended meeting, nothing for a
+/// meeting without sample Insights, otherwise sample Insights.
+pub fn detail(event: &Event) -> Result<Option<Value>, String> {
     if event.title == ENDED_MEETING {
-        notes(event)
+        notes(event).map(Some)
+    } else if event.briefing_status != "ready" {
+        Ok(None)
     } else {
-        insights(event)
+        insights(event).map(Some)
     }
 }
 
@@ -696,11 +819,13 @@ mod tests {
         assert_eq!(summary.preparation.hot_spots[0], ("talking_points".into(), 2));
         assert_eq!(summary.preparation.reasons[0], (crate::feedback::Reason::TooVague, 2));
         for (value, scene) in [("details", Scene::Details), ("feedback", Scene::Feedback), ("prompts", Scene::Prompts),
-            ("tasks", Scene::Tasks), ("followup", Scene::FollowUp)] {
+            ("tasks", Scene::Tasks), ("followup", Scene::FollowUp), ("myday", Scene::MyDay),
+            ("notifications", Scene::Notifications)] {
             assert_eq!(Scene::parse(value).unwrap(), scene);
         }
         assert!(Scene::parse("settings").is_err());
         assert_eq!(Scene::FollowUp.meeting(), ENDED_MEETING);
+        assert!(Scene::Details.selects_meeting() && !Scene::MyDay.selects_meeting() && !Scene::Notifications.selects_meeting());
     }
 
     #[test]
@@ -713,10 +838,12 @@ mod tests {
         assert!(ended.end < now.fixed_offset() && ended.end > now.fixed_offset() - Duration::days(7));
         assert!(ended.attendees.iter().chain([&ended.organizer]).all(|person| person.ends_with("@example.invalid>")));
         crate::calendar::Calendar::build(events.clone(), Default::default(), vec![]).unwrap();
-        let saved = detail(ended).unwrap();
+        let saved = detail(ended).unwrap().unwrap();
         assert_eq!(saved["tomlook_recap"], true);
         assert_eq!(saved["evidence_status"], "Sample meeting notes - not generated by AI");
-        assert!(detail(events.iter().find(|event| event.title == "Weekly planning").unwrap()).unwrap()["tomlook_recap"].is_null());
+        assert!(detail(events.iter().find(|event| event.title == "Weekly planning").unwrap()).unwrap().unwrap()["tomlook_recap"].is_null());
+        let unprepared = events.iter().find(|event| event.title == "Northstar / Escalation check-in").unwrap();
+        assert_eq!(detail(unprepared).unwrap(), None, "A meeting without sample Insights shows none");
         for language in [Language::En, Language::Cs] {
             let imported = crate::tasks::from_notes(crate::feedback::PREVIEW_ACCOUNT, ended, &saved, language, Utc::now()).unwrap();
             assert_eq!(imported.len(), 3);
@@ -732,6 +859,35 @@ mod tests {
         let mut real = ended.clone();
         real.extra.remove("synthetic");
         assert!(notes(&real).is_err());
+    }
+
+    #[test]
+    fn demo_today_has_a_meaningful_my_day_on_weekdays_and_weekends() {
+        use chrono::TimeZone;
+        use std::sync::Arc;
+        for (day, meetings) in [(11, 6), (15, 4)] {
+            let now = Local.with_ymd_and_hms(2026, 11, day, 7, 30, 0).earliest().unwrap();
+            let events = preview_events(now, 200);
+            assert_eq!(events.len(), 200);
+            let ended = events.iter().find(|event| event.title == ENDED_MEETING).unwrap().clone();
+            let coverage = (0..42).map(|offset| crate::calendar::monday(now.date_naive()) + Duration::days(offset)).collect();
+            let calendar = crate::calendar::Calendar::build(events, coverage, vec![]).unwrap();
+            let ready = calendar.events.iter().filter(|event| event.briefing_status == "ready").map(|event| event.id.clone()).collect();
+            let notes = [(ended.id.clone(), crate::myday::Notes::from_payload(&notes(&ended).unwrap()).unwrap())].into();
+            let sources = crate::myday::Sources {
+                calendar: Arc::new(calendar),
+                ready: Arc::new(ready),
+                notes: Arc::new(notes),
+                ..Default::default()
+            };
+            let overview = crate::myday::overview(&sources, now, crate::i18n::Language::En);
+            assert!(overview.verified);
+            assert_eq!(overview.meetings, meetings, "{day}: {:?}", overview.agenda);
+            assert!(!overview.conflicts.is_empty(), "{day}");
+            assert!(overview.agenda.iter().any(|item| item.title == "Northstar / Escalation check-in" && item.unprepared()));
+            assert!(overview.focus.as_ref().is_some_and(|focus| !focus.is_empty()));
+            assert_eq!(overview.mentions.len(), 1, "Yesterday's sample notes mention me");
+        }
     }
 
     #[test]

@@ -726,6 +726,21 @@ impl Tomlook {
                 }
                 ready && self.demo_frames > 8
             }
+            Scene::MyDay => {
+                if !self.myday.open {
+                    self.open_myday();
+                }
+                let ready = self.open_task_count() > 0 && self.myday_overview().is_some();
+                if !ready {
+                    self.demo_frames = 0;
+                }
+                ready && self.demo_frames > 5
+            }
+            Scene::Notifications => {
+                self.preferences_open = true;
+                self.preferences_section = PreferencesSection::Notifications;
+                self.demo_frames > 8
+            }
         }
     }
 }

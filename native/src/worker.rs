@@ -1574,7 +1574,7 @@ impl Worker {
                         let detail = if options.demo.is_some() {
                             calendar.events.iter().find(|event| event.id == id)
                                 .ok_or_else(|| "Synthetic meeting is no longer available".to_owned())
-                                .and_then(crate::showcase::detail).map(Some)
+                                .and_then(crate::showcase::detail)
                         } else if let Some(event) = calendar.event_index(&id).map(|index| &calendar.events[index])
                             && event.end <= chrono::Local::now().fixed_offset() {
                             Ok(store.calendar_owner()?.as_deref().and_then(|account| recaps.record(account, event))

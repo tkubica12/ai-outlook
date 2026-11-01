@@ -22,6 +22,7 @@ mod html_text;
 pub mod i18n;
 pub mod instance;
 pub mod markdown;
+pub mod myday;
 pub mod proposals;
 pub mod prompts;
 pub mod recaps;

@@ -140,8 +140,9 @@ fn capture<'a>(pattern: &str, text: &'a str) -> Option<Vec<&'a str>> {
     let mut remaining = text.strip_prefix(parts.next()?)?;
     let mut values = Vec::new();
     while let Some(suffix) = parts.next() {
-        if suffix.is_empty() && parts.peek().is_none() {
-            values.push(remaining);
+        if parts.peek().is_none() {
+            // The last value may itself contain the closing text, e.g. dots in "31.10.2026.".
+            values.push(remaining.strip_suffix(suffix)?);
             remaining = "";
         } else {
             let end = remaining.find(suffix)?;
@@ -2643,6 +2644,100 @@ pub const TEXTS: &[(&str, &str)] = &[
         "AI is stopping; nothing was submitted",
         "AI se zastavuje; nic nebylo odesláno",
     ),
+    ("My day", "Můj den"),
+    ("Ctrl+D   My day", "Ctrl+D   Můj den"),
+    ("Current meeting", "Právě probíhá"),
+    ("Next meeting", "Další schůzka"),
+    ("No more meetings today.", "Dnes vás už žádná schůzka nečeká."),
+    ("Today's agenda", "Dnešní program"),
+    ("No meetings today.", "Dnes nemáte žádné schůzky."),
+    ("Insights ready", "Přehled je hotový"),
+    ("Notes ready", "Zápis je hotový"),
+    ("Not prepared", "Bez přípravy"),
+    ("Conflicts", "Konflikty"),
+    ("No conflicts today.", "Dnes žádné konflikty."),
+    (
+        "Every meeting that needs preparation today has Insights.",
+        "Všechny dnešní schůzky, které potřebují přípravu, mají přehled.",
+    ),
+    ("Research all", "Zjistit u všech"),
+    (
+        "Research is not available in the offline demo.",
+        "V offline ukázce nelze zjišťovat souvislosti.",
+    ),
+    (
+        "Connect AI and WorkIQ to research these meetings.",
+        "Pro zjištění souvislostí připojte AI a WorkIQ.",
+    ),
+    ("All of them are already queued.", "Všechny už čekají ve frontě."),
+    (
+        "No missing materials for today's meetings.",
+        "Dnešním schůzkám nechybí žádné podklady.",
+    ),
+    ("Open in Messages", "Otevřít ve Zprávách"),
+    (
+        "No overdue tasks, tasks due today or tasks from recent notes.",
+        "Žádné úkoly po termínu, s dnešním termínem ani z nedávných zápisů.",
+    ),
+    (
+        "No mentions of you in recent meeting notes.",
+        "V nedávných zápisech ze schůzek o vás nic není.",
+    ),
+    ("Focus time", "Čas na soustředění"),
+    (
+        "No free block of 30 minutes or more is left between 08:00 and 18:00.",
+        "Mezi 8:00 a 18:00 už nezbývá volný blok alespoň na 30 minut.",
+    ),
+    (
+        "Free in the confirmed calendar between 08:00 and 18:00.",
+        "Volno v potvrzeném kalendáři mezi 8:00 a 18:00.",
+    ),
+    (
+        "Today's calendar is not synced yet, so free time is not shown.",
+        "Dnešní kalendář ještě není synchronizovaný, proto volno nezobrazuji.",
+    ),
+    ("Waiting for approval", "Čeká na schválení"),
+    ("Nothing is waiting for approval.", "Nic nečeká na schválení."),
+    ("Open Messages", "Otevřít Zprávy"),
+    (
+        "Tomorrow's calendar is not synced yet.",
+        "Zítřejší kalendář ještě není synchronizovaný.",
+    ),
+    (
+        "Today's calendar is not synced yet; the overview may be incomplete.",
+        "Dnešní kalendář ještě není synchronizovaný; přehled nemusí být úplný.",
+    ),
+    ("Morning overview", "Ranní přehled"),
+    ("Show my day in the morning", "Ráno zobrazit přehled Můj den"),
+    ("Time", "Čas"),
+    ("Also on weekends", "I o víkendu"),
+    (
+        "Once a day (on workdays unless weekends are included) with today's meetings, conflicts, meetings without Insights and tasks. If Tomlook is not running at that time, it appears at the next opportunity before 12:00. It stays quiet when today's calendar is not synced or there is nothing to act on.",
+        "Jednou denně (v pracovní dny, pokud nezapnete i víkendy) s dnešními schůzkami, konflikty, schůzkami bez přehledu a úkoly. Pokud Tomlook v tu dobu neběží, ukáže se při nejbližší příležitosti do 12:00. Neozve se, když dnešní kalendář není synchronizovaný nebo není co řešit.",
+    ),
+    ("Morning overview is turned off.", "Ranní přehled je vypnutý."),
+    (
+        "The morning overview does not run in the offline demo; the test uses the demo's fictional calendar.",
+        "V offline ukázce se ranní přehled nespouští; test použije smyšlený kalendář ukázky.",
+    ),
+    ("Show now", "Zobrazit hned"),
+    ("Send test", "Odeslat test"),
+    (
+        "Shows the My day notification with the current counts.",
+        "Zobrazí oznámení Můj den s aktuálními počty.",
+    ),
+    (
+        "Read morning overview history failed",
+        "Načtení historie ranního přehledu se nezdařilo",
+    ),
+    (
+        "Saved morning overview history is invalid",
+        "Uložená historie ranního přehledu je neplatná",
+    ),
+    (
+        "Save morning overview history failed",
+        "Uložení historie ranního přehledu se nezdařilo",
+    ),
 ];
 
 const PATTERNS: &[(&str, &str)] = &[
@@ -2827,6 +2922,18 @@ const PATTERNS: &[(&str, &str)] = &[
         "Could not open the e-mail app (code {})",
         "E-mailovou aplikaci se nepodařilo otevřít (kód {0})",
     ),
+    (
+        "Last morning overview shown: {}",
+        "Poslední ranní přehled zobrazen: {0}",
+    ),
+    (
+        "Morning overview history could not be saved: {}",
+        "Historii ranního přehledu nelze uložit: {0}",
+    ),
+    (
+        "Morning overview history is unavailable: {}",
+        "Historie ranního přehledu není k dispozici: {0}",
+    ),
 ];
 
 #[cfg(test)]
@@ -2844,6 +2951,7 @@ mod tests {
             include_str!("app/feedback.rs"),
             include_str!("app/followup.rs"),
             include_str!("app/meeting.rs"),
+            include_str!("app/myday.rs"),
             include_str!("app/palette.rs"),
             include_str!("app/recommendations.rs"),
             include_str!("app/settings.rs"),
@@ -2914,6 +3022,15 @@ mod tests {
         assert!(restored.hide_unconfirmed);
         assert!(!restored.dark);
         assert_eq!(restored.accent, 2);
+    }
+
+    #[test]
+    fn trailing_placeholders_keep_values_that_contain_the_closing_text() {
+        assert_eq!(
+            Language::Cs.text("Last reminder shown at 31.10.2026 21:39."),
+            "Poslední připomínka zobrazena v 31.10.2026 21:39."
+        );
+        assert_eq!(Language::Cs.text("In 5 min · 09:15–10:45"), "Za 5 min · 09:15–10:45");
     }
 
     #[test]
