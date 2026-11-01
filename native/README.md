@@ -24,6 +24,56 @@ Worker notifications request repaint on change; no recurring idle UI poll runs.
 Meeting detail requests carry a revision so an old response cannot reopen or
 overwrite a different meeting. Settings and calendar transactions survive restart.
 
+## First run and setup checklist
+
+The first normal start of a profile without saved connections opens a compact
+**Welcome** window: what Tomlook is, the language and light/dark choice of
+**Settings > Display**, and the required setup steps with their actions.
+**Open setup checklist** or **Later** closes it. That it was shown is saved in
+the profile (`welcome_shown`), so it never opens again. A profile that already
+has a saved connection (work e-mail, GitHub App Client ID, a synchronized
+calendar, `connections.json`, `decision-router.json`, the isolated `copilot`
+home or a saved WorkIQ, WebIQ or GitHub sign-in) counts as already welcomed,
+so upgrades never see it. `--demo`, `--stress`, measurement and acceptance runs
+never show it and never save the flag.
+
+**Settings > Setup** (Czech **Nastavení připojení**; also **Setup checklist**
+in Commands, Ctrl+Shift+P) replaces reading the setup sections below. Each step
+has a status icon (done, action needed, not set up, checking, error), a line
+about what it enables, one action and **Details** with the honest current state
+or error:
+
+| Step | Done when | Action |
+|---|---|---|
+| Microsoft 365 calendar (WorkIQ), required | WorkIQ is connected and every day from one month back to six months ahead has synchronized data; otherwise it shows how many days are not synced yet | **Sign in** opens the WorkIQ dialog for the work e-mail; **Retry sync** refreshes after a sync error |
+| GitHub Copilot, required | The isolated Copilot runtime accepted its identity | **Sign in** runs the AI dialog's browser sign-in; **Install Copilot CLI** opens the [Copilot CLI installation guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli) when `connections.json` names no usable runtime |
+| Identity match, required | Automatic Insights can run: turned on and not paused, both connections ready, today synchronized and the connected WorkIQ account owning the calendar, the same rules preparation applies | Opens Insights activity, the AI or WorkIQ dialog, or retries sync |
+| Windows notifications, required | Windows allows Tomlook notifications | **Send test notification** |
+| Updates, required | Automatic daily checks are on | **Turn on automatic checks**, or **Check now** after a failed check |
+| WebIQ, GitHub connector, Foundry / Auto mode, MSX and Azure consumption, optional | Connected or signed in | Opens the existing connection dialog, or MSX settings when MSX is off |
+| Runtime prerequisites, informational | Visual C++ runtime (Tomlook is running), the machine-wide Azure CLI used by Foundry and MSX, and the runtime configured in `connections.json` with its version when the executable has one | **Check again** |
+
+The header counts required steps and connected optional steps; **Next step**
+runs the first required step that needs action. While a required step is
+incomplete and none is still being checked, the status bar shows a small
+**Setup 2/5** indicator that opens the checklist. Right-click it and choose
+**Don't show**, or clear **Show setup progress in the status bar**, to hide it
+permanently. No step signs in, checks a connection or sends a request by
+itself; its button calls the same function as the status-bar dialog. Azure CLI,
+the configured Copilot runtime and saved sign-ins are looked up once on a
+background thread at startup and again after **Check again**, which also rereads
+the Windows notification setting. In the offline demo every step says it is not
+available and offers no action.
+
+Live AI needs a GitHub Copilot account, the installed Copilot CLI and an
+app-owned `connections.json` with its isolated stored login; see
+[Ask profiles, cache and durable research](#ask-profiles-cache-and-durable-research).
+Foundry / Auto mode and MSX use the
+[Azure CLI (MSI)](https://learn.microsoft.com/cli/azure/install-azure-cli-windows).
+WebIQ needs an API key and the GitHub connector a GitHub App
+([Czech guide](../docs/github-sign-in.cs.md)); see
+[WebIQ and GitHub sign-in](#webiq-and-github-sign-in).
+
 ## Privacy-safe showcase
 
 `Tomlook.exe --demo --state <new-empty-directory>` renders a curated, fictional
@@ -49,7 +99,7 @@ have loaded. It cannot be used in production or combined with measurements.
 Only the demo window content is captured, not other desktop windows or the
 Windows title bar. PNG encoding and exclusive-create file output run on the
 bounded storage worker. Existing images are never overwritten.
-`--demo-scene <details|feedback|prompts|tasks|followup|myday|notifications|weekly|invite|findtime|teams|customer>` chooses what that screenshot shows:
+`--demo-scene <details|feedback|prompts|tasks|followup|myday|notifications|weekly|invite|findtime|teams|customer|setup|welcome>` chooses what that screenshot shows:
 the default details pane, expanded Insights with a saved rating and an open
 reason panel, **Settings > AI prompts** after fictional sample feedback is
 saved into the isolated demo profile through the normal storage path, the
@@ -86,7 +136,10 @@ Northstar for that meeting), fictional MSX opportunities and milestones, a
 fictional Azure consumption chart and a fictional communication summary, all
 marked as sample data. Cedar is a confirmed local customer without MSX and Orbit
 stays an unconfirmed customer. The demo never reads MSX or Power BI and never
-asks AI.
+asks AI. `setup` opens **Settings > Setup** with the setup checklist; every step
+says it is not available in the offline demo and offers no action. `welcome`
+shows the first-run **Welcome** window over the calendar. Neither probes the
+computer for Azure CLI or a Copilot runtime.
 
 ## Native interaction measurement
 

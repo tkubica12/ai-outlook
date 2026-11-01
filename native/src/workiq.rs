@@ -17,6 +17,11 @@ pub mod connection;
 pub mod hosted;
 mod vault;
 
+/// Whether this profile saved a WorkIQ sign-in; read-only, nothing is decrypted.
+pub fn saved_sign_in_exists(root: &Path) -> bool {
+    vault::Vault::exists(root)
+}
+
 const TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Serialize)]

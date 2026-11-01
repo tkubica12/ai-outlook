@@ -23,6 +23,82 @@ impl ReviewRequest {
 
 pub const PENDING_LIMIT: usize = 64;
 pub const PROFILE: &str = "native-preparation-v1";
+/// A job whose day has no synchronized calendar data waits instead of being researched.
+pub const UNVERIFIED_COVERAGE: &str = "Calendar coverage is unverified; no automatic analysis";
+/// Preparation admission refuses research while the isolated Copilot runtime is not connected.
+pub const AI_NOT_CONNECTED: &str = "AI is not connected";
+/// Preparation admission refuses a calendar owned by an account other than the WorkIQ sign-in.
+pub const FOREIGN_CALENDAR: &str = "The connected WorkIQ account does not own this calendar. Refresh with the correct account before retrying.";
+
+/// Why automatic Insights cannot run; see [`Readiness::blocker`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Blocker {
+    Disabled,
+    Paused,
+    Ai,
+    Workiq,
+    ForeignCalendar,
+    Coverage,
+}
+
+impl Blocker {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Disabled => "Automatic Insights are turned off.",
+            Self::Paused => "Automatic Insights are paused.",
+            Self::Ai => AI_NOT_CONNECTED,
+            Self::Workiq => "WorkIQ is not connected.",
+            Self::ForeignCalendar => FOREIGN_CALENDAR,
+            Self::Coverage => UNVERIFIED_COVERAGE,
+        }
+    }
+}
+
+/// Conditions automatic preparation needs. The worker dispatches only when [`Self::automatic`]
+/// (or a manual job) and [`Self::connected`] hold; AI admission then rejects a calendar the
+/// WorkIQ account does not own and the queue defers unsynchronized days.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Readiness<'a> {
+    pub enabled: bool,
+    pub paused: bool,
+    /// The isolated Copilot runtime accepted its identity and published its analysis revision.
+    pub ai_ready: bool,
+    pub workiq_ready: bool,
+    /// The connected WorkIQ sign-in.
+    pub workiq_account: Option<&'a str>,
+    pub calendar_owner: Option<&'a str>,
+    /// Today's calendar day has synchronized data.
+    pub coverage_verified: bool,
+}
+
+impl Readiness<'_> {
+    pub fn automatic(&self) -> bool {
+        self.enabled && !self.paused
+    }
+
+    pub fn connected(&self) -> bool {
+        self.ai_ready && self.workiq_ready
+    }
+
+    /// The first unmet condition, in the order preparation checks them.
+    pub fn blocker(&self) -> Option<Blocker> {
+        if !self.enabled {
+            Some(Blocker::Disabled)
+        } else if self.paused {
+            Some(Blocker::Paused)
+        } else if !self.ai_ready {
+            Some(Blocker::Ai)
+        } else if !self.workiq_ready {
+            Some(Blocker::Workiq)
+        } else if !self.coverage_verified || self.calendar_owner.is_none() {
+            Some(Blocker::Coverage)
+        } else if self.workiq_account != self.calendar_owner {
+            Some(Blocker::ForeignCalendar)
+        } else {
+            None
+        }
+    }
+}
 const LEGACY_SHUTDOWN_FAILURE: &str = "Preparation stopped after a failed operation: AI is stopping; the previous result was discarded; Cancelled before the question was sent. Inspect saved evidence and explicitly retry.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,7 +445,7 @@ impl Queue {
             }
             if !verified && matches!(job.state, State::Queued | State::Deferred | State::Running) {
                 job.state = State::Deferred;
-                job.message = "Calendar coverage is unverified; no automatic analysis".into();
+                job.message = UNVERIFIED_COVERAGE.into();
             }
             if job.on_demand
                 && !job.manual

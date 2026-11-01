@@ -2,7 +2,7 @@
 fn settings_content_has_clear_padding_from_navigation_in_both_sections_and_themes() {
     for dark in [true, false] {
         for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
-            for section in [PreferencesSection::Display, PreferencesSection::Notifications, PreferencesSection::Prompts, PreferencesSection::Msx, PreferencesSection::Updates] {
+            for section in [PreferencesSection::Setup, PreferencesSection::Display, PreferencesSection::Notifications, PreferencesSection::Prompts, PreferencesSection::Msx, PreferencesSection::Updates] {
                 let mut app = Tomlook::initial(None, None, None);
                 app.preferences.dark = dark;
                 app.preferences.language = language;
@@ -27,6 +27,7 @@ fn settings_content_has_clear_padding_from_navigation_in_both_sections_and_theme
                     _ => None,
                 }).expect("Settings navigation must have a vertical divider");
                 let heading = language.text(match section {
+                    PreferencesSection::Setup => "Setup checklist",
                     PreferencesSection::Display => "Display",
                     PreferencesSection::Notifications => "Notifications",
                     PreferencesSection::Prompts => "AI prompts",
@@ -7185,5 +7186,273 @@ fn demo_customer_panel_shows_marked_sample_data_and_never_reads_msx_or_asks_ai()
         let text = settled(&context, &mut app, card);
         assert!(text.contains(&language.text("Unconfirmed customer: orbit.invalid").into_owned()), "{text}");
         assert!(!text.contains("example.invalid"), "Fictional colleagues are the demo user's own organization");
+    }
+}
+fn setup_probe(runtime: bool, saved: bool) -> Arc<tomlook::setup::Probe> {
+    Arc::new(tomlook::setup::Probe {
+        azure_cli: None,
+        copilot: if runtime {
+            Ok(tomlook::setup::Runtime { path: r"C:\Tools\copilot.exe".into(), version: Some("1.0.93".into()) })
+        } else {
+            Err("Read Tomlook connections.json: missing".into())
+        },
+        saved_connections: saved,
+    })
+}
+
+#[test]
+fn setup_checklist_is_bilingual_and_its_actions_reuse_the_existing_connection_flows() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, mut ai_commands, _) = task_fixture(language);
+        app.calendar_owner = None;
+        app.ai_ready = false;
+        app.connection = "Not connected".into();
+        app.setup.probe = Some(setup_probe(true, false));
+        app.open_setup_checklist();
+        let context = egui::Context::default();
+        let dialog: Show = &|app, ui| app.preferences_dialog(ui.ctx());
+        let text = settled(&context, &mut app, dialog);
+        assert!(text.lines().any(|line| line == language.text("Setup")), "Settings navigation offers Setup\n{text}");
+        assert!(text.contains(language.text("Setup checklist").as_ref()));
+        let show: Show = &|app, ui| app.setup_preferences(ui);
+        let text = settled(&context, &mut app, show);
+        for expected in ["Setup checklist", "Required steps", "Optional connections", "Prerequisites",
+            "Microsoft 365 calendar (WorkIQ)", "GitHub Copilot", "Identity match", "Windows notifications", "Updates",
+            "WebIQ", "GitHub connector", "Foundry / Auto mode", "MSX and Azure consumption", "Runtime prerequisites",
+            "0 of 5 required steps done · 0 optional connected", "Copilot CLI installation guide", "Check again",
+            "Show setup progress in the status bar", "Enter key", "Connect", "Open Foundry connection", "Open MSX connection",
+            "Automatic Insights require matching connected identities and verified calendar coverage.", "Details"] {
+            assert!(text.contains(language.text(expected).as_ref()), "{language:?}: missing {expected}\n{text}");
+        }
+        if language == tomlook::i18n::Language::Cs {
+            assert!(text.contains("Kontrolní seznam nastavení") && text.contains("Shoda účtů"));
+        }
+        click_text(&context, &mut app, show, language.text("Next step: Sign in").as_ref());
+        assert!(app.connection_panel == Some(ConnectionPanel::Workiq), "Sign in opens the WorkIQ dialog for the work e-mail");
+        assert!(ai_commands.try_recv().is_err(), "Opening a dialog never starts a sign-in");
+        app.connection_panel = None;
+        app.workiq_ready = true;
+        app.hosted_workiq_status = "Connected".into();
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains(language.text("Next step: Sign in").as_ref()), "Copilot is the next required step\n{text}");
+        click_text(&context, &mut app, show, language.text("Sign in").as_ref());
+        assert!(matches!(ai_commands.try_recv(), Ok(ai::Command::SignInAi)), "The same isolated sign-in as the AI dialog");
+        assert!(ai_commands.try_recv().is_err());
+        assert!(app.ai_login_busy && app.connection_panel == Some(ConnectionPanel::Ai));
+        app.connection_panel = None;
+        click_text(&context, &mut app, show, language.text("Enter key").as_ref());
+        assert!(app.connection_panel == Some(ConnectionPanel::External(tomlook::connectors::Kind::Webiq)));
+        click_text(&context, &mut app, show, language.text("Connect").as_ref());
+        assert!(app.connection_panel == Some(ConnectionPanel::External(tomlook::connectors::Kind::Github)));
+        assert!(ai_commands.try_recv().is_err(), "Optional connections only open their dialogs");
+        click_text(&context, &mut app, show, language.text("Show setup progress in the status bar").as_ref());
+        assert!(app.preferences.setup_hint_hidden);
+        assert!(matches!(receiver.try_recv(), Ok(Command::Preferences(preferences)) if preferences.setup_hint_hidden));
+        let mut seen = Vec::new();
+        drain_ai(&mut ai_commands, &mut seen);
+        assert!(seen.iter().all(|command| matches!(command, ai::Command::MsxSettings(_))), "No sign-in or check from a preference change");
+        click_text(&context, &mut app, show, language.text("Details").as_ref());
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains(language.text("Calendar sync").as_ref()) || text.contains(language.text("Status").as_ref()),
+            "Details show the honest current state\n{text}");
+    }
+}
+
+#[test]
+fn identity_match_uses_preparation_readiness_and_completed_steps_hide_their_actions() {
+    let (mut app, _, mut ai_commands, _) = task_fixture(tomlook::i18n::Language::En);
+    app.setup.probe = Some(setup_probe(true, true));
+    app.workiq_ready = true;
+    app.hosted_workiq_account = "someone@example.com".into();
+    let items = app.setup_items();
+    let identity = items.iter().find(|item| item.step == tomlook::setup::Step::Insights).unwrap();
+    assert!(identity.details.iter().any(|detail| detail.value == tomlook::scheduler::Blocker::Coverage.message()));
+    let today = Local::now().date_naive();
+    app.calendar = Arc::new(Calendar::build(Vec::new(), [today].into(), Vec::new()).unwrap());
+    let items = app.setup_items();
+    let identity = items.iter().find(|item| item.step == tomlook::setup::Step::Insights).unwrap();
+    assert_eq!(identity.action, Some(tomlook::setup::Action::OpenWorkiq));
+    assert!(identity.details.iter().any(|detail| detail.value == tomlook::scheduler::FOREIGN_CALENDAR));
+    app.hosted_workiq_account = "owner@example.com".into();
+    let items = app.setup_items();
+    let identity = items.iter().find(|item| item.step == tomlook::setup::Step::Insights).unwrap();
+    assert_eq!((identity.state, identity.action), (tomlook::setup::State::Done, None));
+    app.preferences.paused = true;
+    let items = app.setup_items();
+    let identity = items.iter().find(|item| item.step == tomlook::setup::Step::Insights).unwrap();
+    assert_eq!(identity.action, Some(tomlook::setup::Action::OpenInsights));
+    app.run_setup_action(tomlook::setup::Action::OpenInsights, &egui::Context::default());
+    assert!(app.settings, "Opens the existing Insights activity window");
+    assert!(ai_commands.try_recv().is_err());
+}
+
+#[test]
+fn demo_setup_checklist_and_welcome_explain_the_offline_demo_without_actions_or_probes() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, _, mut ai_commands) = assistant_fixture();
+        app.preview = true;
+        app.loading = false;
+        app.preferences.language = language;
+        app.setup.root = Some(std::path::PathBuf::from(r"C:\not-probed"));
+        app.open_setup_checklist();
+        let context = egui::Context::default();
+        let show: Show = &|app, ui| app.setup_preferences(ui);
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains(language.text(tomlook::setup::DEMO).as_ref()), "{text}");
+        assert!(text.contains(language.text("Offline demo: Tomlook never connects to Microsoft 365, GitHub Copilot or other services.").as_ref()));
+        for absent in ["Sign in", "Check again", "Send test notification", "Enter key", "Copilot CLI installation guide", "Show setup progress in the status bar"] {
+            assert!(!text.lines().any(|line| line == language.text(absent)), "{language:?}: the demo offers no {absent}\n{text}");
+        }
+        assert!(app.setup.probe.is_none() && app.setup.probing.is_none(), "The demo never probes the computer");
+        app.run_setup_action(tomlook::setup::Action::SignInCopilot, &context);
+        app.run_setup_action(tomlook::setup::Action::SignInWorkiq, &context);
+        assert!(app.connection_panel.is_none() && ai_commands.try_recv().is_err());
+        app.preferences_open = false;
+        app.setup.welcome = true;
+        let show: Show = &|app, ui| app.welcome_window(ui.ctx());
+        let text = settled(&context, &mut app, show);
+        for expected in ["Welcome to Tomlook", "Required steps", "Open setup checklist", "Later", tomlook::setup::DEMO] {
+            assert!(text.contains(language.text(expected).as_ref()), "{language:?}: missing {expected}\n{text}");
+        }
+        assert!(!text.lines().any(|line| line == language.text("Sign in")), "The demo welcome offers no sign-in\n{text}");
+        app.setup.eligible = true;
+        let show: Show = &|app, ui| {
+            ui.horizontal(|ui| app.setup_indicator(ui));
+        };
+        assert!(!settled(&context, &mut app, show).contains("0/5"), "The demo shows no setup indicator");
+        assert!(ai_commands.try_recv().is_err());
+    }
+}
+
+#[test]
+fn welcome_opens_once_for_a_new_profile_and_never_for_upgraded_or_diagnostic_profiles() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, mut ai_commands, _) = task_fixture(language);
+        app.calendar_owner = None;
+        app.ai_ready = false;
+        app.connection = "Not connected".into();
+        app.setup.eligible = true;
+        app.sync_setup();
+        assert!(!app.setup.welcome && !app.setup.decided, "Waits for the background probe");
+        app.setup.probe = Some(setup_probe(false, false));
+        app.sync_setup();
+        assert!(app.setup.welcome && app.preferences.welcome_shown);
+        assert!(matches!(receiver.try_recv(), Ok(Command::Preferences(preferences)) if preferences.welcome_shown));
+        let context = egui::Context::default();
+        let show: Show = &|app, ui| app.welcome_window(ui.ctx());
+        let text = settled(&context, &mut app, show);
+        for expected in ["Welcome", "Welcome to Tomlook", "Language", "Theme", "Dark", "Required steps",
+            "Microsoft 365 calendar (WorkIQ)", "GitHub Copilot", "Identity match", "Windows notifications", "Updates",
+            "Install Copilot CLI", "Open setup checklist", "Later",
+            "The checklist stays in Settings > Setup and in Commands (Ctrl+Shift+P)."] {
+            assert!(text.contains(language.text(expected).as_ref()), "{language:?}: missing {expected}\n{text}");
+        }
+        assert!(!text.contains(language.text("WebIQ").as_ref()), "Only required steps are listed");
+        click_text(&context, &mut app, show, if language == tomlook::i18n::Language::En { "Čeština" } else { "English" });
+        let language = language.other();
+        assert_eq!(app.preferences.language, language);
+        assert!(matches!(receiver.try_recv(), Ok(Command::Preferences(preferences)) if preferences.language == language));
+        click_text(&context, &mut app, show, language.text("Later").as_ref());
+        assert!(!app.setup.welcome);
+        app.sync_setup();
+        assert!(!app.setup.welcome, "The welcome opens only once");
+        app.setup.welcome = true;
+        click_text(&context, &mut app, show, language.text("Open setup checklist").as_ref());
+        assert!(!app.setup.welcome && app.preferences_open && app.preferences_section == PreferencesSection::Setup);
+        app.setup.welcome = true;
+        click_text(&context, &mut app, show, language.text("Sign in").as_ref());
+        assert!(!app.setup.welcome && app.connection_panel == Some(ConnectionPanel::Workiq));
+        app.setup.welcome = true;
+        let escape = egui::RawInput { events: vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }], ..Default::default() };
+        app.connection_panel = None;
+        app.preferences_open = false;
+        let mut output = context.run_ui(escape, |ui| app.shortcuts(ui.ctx()));
+        output.textures_delta.clear();
+        assert!(!app.setup.welcome, "Escape closes the welcome");
+        let mut seen = Vec::new();
+        drain_ai(&mut ai_commands, &mut seen);
+        assert!(seen.iter().all(|command| matches!(command, ai::Command::MsxSettings(_))), "The welcome never signs in by itself");
+    }
+    let (mut upgraded, receiver, _, _) = task_fixture(tomlook::i18n::Language::En);
+    upgraded.setup.eligible = true;
+    upgraded.setup.probe = Some(setup_probe(false, false));
+    upgraded.sync_setup();
+    assert!(!upgraded.setup.welcome && upgraded.preferences.welcome_shown, "A profile with a synced calendar is an upgrade");
+    assert!(matches!(receiver.try_recv(), Ok(Command::Preferences(preferences)) if preferences.welcome_shown));
+    let (mut saved, receiver, _, _) = task_fixture(tomlook::i18n::Language::En);
+    saved.calendar_owner = None;
+    saved.setup.eligible = true;
+    saved.setup.probe = Some(setup_probe(true, true));
+    saved.sync_setup();
+    assert!(!saved.setup.welcome && saved.preferences.welcome_shown);
+    assert!(receiver.try_recv().is_ok());
+    let (mut diagnostic, receiver, _, _) = task_fixture(tomlook::i18n::Language::En);
+    diagnostic.calendar_owner = None;
+    diagnostic.setup.probe = Some(setup_probe(false, false));
+    diagnostic.sync_setup();
+    assert!(!diagnostic.setup.welcome && !diagnostic.preferences.welcome_shown && receiver.try_recv().is_err(),
+        "Demo, stress, measurement and acceptance runs never welcome or save");
+    let (mut shown, receiver, _, _) = task_fixture(tomlook::i18n::Language::En);
+    shown.calendar_owner = None;
+    shown.preferences.welcome_shown = true;
+    shown.setup.eligible = true;
+    shown.setup.probe = Some(setup_probe(false, false));
+    shown.sync_setup();
+    assert!(!shown.setup.welcome && receiver.try_recv().is_err());
+}
+
+#[test]
+fn setup_indicator_shows_progress_opens_the_checklist_and_dont_show_persists() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, mut ai_commands, _) = task_fixture(language);
+        app.setup.eligible = true;
+        app.setup.probe = Some(setup_probe(true, true));
+        app.ai_ready = false;
+        app.connection = "Not connected".into();
+        let context = egui::Context::default();
+        let show: Show = &|app, ui| {
+            ui.horizontal(|ui| app.setup_indicator(ui));
+        };
+        let badge = language.text("Setup 0/5").into_owned();
+        assert!(settled(&context, &mut app, show).contains(&badge));
+        click_text(&context, &mut app, show, &badge);
+        assert!(app.preferences_open && app.preferences_section == PreferencesSection::Setup);
+        app.hosted_workiq_busy = true;
+        assert!(!settled(&context, &mut app, show).contains(&badge), "No indicator while a required step is still being checked");
+        app.hosted_workiq_busy = false;
+        let output = draw_with(&context, &mut app, vec![], show);
+        let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.job.text == badge => Some(text.pos + text.galley.size() * 0.5),
+            _ => None,
+        }).unwrap();
+        for pressed in [true, false] {
+            draw_with(&context, &mut app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Secondary, pressed, modifiers: Modifiers::NONE,
+            }], show);
+        }
+        click_text(&context, &mut app, show, language.text("Don't show").as_ref());
+        assert!(app.preferences.setup_hint_hidden);
+        assert!(matches!(receiver.try_recv(), Ok(Command::Preferences(preferences)) if preferences.setup_hint_hidden));
+        assert!(!settled(&context, &mut app, show).contains(&badge), "Dismissal persists");
+        app.preferences.setup_hint_hidden = false;
+        app.setup.eligible = false;
+        assert!(!settled(&context, &mut app, show).contains(&badge), "Diagnostic runs show no indicator");
+        let mut seen = Vec::new();
+        drain_ai(&mut ai_commands, &mut seen);
+        assert!(seen.iter().all(|command| matches!(command, ai::Command::MsxSettings(_))));
+    }
+}
+
+#[test]
+fn setup_checklist_opens_from_the_command_palette_in_both_languages() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let matches = command_matches_in(if language == tomlook::i18n::Language::Cs { "kontrolní seznam" } else { "setup" }, language);
+        assert_eq!(matches.first(), Some(&PaletteCommand::Setup));
+        let (mut app, _, mut ai_commands, _) = task_fixture(language);
+        let context = egui::Context::default();
+        app.open_palette();
+        app.run_palette_command(PaletteCommand::Setup, &context);
+        assert!(app.preferences_open && app.preferences_section == PreferencesSection::Setup && !app.palette);
+        assert!(ai_commands.try_recv().is_err());
     }
 }

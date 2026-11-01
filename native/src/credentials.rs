@@ -86,3 +86,20 @@ pub(crate) fn protect(data: &[u8], binding: &str, encrypt: bool) -> Result<Vec<u
 pub(crate) fn protect(_: &[u8], _: &str, _: bool) -> Result<Vec<u8>, String> {
     Err("Saved sign-ins require Windows DPAPI".into())
 }
+
+/// Whether a credential database holds a saved record. It is opened read-only, so a missing
+/// database is not created and nothing is decrypted.
+pub(crate) fn has_records(path: &std::path::Path, table: &str) -> bool {
+    use rusqlite::OpenFlags;
+    rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .and_then(|db| {
+        db.busy_timeout(std::time::Duration::from_millis(200))?;
+        db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table})"), [], |row| {
+            row.get::<_, bool>(0)
+        })
+    })
+    .unwrap_or(false)
+}

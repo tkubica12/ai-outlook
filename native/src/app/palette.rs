@@ -13,6 +13,7 @@ pub(super) enum PaletteCommand {
     AddTask,
     FindTime,
     Prepare,
+    Setup,
     Settings,
     Theme,
     Refresh,
@@ -36,6 +37,7 @@ impl PaletteCommand {
             Self::AddTask => "Add task",
             Self::FindTime => "Find a time",
             Self::Prepare => "Research selected meeting now",
+            Self::Setup => "Setup checklist",
             Self::Settings => "Insights activity",
             Self::Theme => "Toggle dark / light",
             Self::Refresh => "Refresh calendar",
@@ -66,6 +68,7 @@ pub(super) fn command_matches_in(query: &str, language: tomlook::i18n::Language)
         PaletteCommand::AddTask,
         PaletteCommand::FindTime,
         PaletteCommand::Prepare,
+        PaletteCommand::Setup,
         PaletteCommand::Settings,
         PaletteCommand::Theme,
         PaletteCommand::Refresh,
@@ -124,6 +127,7 @@ impl Tomlook {
                     self.error = Some("Select a meeting first.".into());
                 }
             }
+            PaletteCommand::Setup => self.open_setup_checklist(),
             PaletteCommand::Settings => self.settings = true,
             PaletteCommand::Theme => {
                 self.preferences.dark = !self.preferences.dark;

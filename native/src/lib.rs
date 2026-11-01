@@ -37,6 +37,7 @@ pub mod retry;
 pub mod scheduler;
 pub mod scheduling;
 mod search;
+pub mod setup;
 pub mod showcase;
 pub mod source_index;
 pub mod storage;

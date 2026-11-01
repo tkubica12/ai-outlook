@@ -37,9 +37,9 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The latest native Windows release is **[v0.15.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.15.0)**.
-Read the [release notes](docs/releases/v0.15.0.md) for changes since v0.14.0.
-Download **[Tomlook-v0.15.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.15.0/Tomlook-v0.15.0-win-x64.zip)**
+The latest native Windows release is **[v0.16.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.16.0)**.
+Read the [release notes](docs/releases/v0.16.0.md) for changes since v0.15.0.
+Download **[Tomlook-v0.16.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.16.0/Tomlook-v0.16.0-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable and unsigned.
 From v0.8.0, Tomlook checks GitHub Releases once a day and installs
@@ -56,6 +56,9 @@ live Microsoft 365 data requires access to the supported WorkIQ MCP services
 and your organization's consent. WorkIQ/WebIQ availability and tenant policies
 are not provided by this repository. The offline demo works without these
 connections. See [native setup](native/README.md) for sign-in and configuration.
+New users start from the **Welcome** window and **Settings > Setup**, a
+[setup checklist](native/README.md#first-run-and-setup-checklist) that shows
+what is connected, what is missing and what to do next.
 
 The [goal contracts](docs/goals/README.md) govern the authorized native Rust
 migration, isolated official Rust Copilot SDK, future-first tray preparation,

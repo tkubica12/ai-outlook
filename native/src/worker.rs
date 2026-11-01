@@ -1367,7 +1367,8 @@ impl Worker {
                             })) {
                         let _ = sdk.commands.try_send(ai::Command::Cancel(*id | (1 << 63)));
                     }
-                    let automatic = preferences.prepare_enabled && !preferences.paused;
+                    let readiness = crate::scheduler::Readiness { enabled: preferences.prepare_enabled, paused: preferences.paused, ..Default::default() };
+                    let automatic = readiness.automatic();
                     let sync_window = crate::calendar_sync::Window::new(now.date_naive())?;
                     let sync_ready = !exiting && options.demo.is_none()
                         && sdk.as_ref().is_some_and(|sdk| sdk.workiq_ready.load(Ordering::Acquire) && !sdk.terminated.load(Ordering::Acquire));
@@ -1404,7 +1405,10 @@ impl Worker {
                     let dispatch_ready = !exiting && options.demo.is_none() && failure.is_none()
                         && std::time::Instant::now() >= retry_after
                         && queue.budget_exhausted_day != Some(now.date_naive())
-                        && queue.can_dispatch_for(automatic) && sdk.as_ref().is_some_and(|sdk| sdk.ready.load(Ordering::Acquire) && sdk.workiq_ready.load(Ordering::Acquire) && sdk.analysis_revision.get().is_some() && !sdk.terminated.load(Ordering::Acquire) && sdk.occupied.load(Ordering::Acquire) < 2);
+                        && queue.can_dispatch_for(automatic) && sdk.as_ref().is_some_and(|sdk| crate::scheduler::Readiness {
+                            ai_ready: sdk.ready.load(Ordering::Acquire) && sdk.analysis_revision.get().is_some(),
+                            workiq_ready: sdk.workiq_ready.load(Ordering::Acquire), ..readiness
+                        }.connected() && !sdk.terminated.load(Ordering::Acquire) && sdk.occupied.load(Ordering::Acquire) < 2);
                     let cancelled = if dirty || std::time::Instant::now() >= deadline || !results.is_empty() || exiting || dispatch_ready {
                         let inputs_changed = dirty;
                         dirty = false;

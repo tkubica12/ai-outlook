@@ -103,6 +103,15 @@ impl Tomlook {
         }
     }
 
+    /// The AI dialog's isolated browser sign-in; the setup checklist calls the same flow.
+    pub(super) fn sign_in_ai(&mut self) {
+        if !self.ai_login_busy && !self.ai_ready && self.ai_command(ai::Command::SignInAi) {
+            self.ai_login_busy = true;
+            self.ai_login_status = None;
+            self.connection = "AI browser sign-in queued...".into();
+        }
+    }
+
     fn msx_pending(&mut self, phase: tomlook::msx::Phase, message: &str) {
         self.msx_status.phase = phase;
         self.msx_status.message = message.into();
@@ -251,13 +260,8 @@ impl Tomlook {
                     if ui.button(language.text("Cancel AI sign-in")).clicked() {
                         self.ai_command(ai::Command::CancelAiLogin);
                     }
-                } else if !self.ai_ready
-                    && ui.button(language.text("Sign in")).clicked()
-                    && self.ai_command(ai::Command::SignInAi)
-                {
-                    self.ai_login_busy = true;
-                    self.ai_login_status = None;
-                    self.connection = "AI browser sign-in queued...".into();
+                } else if !self.ai_ready && ui.button(language.text("Sign in")).clicked() {
+                    self.sign_in_ai();
                 }
                 ui.add_space(10.0);
                 ui.separator();

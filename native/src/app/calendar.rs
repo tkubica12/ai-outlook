@@ -96,6 +96,8 @@ impl Tomlook {
                 context.request_repaint();
             } else if self.palette {
                 self.close_palette(context);
+            } else if self.setup.welcome {
+                self.setup.welcome = false;
             } else if self.tasks_open {
                 self.tasks_open = false;
             } else if self.weekly.open {
@@ -142,6 +144,7 @@ impl Tomlook {
             context.memory(|memory| memory.focused() == Some(Id::new("calendar-search")));
         if (editing && !search_focused)
             || self.palette
+            || self.setup.welcome
             || self.settings
             || self.messages_open
             || self.tasks_open

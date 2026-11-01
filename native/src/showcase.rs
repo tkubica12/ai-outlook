@@ -34,6 +34,10 @@ pub enum Scene {
     /// The customer panel of the fictional customer Northstar with sample MSX data, Azure
     /// consumption and a sample communication summary, next to the workshop's details.
     Customer,
+    /// Settings > Setup: the setup checklist with offline-demo explanations and no actions.
+    Setup,
+    /// The first-run welcome window over the calendar.
+    Welcome,
 }
 
 impl Scene {
@@ -51,13 +55,15 @@ impl Scene {
             "findtime" => Ok(Self::FindTime),
             "teams" => Ok(Self::Teams),
             "customer" => Ok(Self::Customer),
-            _ => Err("--demo-scene must be details, feedback, prompts, tasks, followup, myday, notifications, weekly, invite, findtime, teams or customer".into()),
+            "setup" => Ok(Self::Setup),
+            "welcome" => Ok(Self::Welcome),
+            _ => Err("--demo-scene must be details, feedback, prompts, tasks, followup, myday, notifications, weekly, invite, findtime, teams, customer, setup or welcome".into()),
         }
     }
 
     /// Whether the scene first selects [`Scene::meeting`] and waits for its saved document.
     pub fn selects_meeting(self) -> bool {
-        !matches!(self, Self::MyDay | Self::Notifications | Self::Weekly | Self::Invite | Self::FindTime | Self::Teams)
+        !matches!(self, Self::MyDay | Self::Notifications | Self::Weekly | Self::Invite | Self::FindTime | Self::Teams | Self::Setup | Self::Welcome)
     }
 
     /// The sample meeting whose details the scene shows.
@@ -1563,7 +1569,7 @@ mod tests {
         for (value, scene) in [("details", Scene::Details), ("feedback", Scene::Feedback), ("prompts", Scene::Prompts),
             ("tasks", Scene::Tasks), ("followup", Scene::FollowUp), ("myday", Scene::MyDay),
             ("notifications", Scene::Notifications), ("weekly", Scene::Weekly), ("invite", Scene::Invite),
-            ("findtime", Scene::FindTime), ("teams", Scene::Teams)] {
+            ("findtime", Scene::FindTime), ("teams", Scene::Teams), ("setup", Scene::Setup), ("welcome", Scene::Welcome)] {
             assert_eq!(Scene::parse(value).unwrap(), scene);
         }
         assert!(Scene::parse("settings").is_err());
@@ -1571,6 +1577,7 @@ mod tests {
         assert!(Scene::Details.selects_meeting() && !Scene::MyDay.selects_meeting() && !Scene::Notifications.selects_meeting());
         assert!(!Scene::Weekly.selects_meeting() && !Scene::Invite.selects_meeting());
         assert!(!Scene::FindTime.selects_meeting() && !Scene::Teams.selects_meeting());
+        assert!(!Scene::Setup.selects_meeting() && !Scene::Welcome.selects_meeting());
     }
 
     #[test]

@@ -1897,13 +1897,13 @@ impl Engine {
                                 Some(Command::Prepare(request)) => {
                                     let id = request.id | (1 << 63);
                                     let denied = if stopping { Some("AI is stopping; nothing was submitted") }
-                                        else if demo || harness.is_none() { Some("AI is not connected") }
+                                        else if demo || harness.is_none() { Some(crate::scheduler::AI_NOT_CONNECTED) }
                                         else if request.connector_revision.as_ref().is_some_and(|revision| revision != &connectors.context_revision()) { Some("Connections changed before research admission") }
                                         else if workiq.as_ref().is_none_or(|connection| !connection.is_active()) { Some("Connect WorkIQ before preparing this meeting") }
                                         else if cancellations.len() >= 2 || (!request.foreground && cancellations.values().any(|(_, background)| *background)) { Some("Execution capacity is reserved or busy") }
                                         else if cancellations.contains_key(&id) { Some("Preparation identity is already active") } else { None };
                                     if workiq.as_ref().is_some_and(|connection| request.account.as_deref() != Some(connection.account.as_str())) {
-                                        if let Err(error) = deliver_prepared(&request.reply, Prepared { id: request.id, result: PreparationResult::Finished(Err("The connected WorkIQ account does not own this calendar. Refresh with the correct account before retrying.".into())) }).await {
+                                        if let Err(error) = deliver_prepared(&request.reply, Prepared { id: request.id, result: PreparationResult::Finished(Err(crate::scheduler::FOREIGN_CALENDAR.into())) }).await {
                                             notify(Notice::Connection { ready: false, message: error }); stopping = true;
                                         }
                                         let _ = request.wake.try_send(crate::worker::Command::Wake);

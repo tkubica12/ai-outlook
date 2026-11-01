@@ -82,6 +82,11 @@ pub struct Preferences {
     /// Meeting preparation of confirmed customer meetings adds a bounded customer context
     /// (MSX, Azure consumption and cached communication) read at preparation time.
     pub customer_context: bool,
+    /// The first-run welcome was shown, or the profile already had saved connections when
+    /// this preference was introduced; the welcome never opens again.
+    pub welcome_shown: bool,
+    /// The user chose not to show setup progress in the status bar.
+    pub setup_hint_hidden: bool,
 }
 
 impl Default for Preferences {
@@ -116,6 +121,8 @@ impl Default for Preferences {
             msx_enabled: true,
             msx_tenant: crate::msx::DEFAULT_TENANT.into(),
             customer_context: true,
+            welcome_shown: false,
+            setup_hint_hidden: false,
         }
     }
 }

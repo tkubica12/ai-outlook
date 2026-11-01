@@ -65,6 +65,7 @@ pub(super) fn activity_row(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum PreferencesSection {
+    Setup,
     Display,
     Notifications,
     Prompts,
@@ -90,6 +91,7 @@ impl Tomlook {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 8.0;
                         for (section, label) in [
+                            (PreferencesSection::Setup, "Setup"),
                             (PreferencesSection::Display, "Display"),
                             (PreferencesSection::Notifications, "Notifications"),
                             (PreferencesSection::Prompts, "AI prompts"),
@@ -114,25 +116,15 @@ impl Tomlook {
                     egui::ScrollArea::vertical().id_salt(("preferences-content", self.preferences_section))
                         .auto_shrink([false, false]).show(ui, |ui| {
                         match self.preferences_section {
+                            PreferencesSection::Setup => self.setup_preferences(ui),
                             PreferencesSection::Display => {
                                 ui.heading(language.text("Display"));
                                 ui.add_space(16.0);
                                 ui.strong(language.text("Language"));
-                                ui.horizontal(|ui| {
-                                    for (value, label) in [
-                                        (tomlook::i18n::Language::En, "English"),
-                                        (tomlook::i18n::Language::Cs, "Čeština"),
-                                    ] {
-                                        if ui.selectable_value(&mut self.preferences.language, value, label).changed() {
-                                            self.save_preferences();
-                                        }
-                                    }
-                                });
+                                self.language_choice(ui);
                                 ui.add_space(20.0);
                                 ui.strong(language.text("Theme"));
-                                if ui.checkbox(&mut self.preferences.dark, language.text("Dark")).changed() {
-                                    self.save_preferences();
-                                }
+                                self.theme_choice(ui);
                                 ui.add_space(20.0);
                                 ui.strong(language.text("Accent"));
                                 ui.horizontal_wrapped(|ui| {
@@ -182,6 +174,28 @@ impl Tomlook {
                 });
             });
         self.preferences_open = open;
+    }
+
+    /// Language buttons of Settings > Display, also offered by the first-run welcome.
+    pub(super) fn language_choice(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (value, label) in [
+                (tomlook::i18n::Language::En, "English"),
+                (tomlook::i18n::Language::Cs, "Čeština"),
+            ] {
+                if ui.selectable_value(&mut self.preferences.language, value, label).changed() {
+                    self.save_preferences();
+                }
+            }
+        });
+    }
+
+    /// The light/dark choice of Settings > Display, also offered by the first-run welcome.
+    pub(super) fn theme_choice(&mut self, ui: &mut egui::Ui) {
+        let language = self.preferences.language;
+        if ui.checkbox(&mut self.preferences.dark, language.text("Dark")).changed() {
+            self.save_preferences();
+        }
     }
 
     fn msx_preferences(&mut self, ui: &mut egui::Ui) {
@@ -603,6 +617,7 @@ impl Tomlook {
     pub(super) fn overlays(&mut self, context: &egui::Context) {
         let language = self.preferences.language;
         self.preferences_dialog(context);
+        self.welcome_window(context);
         self.meeting_action_dialog(context);
         self.event_creation_dialog(context);
         self.find_time_dialog(context);

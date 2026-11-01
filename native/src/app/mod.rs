@@ -26,6 +26,7 @@ mod myday;
 mod palette;
 mod recommendations;
 mod settings;
+mod setup;
 mod tasks;
 mod weekly;
 
@@ -283,6 +284,7 @@ pub struct Tomlook {
     reminders: Option<tomlook::reminders::Reminders>,
     reminder_status: tomlook::reminders::Status,
     reminder_open: Option<mpsc::Receiver<tomlook::reminders::Activation>>,
+    setup: setup::SetupUi,
 }
 
 impl Tomlook {
@@ -300,6 +302,7 @@ impl Tomlook {
             || interaction_trace.is_some()
             || env!("CARGO_BIN_NAME") != "tomlook";
         let reminder_state = options.state.clone();
+        let setup_root = options.state.clone();
         let update_disabled = if preview {
             Some("Updates are disabled in the offline demo.")
         } else if measurement {
@@ -382,6 +385,12 @@ impl Tomlook {
         };
         let mut app = Self::initial(worker, ai, error);
         app.preview = preview;
+        app.setup.root = Some(setup_root);
+        // Only a normal launch of a real profile is welcomed or probed at startup.
+        app.setup.eligible = !preview && !measurement;
+        if app.setup.eligible {
+            app.start_setup_probe(&creation.egui_ctx);
+        }
         if let Some((path, scene)) = demo_screenshot {
             app.demo_screenshot = Some(path);
             app.demo_scene = scene;
@@ -589,6 +598,7 @@ impl Tomlook {
                 ..Default::default()
             },
             reminder_open: None,
+            setup: Default::default(),
         }
     }
 
@@ -1293,6 +1303,7 @@ impl eframe::App for Tomlook {
         self.receive();
         self.receive_update();
         self.receive_reminders();
+        self.sync_setup();
         self.sync_myday();
         self.sync_weekly();
         self.sync_proposal_confirmation();
@@ -1520,6 +1531,7 @@ impl eframe::App for Tomlook {
                     self.preferences_open = true;
                     self.preferences_section = PreferencesSection::Updates;
                 }
+                self.setup_indicator(ui);
                 }
                 ui.weak(language.text(&(format!("{} cached meetings", self.calendar.events.len())))).on_hover_text(
                     language.text(&(self.calendar_owner.as_deref().map(|owner| format!("Locally saved calendar owned by {owner}; retained when disconnected.")).unwrap_or_else(|| "Local calendar cache; no connected account assigned.".into())))

@@ -19,6 +19,11 @@ impl Vault {
         }
     }
 
+    /// Whether any WorkIQ sign-in is saved in this profile; read-only, nothing is decrypted.
+    pub fn exists(root: &Path) -> bool {
+        crate::credentials::has_records(&root.join("workiq-login.db"), "login")
+    }
+
     fn database(&self) -> Result<rusqlite::Connection, String> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)

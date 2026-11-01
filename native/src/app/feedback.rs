@@ -741,6 +741,14 @@ impl Tomlook {
                 self.preferences_section = PreferencesSection::Notifications;
                 self.demo_frames > 8
             }
+            Scene::Setup => {
+                self.open_setup_checklist();
+                self.demo_frames > 8
+            }
+            Scene::Welcome => {
+                self.setup.welcome = true;
+                self.demo_frames > 8
+            }
             Scene::Weekly => {
                 if !self.weekly.open {
                     self.open_weekly(None);

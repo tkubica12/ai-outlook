@@ -305,6 +305,10 @@ impl Vault {
 fn binding(kind: Kind) -> String {
     format!("Tomlook connector v1:{}:{}", kind.server(), kind.endpoint())
 }
+/// Whether this profile saved a WebIQ or GitHub sign-in; read-only, nothing is decrypted.
+pub fn saved_sign_in_exists(root: &Path) -> bool {
+    crate::credentials::has_records(&root.join("connector-login.db"), "credentials")
+}
 fn database(path: &Path) -> Result<rusqlite::Connection, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
