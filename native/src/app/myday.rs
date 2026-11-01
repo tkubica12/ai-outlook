@@ -38,7 +38,7 @@ fn span(start: chrono::DateTime<chrono::FixedOffset>, end: chrono::DateTime<chro
     format!("{}–{}", model::clock(start), model::clock(end))
 }
 
-fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
+pub(super) fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
     egui::Frame::new()
         .stroke(Stroke::new(1.0, color.gamma_multiply(0.7)))
         .corner_radius(4)

@@ -37,9 +37,9 @@ and disk writes run on the storage worker rather than the UI thread.
 
 ## Project status
 
-The latest native Windows release is **[v0.14.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.14.0)**.
-Read the [release notes](docs/releases/v0.14.0.md) for changes since v0.13.0.
-Download **[Tomlook-v0.14.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.14.0/Tomlook-v0.14.0-win-x64.zip)**
+The latest native Windows release is **[v0.15.0](https://github.com/tkubica12/ai-outlook/releases/tag/v0.15.0)**.
+Read the [release notes](docs/releases/v0.15.0.md) for changes since v0.14.0.
+Download **[Tomlook-v0.15.0-win-x64.zip](https://github.com/tkubica12/ai-outlook/releases/download/v0.15.0/Tomlook-v0.15.0-win-x64.zip)**
 for Windows x64, extract it, and run **Tomlook.exe**. The archive includes the
 application and third-party/font license notices. It is portable and unsigned.
 From v0.8.0, Tomlook checks GitHub Releases once a day and installs
@@ -81,6 +81,12 @@ status bar, with Windows-user encrypted storage and quiet saved-login checks.
 See [native setup](native/README.md#webiq-and-github-sign-in) for the dedicated
 GitHub App registration and read-only repository permissions; never paste keys
 or client secrets into chat or the repository.
+An optional read-only [MSX and Azure consumption](native/README.md#msx-and-azure-consumption)
+connection uses your Azure CLI sign-in with memory-only tokens.
+The [customer panel](native/README.md#customer-context) brings a confirmed customer's
+meetings, notes, local tasks, MSX opportunities and milestones, monthly Azure consumption and
+an on-demand summary of recent mail and Teams communication together; external meeting
+domains become customers only after you confirm them.
 
 The current runnable product is **`release\Tomlook.exe`**. It is the only
 product in that directory; build caches and measurement executables are not

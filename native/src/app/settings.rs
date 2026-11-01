@@ -68,6 +68,7 @@ pub(super) enum PreferencesSection {
     Display,
     Notifications,
     Prompts,
+    Msx,
     Updates,
 }
 
@@ -92,6 +93,7 @@ impl Tomlook {
                             (PreferencesSection::Display, "Display"),
                             (PreferencesSection::Notifications, "Notifications"),
                             (PreferencesSection::Prompts, "AI prompts"),
+                            (PreferencesSection::Msx, "MSX"),
                             (PreferencesSection::Updates, "Updates"),
                         ] {
                             if ui.add_sized([ui.available_width(), 36.0],
@@ -173,12 +175,76 @@ impl Tomlook {
                                 self.prompt_feedback(ui);
                             }
                             PreferencesSection::Notifications => self.notification_preferences(ui),
+                            PreferencesSection::Msx => self.msx_preferences(ui),
                             PreferencesSection::Updates => self.update_preferences(ui),
                         }
                     });
                 });
             });
         self.preferences_open = open;
+    }
+
+    fn msx_preferences(&mut self, ui: &mut egui::Ui) {
+        let language = self.preferences.language;
+        ui.heading(language.text("MSX and Azure consumption"));
+        ui.weak(language.text("Read-only customer context from MSX (Dataverse) and Azure consumption (Power BI)."));
+        ui.add_space(16.0);
+        if ui
+            .checkbox(&mut self.preferences.msx_enabled, language.text("Use MSX and Azure consumption"))
+            .changed()
+        {
+            self.save_preferences();
+        }
+        ui.weak(language.text("Tomlook stays idle until you sign in or Azure CLI already has a token. It never opens a sign-in prompt on its own."));
+        ui.add_space(20.0);
+        ui.strong(language.text("Microsoft tenant ID"));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.msx_tenant_editor)
+                .id(Id::new("msx-tenant"))
+                .char_limit(36)
+                .desired_width(340.0),
+        );
+        let tenant = self.msx_tenant_editor.trim().to_ascii_lowercase();
+        let valid = tomlook::msx::validate_tenant(&tenant);
+        if let Err(error) = &valid {
+            ui.colored_label(ui.visuals().error_fg_color, language.text(error));
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    valid.is_ok() && tenant != self.preferences.msx_tenant,
+                    egui::Button::new(language.text("Save tenant")),
+                )
+                .clicked()
+            {
+                self.preferences.msx_tenant = tenant.clone();
+                self.msx_tenant_editor = tenant.clone();
+                self.save_preferences();
+            }
+            if ui.button(language.text("Restore default")).clicked() {
+                self.msx_tenant_editor = tomlook::msx::DEFAULT_TENANT.into();
+            }
+        });
+        ui.add_space(20.0);
+        if ui
+            .add_enabled(self.preferences.msx_enabled, egui::Button::new(language.text("Open MSX connection")))
+            .clicked()
+        {
+            self.connection_panel = Some(ConnectionPanel::Msx);
+        }
+        ui.add_space(20.0);
+        ui.strong(language.text("Customers"));
+        if ui
+            .checkbox(&mut self.preferences.customer_context, language.text("Add customer context to meeting preparation"))
+            .changed()
+        {
+            self.save_preferences();
+        }
+        ui.weak(language.text("For confirmed customer meetings, preparation adds the customer, open opportunities and next milestones, the Azure consumption trend (when MSX is connected) and the last communication summary. It is read when a meeting is prepared and never prepares existing Insights again by itself."));
+        if ui.button(language.text("Open customers")).clicked() {
+            self.preferences_open = false;
+            self.open_customers(None, None);
+        }
     }
 
     fn notification_preferences(&mut self, ui: &mut egui::Ui) {
@@ -545,6 +611,7 @@ impl Tomlook {
         self.tasks_window(context);
         self.myday_window(context);
         self.weekly_window(context);
+        self.customers_window(context);
         if self.messages_open {
             let calendar = self.calendar.clone();
             let mut open = true;

@@ -99,7 +99,7 @@ fn parse_options(
                     &args
                         .next()
                         .and_then(|value| value.into_string().ok())
-                        .ok_or("--demo-scene needs details, feedback, prompts, tasks, followup, myday, notifications, weekly, invite, findtime or teams")?,
+                        .ok_or("--demo-scene needs details, feedback, prompts, tasks, followup, myday, notifications, weekly, invite, findtime, teams or customer")?,
                 )?);
             }
             Some("--fixture-cache") => fixture_cache = true,
@@ -671,6 +671,9 @@ mod tests {
         let mut scene = arguments();
         scene.extend(["--demo-scene".into(), "prompts".into()]);
         assert_eq!(parse(scene).unwrap().scene, tomlook::showcase::Scene::Prompts);
+        let mut customer = arguments();
+        customer.extend(["--demo-scene".into(), "customer".into()]);
+        assert_eq!(parse(customer).unwrap().scene, tomlook::showcase::Scene::Customer);
         let mut unknown = arguments();
         unknown.extend(["--demo-scene".into(), "anything".into()]);
         assert!(parse(unknown).is_err());

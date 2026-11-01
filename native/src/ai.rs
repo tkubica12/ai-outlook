@@ -59,6 +59,9 @@ struct Sources {
     connectors: Option<Arc<crate::connectors::Registry>>,
     telemetry: Option<Arc<crate::telemetry::Service>>,
     prompts: Arc<crate::prompts::Prompts>,
+    msx: Option<Arc<crate::msx::Client>>,
+    /// Confirmed customers of a meeting being prepared.
+    customer: Option<Box<crate::customers::PreparationInput>>,
 }
 
 pub enum Command {
@@ -88,6 +91,17 @@ pub enum Command {
     CheckAuto,
     SignInAuto,
     CancelAutoLogin,
+    /// MSX preferences. Enabling starts one quiet, non-interactive token check.
+    MsxSettings(crate::msx::Settings),
+    /// Explicit connection check; still never interactive.
+    CheckMsx,
+    /// Explicit user sign-in: browser/WAM, or a device code.
+    SignInMsx {
+        device_code: bool,
+    },
+    CancelMsx,
+    /// Forgets in-memory MSX tokens; the Azure CLI sign-in is unchanged.
+    DisconnectMsx,
     ProbeWorkiq,
     ConnectWorkiq(String),
     RestoreWorkiq(String),
@@ -156,6 +170,21 @@ pub enum Command {
     SuggestPrompt(Box<crate::feedback::SuggestionRequest>),
     FollowUp(Box<crate::followup::Request>),
     WeeklySummary(Box<crate::weekly::Request>),
+    /// Read-only MSX opportunities, milestones, owned tasks and monthly ACR of a linked customer;
+    /// only while MSX is already connected, never a sign-in.
+    CustomerMsx {
+        id: u64,
+        customer: String,
+        account: crate::customers::MsxAccount,
+    },
+    /// Read-only MSX account candidates for a domain the user is confirming as a customer.
+    CustomerAccounts {
+        id: u64,
+        domains: Vec<String>,
+        names: Vec<String>,
+    },
+    /// One explicit research of recent communication with a customer's people.
+    CustomerResearch(Box<crate::customers::research::Request>),
     Stop,
 }
 
@@ -166,6 +195,9 @@ pub struct Preparation {
     pub account: Option<String>,
     pub connector_revision: Option<String>,
     pub previous: Option<serde_json::Value>,
+    /// Confirmed customers of the meeting; their context is read at preparation time and is
+    /// never part of the meeting data or its fingerprint.
+    pub customer: Option<Box<crate::customers::PreparationInput>>,
     pub reply: async_mpsc::Sender<Prepared>,
     pub wake: std::sync::mpsc::SyncSender<crate::worker::Command>,
 }
@@ -231,6 +263,7 @@ fn flush_connector_revision(
 
 pub enum Notice {
     Auto(crate::decision::Status),
+    Msx(crate::msx::Status),
     Usage(crate::telemetry::Summary),
     Diagnostic(String),
     External {
@@ -307,6 +340,19 @@ pub enum Notice {
         id: u64,
         result: Result<crate::weekly::AiSummary, String>,
     },
+    CustomerMsx {
+        id: u64,
+        customer: String,
+        result: Result<crate::customers::MsxSnapshot, String>,
+    },
+    CustomerAccounts {
+        id: u64,
+        result: Result<crate::msx::dataverse::AccountLookup, String>,
+    },
+    CustomerResearch {
+        id: u64,
+        result: Result<crate::customers::research::Communication, String>,
+    },
     Stopped,
 }
 
@@ -337,6 +383,7 @@ pub struct Shutdown {
 #[derive(Default)]
 struct Pending {
     auto: Option<Notice>,
+    msx: Option<Notice>,
     usage: Option<Notice>,
     diagnostic: Option<Notice>,
     external: BTreeMap<crate::connectors::Kind, Notice>,
@@ -359,6 +406,7 @@ struct Pending {
     prompt_suggestion: Option<Notice>,
     followup: Option<Notice>,
     weekly: Option<Notice>,
+    customers: BTreeMap<u64, Notice>,
     stopped: bool,
 }
 
@@ -367,6 +415,7 @@ impl Pending {
         self.connection
             .take()
             .or_else(|| self.auto.take())
+            .or_else(|| self.msx.take())
             .or_else(|| self.external.pop_first().map(|(_, notice)| notice))
             .or_else(|| self.ai_login.take())
             .or_else(|| self.workiq.take())
@@ -385,6 +434,7 @@ impl Pending {
             .or_else(|| self.prompt_suggestion.take())
             .or_else(|| self.followup.take())
             .or_else(|| self.weekly.take())
+            .or_else(|| self.customers.pop_first().map(|(_, notice)| notice))
             .or_else(|| self.sources.take())
             .or_else(|| self.usage.take())
             .or_else(|| self.diagnostic.take())
@@ -407,6 +457,7 @@ impl Notices {
             .map_err(|_| "AI notifications are unavailable")?;
         match notice {
             Notice::Auto(_) => pending.auto = Some(notice),
+            Notice::Msx(_) => pending.msx = Some(notice),
             Notice::Usage(_) => pending.usage = Some(notice),
             Notice::Diagnostic(_) => pending.diagnostic = Some(notice),
             Notice::External { kind, .. } => {
@@ -442,6 +493,14 @@ impl Notices {
             Notice::PromptSuggestion { .. } => pending.prompt_suggestion = Some(notice),
             Notice::FollowUp { .. } => pending.followup = Some(notice),
             Notice::WeeklySummary { .. } => pending.weekly = Some(notice),
+            Notice::CustomerMsx { id, .. }
+            | Notice::CustomerAccounts { id, .. }
+            | Notice::CustomerResearch { id, .. } => {
+                pending.customers.insert(id, notice);
+                if pending.customers.len() > 8 {
+                    pending.customers.pop_first();
+                }
+            }
         }
         drop(pending);
         self.changed.notify_all();
@@ -502,6 +561,11 @@ enum Completion {
         generation: u64,
         status: crate::decision::Status,
     },
+    Msx {
+        generation: u64,
+        result: Result<(), crate::msx::Failure>,
+    },
+    MsxClosed,
     Recap {
         request: Box<crate::recaps::Request>,
         result: Result<Option<serde_json::Value>, RequestError>,
@@ -579,6 +643,10 @@ enum Completion {
         id: u64,
         result: Result<crate::weekly::AiSummary, String>,
     },
+    CustomerResearch {
+        id: u64,
+        result: Result<crate::customers::research::Communication, String>,
+    },
 }
 
 #[derive(Debug)]
@@ -639,6 +707,32 @@ async fn hosted_check<T>(
     }
 }
 
+enum MsxOperation {
+    Check { explicit: bool },
+    SignIn { device_code: bool },
+}
+
+/// Runs one MSX check or explicit sign-in; the returned sender cancels it.
+fn start_msx(
+    tasks: &mut tokio::task::JoinSet<Completion>,
+    client: Arc<crate::msx::Client>,
+    generation: u64,
+    operation: MsxOperation,
+    shutdown: watch::Receiver<bool>,
+) -> watch::Sender<bool> {
+    let (cancel, cancelled) = watch::channel(false);
+    tasks.spawn(async move {
+        let result = match operation {
+            MsxOperation::Check { explicit } => client.check(explicit, cancelled, shutdown).await,
+            MsxOperation::SignIn { device_code } => {
+                client.sign_in(device_code, cancelled, shutdown).await
+            }
+        };
+        Completion::Msx { generation, result }
+    });
+    cancel
+}
+
 async fn connect_ai(root: &std::path::Path) -> Result<Arc<Harness>, String> {
     let config = Config::load(root)?.for_native_app();
     let harness = Harness::start(root, config).await?;
@@ -676,6 +770,14 @@ impl Engine {
         let workiq_ready = Arc::new(AtomicBool::new(false));
         let workiq_connected = workiq_ready.clone();
         thread::Builder::new().name("tomlook-sdk".into()).spawn(move || {
+            let msx_publish: crate::msx::Publish = {
+                let output = output.clone();
+                let context = context.clone();
+                Arc::new(move |status| {
+                    if let Err(error) = output.send(Notice::Msx(status)) { eprintln!("Tomlook: {error}"); }
+                    context.request_repaint();
+                })
+            };
             let notify = |notice| {
                 let result = output.send(notice);
                 context.request_repaint();
@@ -729,6 +831,11 @@ impl Engine {
                 let mut auto_generation = 0;
                 let mut auto_status = crate::decision::Status::new(crate::decision::Phase::Checking, "Checking Foundry Azure sign-in...");
                 let (auto_progress, mut auto_updates) = async_mpsc::channel::<(u64, String)>(4);
+                let mut msx_settings: Option<crate::msx::Settings> = None;
+                let mut msx: Option<Arc<crate::msx::Client>> = None;
+                let mut msx_cancel: Option<watch::Sender<bool>> = None;
+                let mut msx_generation = 0_u64;
+                let mut msx_retry = crate::retry::Retry::default();
                 let mut connectors = Arc::new(crate::connectors::Registry::default());
                 let mut connector_cancels = BTreeMap::<crate::connectors::Kind, watch::Sender<bool>>::new();
                 let mut connector_generations = BTreeMap::<crate::connectors::Kind, u64>::new();
@@ -844,6 +951,13 @@ impl Engine {
                                 Completion::HostedWorkiq { generation, result }
                             });
                         }
+                        if msx_cancel.is_none() && msx_retry.due(Instant::now())
+                            && let Some(client) = msx.clone() {
+                            msx_retry.started();
+                            msx_generation += 1;
+                            telemetry.record("msx", "connection_retry_started", None, 0);
+                            msx_cancel = Some(start_msx(&mut tasks, client, msx_generation, MsxOperation::Check { explicit: false }, stopped.clone()));
+                        }
                     }
                     if connectors.records.values().any(|saved| !saved.available()) {
                         let mut next = (*connectors).clone();
@@ -916,6 +1030,7 @@ impl Engine {
                     if *stopped.borrow() { shutdown_requested = true; stopping = true; }
                     if stopping {
                         if let Some(cancel) = &auto_login_cancel { let _ = cancel.send(true); }
+                        if let Some(cancel) = &msx_cancel { let _ = cancel.send(true); }
                         if let Some(index) = &source_index { index.stopped.store(true, Ordering::Release); }
                         connected.store(false, Ordering::Release);
                         for (cancel, _) in cancellations.values() { cancel_request(cancel); }
@@ -923,6 +1038,7 @@ impl Engine {
                         for cancel in connector_cancels.values() { let _ = cancel.send(true); }
                     }
                     if stopping && tasks.is_empty() {
+                        if let Some(client) = msx.take() { client.disconnect().await; }
                         if let Some(connection) = workiq.take()
                             && let Err(error) = connection.close().await {
                                 notify(Notice::HostedWorkiq { busy: false, ready: false, message: error });
@@ -936,7 +1052,7 @@ impl Engine {
                     }
                     let heartbeat = Instant::now() + Duration::from_secs(30);
                     let retry_deadline = connector_retries.values().filter_map(crate::retry::Retry::deadline)
-                        .chain(workiq_retry.deadline()).chain(ai_retry.deadline()).min()
+                        .chain(workiq_retry.deadline()).chain(ai_retry.deadline()).chain(msx_retry.deadline()).min()
                         .unwrap_or(heartbeat).min(heartbeat);
                     tokio::select! {
                         biased;
@@ -1008,6 +1124,66 @@ impl Engine {
                                 }
                                 Some(Command::CancelAutoLogin) => {
                                     if let Some(cancel) = &auto_login_cancel { let _ = cancel.send(true); }
+                                }
+                                Some(Command::MsxSettings(settings)) if demo => {
+                                    msx_settings = Some(settings);
+                                    notify(Notice::Msx(crate::msx::Status::demo()));
+                                }
+                                Some(Command::MsxSettings(settings)) => {
+                                    if msx_settings.as_ref() != Some(&settings) {
+                                        if let Some(cancel) = msx_cancel.take() { let _ = cancel.send(true); }
+                                        msx_generation += 1;
+                                        msx_retry.clear();
+                                        if let Some(old) = msx.take() {
+                                            tasks.spawn(async move { old.disconnect().await; Completion::MsxClosed });
+                                        }
+                                        if !settings.enabled {
+                                            notify(Notice::Msx(crate::msx::Status::disabled()));
+                                        } else if let Err(error) = crate::msx::validate_tenant(&settings.tenant) {
+                                            notify(Notice::Msx(crate::msx::Status { phase: crate::msx::Phase::Unavailable, message: error, ..crate::msx::Status::new(&settings.tenant) }));
+                                        } else {
+                                            // Idle until a cached token exists: one quiet, bounded, non-interactive check.
+                                            let client = Arc::new(crate::msx::Client::new(&settings, msx_publish.clone()));
+                                            notify(Notice::Msx(client.status()));
+                                            msx_cancel = Some(start_msx(&mut tasks, client.clone(), msx_generation, MsxOperation::Check { explicit: false }, stopped.clone()));
+                                            msx = Some(client);
+                                        }
+                                        msx_settings = Some(settings);
+                                    }
+                                }
+                                Some(Command::CheckMsx | Command::SignInMsx { .. } | Command::DisconnectMsx) if demo => {
+                                    notify(Notice::Msx(crate::msx::Status::demo()));
+                                }
+                                Some(Command::CheckMsx) => match msx.clone() {
+                                    Some(client) if msx_cancel.is_none() => {
+                                        msx_generation += 1;
+                                        msx_retry.clear();
+                                        msx_cancel = Some(start_msx(&mut tasks, client, msx_generation, MsxOperation::Check { explicit: true }, stopped.clone()));
+                                    }
+                                    Some(client) => { notify(Notice::Msx(client.status())); }
+                                    None => { notify(Notice::Msx(crate::msx::Status::disabled())); }
+                                },
+                                Some(Command::SignInMsx { device_code }) => match msx.clone() {
+                                    Some(client) => {
+                                        // An explicit sign-in supersedes a quiet check or an earlier sign-in.
+                                        if let Some(cancel) = msx_cancel.take() { let _ = cancel.send(true); }
+                                        msx_generation += 1;
+                                        msx_retry.clear();
+                                        telemetry.record("msx", if device_code { "device_sign_in_started" } else { "sign_in_started" }, None, 0);
+                                        msx_cancel = Some(start_msx(&mut tasks, client, msx_generation, MsxOperation::SignIn { device_code }, stopped.clone()));
+                                    }
+                                    None => { notify(Notice::Msx(crate::msx::Status::disabled())); }
+                                },
+                                Some(Command::CancelMsx) => {
+                                    if let Some(cancel) = &msx_cancel { let _ = cancel.send(true); }
+                                }
+                                Some(Command::DisconnectMsx) => {
+                                    if let Some(cancel) = msx_cancel.take() { let _ = cancel.send(true); }
+                                    msx_generation += 1;
+                                    msx_retry.clear();
+                                    if let Some(client) = msx.clone() {
+                                        tasks.spawn(async move { client.disconnect().await; Completion::MsxClosed });
+                                    }
                                 }
                                 Some(Command::Prompts(next)) => {
                                     match next.validate() {
@@ -1538,7 +1714,7 @@ impl Engine {
                                         let proposal_wake = wake.clone();
                                         tasks.spawn(async move {
                                             let id = question.id;
-                                            let result = ask(harness, *question, cancelled, progress, true, Sources { translation: false, wake: proposal_wake, workiq: workiq_connection, index, connectors: Some(connectors), telemetry: Some(telemetry), prompts }).await.map_err(RequestError::message);
+                                            let result = ask(harness, *question, cancelled, progress, true, Sources { translation: false, wake: proposal_wake, workiq: workiq_connection, index, connectors: Some(connectors), telemetry: Some(telemetry), prompts, msx: None, customer: None }).await.map_err(RequestError::message);
                                             Completion::Answer { id, connector_revision, result }
                                         });
                                     } else {
@@ -1574,7 +1750,7 @@ impl Engine {
                                             cancellations.insert(id, (cancel, false));
                                             if request.mode == crate::chat::Mode::Auto { auto_requests.insert(id); }
                                             if let Some(account)=request.question.account.clone() { chat_accounts.insert(id,account); }
-                                            let sources = Sources { translation: false, wake: wake.clone(), workiq: workiq.clone(), index: source_index.clone(), connectors: Some(connectors.clone()), telemetry: Some(telemetry.clone()), prompts: prompts.clone() };
+                                            let sources = Sources { translation: false, wake: wake.clone(), workiq: workiq.clone(), index: source_index.clone(), connectors: Some(connectors.clone()), telemetry: Some(telemetry.clone()), prompts: prompts.clone(), msx: msx.clone(), customer: None };
                                             let connector_revision = connectors.context_revision();
                                             let root = root.clone();
                                             let output = output.clone();
@@ -1653,6 +1829,71 @@ impl Engine {
                                         });
                                     }
                                 }
+                                Some(Command::CustomerResearch(request)) => {
+                                    let key = request.id | CUSTOMER_BIT;
+                                    let connection = workiq.clone().filter(|connection| {
+                                        connection.is_active() && connection.account.eq_ignore_ascii_case(&request.account)
+                                    });
+                                    let denied = if stopping { Some("AI is stopping; nothing was submitted") }
+                                        else if demo { Some("Offline demo never sends AI requests.") }
+                                        else if harness.is_none() { Some("Connect GitHub Copilot first. No AI request was made.") }
+                                        else if connection.is_none() { Some("Connect WorkIQ with this calendar's account before searching communication; nothing was submitted.") }
+                                        else if cancellations.keys().any(|id| id & CUSTOMER_BIT != 0 && id & (1 << 63) == 0) || cancellations.len() >= 3 {
+                                            Some("AI execution capacity is busy; nothing was submitted")
+                                        } else { None };
+                                    if let Some(reason) = denied {
+                                        notify(Notice::CustomerResearch { id: request.id, result: Err(reason.into()) });
+                                    } else if let (Some(harness), Some(connection)) = (harness.clone(), connection) {
+                                        let (cancel, cancelled) = watch::channel(false);
+                                        cancellations.insert(key, (cancel, false));
+                                        let telemetry = telemetry.clone();
+                                        tasks.spawn(async move {
+                                            let result = research_customer(harness, connection, &request, cancelled, telemetry).await;
+                                            Completion::CustomerResearch { id: request.id, result }
+                                        });
+                                    }
+                                }
+                                Some(Command::CustomerMsx { id, customer, account }) => {
+                                    // Reads only while MSX is already connected; never a sign-in.
+                                    let client = msx.clone().filter(|client| !demo && client.ready(crate::msx::Resource::Dataverse));
+                                    let reason = if demo { crate::msx::DEMO.to_owned() }
+                                        else if msx.is_none() { crate::msx::DISABLED.to_owned() }
+                                        else { "MSX is not connected. Sign in from the MSX status first; nothing was read.".to_owned() };
+                                    let (cancel, cancelled) = watch::channel(false);
+                                    if let Some(previous) = lookup_cancels.insert("customer-msx", cancel) { let _ = previous.send(true); }
+                                    let shutdown = stopped.clone();
+                                    tasks.spawn(async move {
+                                        let result = match client {
+                                            Some(client) => editor_lookup(cancelled, shutdown, async {
+                                                tokio::time::timeout(Duration::from_secs(150),
+                                                    crate::customers::fetch_msx(&client, &account, Local::now().date_naive()))
+                                                    .await.map_err(|_| "MSX did not answer within 150 seconds".to_owned())
+                                            }).await,
+                                            None => Err(reason),
+                                        };
+                                        Completion::Lookup(Box::new(Notice::CustomerMsx { id, customer, result }))
+                                    });
+                                }
+                                Some(Command::CustomerAccounts { id, domains, names }) => {
+                                    let client = msx.clone().filter(|client| !demo && client.ready(crate::msx::Resource::Dataverse));
+                                    let reason = if demo { crate::msx::DEMO.to_owned() }
+                                        else if msx.is_none() { crate::msx::DISABLED.to_owned() }
+                                        else { "MSX is not connected. Sign in from the MSX status first; nothing was read.".to_owned() };
+                                    let (cancel, cancelled) = watch::channel(false);
+                                    if let Some(previous) = lookup_cancels.insert("customer-accounts", cancel) { let _ = previous.send(true); }
+                                    let shutdown = stopped.clone();
+                                    tasks.spawn(async move {
+                                        let result = match client {
+                                            Some(client) => editor_lookup(cancelled, shutdown, async {
+                                                let query = crate::msx::dataverse::AccountQuery { domains, names };
+                                                tokio::time::timeout(Duration::from_secs(120), client.find_accounts(&query))
+                                                    .await.map_err(|_| "MSX did not answer within 120 seconds".to_owned())?
+                                            }).await,
+                                            None => Err(reason),
+                                        };
+                                        Completion::Lookup(Box::new(Notice::CustomerAccounts { id, result }))
+                                    });
+                                }
                                 Some(Command::Prepare(request)) => {
                                     let id = request.id | (1 << 63);
                                     let denied = if stopping { Some("AI is stopping; nothing was submitted") }
@@ -1682,6 +1923,7 @@ impl Engine {
                                         let connector_revision = connectors.context_revision();
                                         let telemetry = telemetry.clone();
                                         let prompts = prompts.clone();
+                                        let msx_client = msx.clone();
                                         tasks.spawn(async move {
                                             let result = async {
                                             let question = Question {
@@ -1691,7 +1933,7 @@ impl Engine {
                                                 },
                                                 meeting: Some(request.event.clone()), account: request.account.clone(), public_topic: None, suggest_drafts: false, language: crate::i18n::Language::En,
                                             };
-                                            ask(harness, question, cancelled, progress, false, Sources { translation: request.previous.is_some(), wake: None, workiq: connection, index, connectors: Some(connectors), telemetry: Some(telemetry), prompts }).await
+                                            ask(harness, question, cancelled, progress, false, Sources { translation: request.previous.is_some(), wake: None, workiq: connection, index, connectors: Some(connectors), telemetry: Some(telemetry), prompts, msx: msx_client, customer: request.customer.clone().filter(|_| request.previous.is_none()) }).await
                                             }.await;
                                             let quota_day = match &result { Err(RequestError::Quota(day)) => Some(*day), _ => None };
                                             Completion::Prepared { request, connector_revision, result: result.map_err(RequestError::message), quota_day }
@@ -1716,6 +1958,25 @@ impl Engine {
                                         if !stopping { notify(Notice::Auto(auto_status.clone())); }
                                     }
                                 }
+                                Some(Ok(Completion::Msx { generation, result })) => {
+                                    if generation == msx_generation {
+                                        msx_cancel = None;
+                                        match result {
+                                            Err(failure) if failure.retry && !stopping => {
+                                                if let Some(delay) = msx_retry.schedule(Instant::now(), &failure.message) {
+                                                    telemetry.record("msx", "retry_scheduled_seconds", None, delay.as_secs());
+                                                    if let Some(client) = &msx {
+                                                        let mut status = client.status();
+                                                        status.message = crate::retry::failure_message(status.message, Some(delay));
+                                                        notify(Notice::Msx(status));
+                                                    }
+                                                }
+                                            }
+                                            _ => msx_retry.clear(),
+                                        }
+                                    }
+                                }
+                                Some(Ok(Completion::MsxClosed)) => {}
                                 Some(Ok(Completion::CalendarDelivered { admitted, result })) => {
                                     if admitted { calendar_mutating = false; }
                                     if let Err(error) = result {
@@ -1983,6 +2244,14 @@ impl Engine {
                                     if let Some(wake) = &wake { let _ = wake.try_send(crate::worker::Command::Wake); }
                                     notify(Notice::WeeklySummary { id, result });
                                 }
+                                Some(Ok(Completion::CustomerResearch { id, result })) => {
+                                    if let Err(error) = &result { telemetry.failure("customer_research", error, Some(id | CUSTOMER_BIT)); }
+                                    next_usage = Instant::now();
+                                    let result = finish_request(id | CUSTOMER_BIT, &mut cancellations, "", "", stopping, result);
+                                    active.store(cancellations.len(), Ordering::Release);
+                                    if let Some(wake) = &wake { let _ = wake.try_send(crate::worker::Command::Wake); }
+                                    notify(Notice::CustomerResearch { id, result });
+                                }
                                 Some(Ok(Completion::Prepared { request, connector_revision, result, quota_day })) => {
                                     if let Err(error) = &result { telemetry.failure("preparation", error, Some(request.id)); }
                                     let mut result = finish_preparation(request.id | (1 << 63), &mut cancellations, &connector_revision, &connectors.context_revision(), stopping || *stopped.borrow(), shutdown_requested || *stopped.borrow(), request.previous, result);
@@ -2016,6 +2285,7 @@ impl Engine {
                         for (cancel, _) in cancellations.values() { cancel_request(cancel); }
                     }
                     if stopping && tasks.is_empty() {
+                        if let Some(client) = msx.take() { client.disconnect().await; }
                         if let Some(connection) = workiq.take()
                             && let Err(error) = connection.close().await {
                                 notify(Notice::HostedWorkiq { busy: false, ready: false, message: error });
@@ -2562,6 +2832,7 @@ async fn ask_chat(
             }),
         workiq: sources.workiq,
         index: sources.index,
+        msx: sources.msx,
         connectors,
         protected,
         run: run.clone(),
@@ -2811,6 +3082,8 @@ async fn process_recap(
                 connectors: Some(connectors.clone()),
                 telemetry: Some(telemetry.clone()),
                 prompts: Arc::new(request.prompts.clone()),
+                msx: None,
+                customer: None,
             },
         )
         .await?;
@@ -3207,6 +3480,195 @@ async fn summarize_week(
     }
 }
 
+/// The customer block of a preparation. MSX is read now, only when it is already connected and
+/// within a bounded time; a failed read stays an explicit gap. A cancellation during the reads
+/// ends the preparation.
+async fn customer_context(
+    input: &crate::customers::PreparationInput,
+    msx: Option<&Arc<crate::msx::Client>>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<String, String> {
+    let today = Local::now().date_naive();
+    customer_reads(input, cancel, move |account| async move {
+        match msx {
+            Some(client) if client.ready(crate::msx::Resource::Dataverse) => {
+                Ok(crate::customers::fetch_msx(client, &account, today).await)
+            }
+            Some(_) => Err("MSX is not connected; nothing was read".to_owned()),
+            None => Err("MSX is turned off or not connected; nothing was read".to_owned()),
+        }
+    })
+    .await
+}
+
+const CUSTOMER_CANCELLED: &str =
+    "Preparation was cancelled while customer context was read; no question was sent";
+
+/// Reads each linked customer with `read`. Waits on a clone of the request's cancellation so the
+/// caller still observes the change.
+async fn customer_reads<F, Fut>(
+    input: &crate::customers::PreparationInput,
+    cancel: &watch::Receiver<bool>,
+    read: F,
+) -> Result<String, String>
+where
+    F: Fn(crate::customers::MsxAccount) -> Fut,
+    Fut: std::future::Future<Output = Result<crate::customers::MsxSnapshot, String>>,
+{
+    let mut cancel = cancel.clone();
+    let mut reads = BTreeMap::new();
+    for customer in &input.customers {
+        let Some(account) = &customer.msx else {
+            continue;
+        };
+        if *cancel.borrow() {
+            return Err(CUSTOMER_CANCELLED.into());
+        }
+        let result = tokio::select! {
+            _ = cancel.changed() => return Err(CUSTOMER_CANCELLED.into()),
+            read = tokio::time::timeout(Duration::from_secs(45), read(account.clone())) =>
+                read.unwrap_or_else(|_| Err("MSX did not answer within 45 seconds".to_owned())),
+        };
+        reads.insert(customer.id.clone(), result);
+    }
+    if *cancel.borrow() {
+        return Err(CUSTOMER_CANCELLED.into());
+    }
+    Ok(crate::customers::preparation_block(input, &reads))
+}
+
+/// Cancellation and accounting identity bit of customer communication research.
+pub const CUSTOMER_BIT: u64 = 1 << 59;
+const CUSTOMER_QUOTA: &str =
+    "Daily AI request limit reached; no communication research was requested.";
+
+/// One bounded Thorough-profile request with WorkIQ read tools only that summarizes recent
+/// communication with a customer's people. Sources are validated against the retrieved results.
+async fn research_customer(
+    harness: Arc<Harness>,
+    workiq: Arc<crate::workiq::connection::Connection>,
+    request: &crate::customers::research::Request,
+    mut cancel: watch::Receiver<bool>,
+    telemetry: Arc<crate::telemetry::Service>,
+) -> Result<crate::customers::research::Communication, String> {
+    let prompt = request.prompt()?;
+    if harness.redactor.contains(&prompt) {
+        return Err("The customer contains an app credential; nothing was submitted".into());
+    }
+    let key = request.id | CUSTOMER_BIT;
+    if *cancel.borrow() {
+        return Err("Cancelled before communication research was requested".into());
+    }
+    if !telemetry.reserve(key).await? {
+        telemetry.record("accounting", "daily_limit_reached", Some(key), 0);
+        return Err(CUSTOMER_QUOTA.into());
+    }
+    telemetry.record("request", "customer_research_admitted", Some(key), 0);
+    let (session, recorder) = tokio::select! {
+        _ = cancel.changed() => return Err("Cancelled before communication research was requested".into()),
+        result = tokio::time::timeout(Duration::from_secs(60), harness.customer_research_session(workiq, request.protected())) =>
+            result.map_err(|_| "Creating the communication research session timed out".to_owned())??,
+    };
+    let mut subscription = session.subscribe();
+    let result: Result<String, String> = async {
+        tokio::select! {
+            _ = cancel.changed() => {
+                return Err("Cancelled while requesting communication research; provider outcome may be unknown".into());
+            }
+            sent = tokio::time::timeout(Duration::from_secs(30), session.send(MessageOptions::new(prompt))) => {
+                sent.map_err(|_| "Sending the SDK request timed out".to_string())?
+                    .map_err(|e| format!("SDK request failed: {e}"))?;
+            }
+        }
+        let timeout = tokio::time::sleep(Duration::from_secs(crate::customers::research::SECONDS));
+        tokio::pin!(timeout);
+        let mut answer = None;
+        loop {
+            tokio::select! {
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        return Err("Communication research cancelled; nothing was saved.".into());
+                    }
+                }
+                _ = &mut timeout => return Err("Communication research took too long; try again".into()),
+                event = subscription.recv() => {
+                    let event = event.map_err(|e| format!("SDK event stream failed: {e}"))?;
+                    match event.event_type.as_str() {
+                        "assistant.usage" => match crate::telemetry::Metrics::from_sdk(&event.data) {
+                            Ok(metrics) => {
+                                if telemetry.observe(key, &event.id, metrics).await.is_err() { telemetry.usage_failure(); }
+                            }
+                            Err(_) => telemetry.usage_failure(),
+                        },
+                        "assistant.message" => {
+                            if let Some(text) = event.data.get("content").and_then(|v| v.as_str()) {
+                                if text.len() > crate::customers::research::OUTPUT_LIMIT {
+                                    return Err("AI returned an oversized communication summary; nothing was saved.".into());
+                                }
+                                answer = Some(text.to_owned());
+                            }
+                        }
+                        "session.error" => return Err("Copilot reported a session error; no communication summary was produced.".into()),
+                        "session.idle" => {
+                            return answer.filter(|text| !text.trim().is_empty())
+                                .ok_or_else(|| "AI returned an empty communication summary; nothing was saved.".into());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    .await;
+    let aborted = if result.is_err() {
+        tokio::time::timeout(Duration::from_secs(5), session.abort())
+            .await
+            .map_err(|_| "Cancel SDK session timed out".to_string())
+            .and_then(|r| r.map_err(|e| format!("Cancel SDK session: {e}")))
+    } else {
+        Ok(())
+    };
+    let until = Instant::now() + Duration::from_millis(100);
+    for _ in 0..64 {
+        match tokio::time::timeout_at(until.into(), subscription.recv()).await {
+            Ok(Ok(event)) if event.event_type == "assistant.usage" => {
+                match crate::telemetry::Metrics::from_sdk(&event.data) {
+                    Ok(metrics) => {
+                        if telemetry.observe(key, &event.id, metrics).await.is_err() {
+                            telemetry.usage_failure();
+                        }
+                    }
+                    Err(_) => telemetry.usage_failure(),
+                }
+            }
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    let disconnected = tokio::time::timeout(Duration::from_secs(5), session.disconnect())
+        .await
+        .map_err(|_| "Detach SDK session timed out".to_string())
+        .and_then(|r| r.map_err(|e| format!("Detach SDK session: {e}")));
+    match (result, aborted, disconnected) {
+        (Ok(text), Ok(()), Ok(())) => {
+            let evidence = recorder.snapshot()?;
+            crate::customers::research::parse(
+                &harness.redactor.text(&text),
+                request,
+                &evidence,
+                chrono::Utc::now(),
+            )
+        }
+        (result, aborted, disconnected) => {
+            let errors = [result.err(), aborted.err(), disconnected.err()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            Err(harness.redactor.text(&errors.join("; ")))
+        }
+    }
+}
+
 async fn ask(
     harness: Arc<Harness>,
     question: Question,
@@ -3223,6 +3685,8 @@ async fn ask(
         connectors,
         telemetry,
         prompts,
+        msx,
+        customer,
     } = sources;
     check_meeting_account(
         &question,
@@ -3269,6 +3733,21 @@ async fn ask(
             return Err(RequestError::Quota(day));
         }
         telemetry.record("request", "admitted", Some(question.id), 0);
+    }
+    if question.question == PREPARATION_PROMPT
+        && let Some(input) = customer
+    {
+        let block = customer_context(&input, msx.as_ref(), &cancel).await?;
+        // Customer data that would leak an app credential or overflow the prompt is left out.
+        if !redactor.contains(&block) && prompt.len() + block.len() <= 64_000 {
+            prompt.push_str(&block);
+            if let Some(telemetry) = &telemetry {
+                telemetry.record("customer", "preparation_context", Some(question.id), input.customers.len() as u64);
+            }
+        }
+    }
+    if *cancel.borrow() {
+        return Err("Cancelled before SDK session creation; no question was sent".into());
     }
 
     let context_query = question.meeting.as_ref().map(|event| {
@@ -3320,7 +3799,7 @@ async fn ask(
         tokio::select! {
             _ = cancel.changed() => return Err("Cancelled before the question was sent".into()),
             result = tokio::time::timeout(Duration::from_secs(300),
-                harness.observed_session_with_connections(None, workiq, index, context_query, protected, connectors)) =>
+                harness.observed_session_with_connections(None, workiq, index, context_query, protected, connectors, msx)) =>
                     result.map_err(|_| "Connecting the answer context timed out".to_string())??,
         }
     };
@@ -3596,6 +4075,8 @@ mod live_source_tests {
                         connectors: None,
                         telemetry: None,
                         prompts: Arc::new(crate::prompts::Prompts::default()),
+                        msx: None,
+                        customer: None,
                     },
                 )
                 .await
@@ -4334,5 +4815,106 @@ mod prompt_tests {
         let prompt = question_prompt(&question, &redactor).unwrap();
         assert!(prompt.contains("LOCAL_DRAFTS:"));
         assert!(prompt.contains("never actions or approvals"));
+    }
+
+    #[tokio::test]
+    async fn customer_context_stays_outside_meeting_data_and_reads_nothing_without_msx() {
+        let redactor = crate::evidence::Redactor::default();
+        let mut meeting = crate::calendar::demo(chrono::Local::now(), 1).remove(0);
+        meeting.attendees.push("Dana Novak <dana@northstar.example>".into());
+        let fingerprint = crate::scheduler::fingerprint(&meeting);
+        let question = Question {
+            id: 1,
+            question: PREPARATION_PROMPT.into(),
+            meeting: Some(meeting.clone()),
+            account: None,
+            public_topic: None,
+            suggest_drafts: false,
+            language: crate::i18n::Language::En,
+        };
+        let before = question_prompt(&question, &redactor).unwrap();
+        let customer = crate::customers::Customer::new(
+            "owner@contoso.com",
+            "Northstar",
+            &["northstar.example".into()],
+            Some(crate::customers::MsxAccount {
+                id: "0f8fad5b-d9cb-469f-a165-70867728950e".into(),
+                name: "Northstar Holdings".into(),
+                tpid: None,
+                confidence: Some(0.9),
+            }),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        let input = crate::customers::PreparationInput {
+            customers: vec![customer],
+            communications: Vec::new(),
+        };
+        let (_cancel, cancelled) = watch::channel(false);
+        let block = customer_context(&input, None, &cancelled).await.unwrap();
+        assert!(block.len() <= crate::customers::PREPARATION_LIMIT);
+        assert!(block.contains("MSX is turned off or not connected; nothing was read"), "{block}");
+        assert!(block.contains("not evidence of absence"));
+        assert!(!before.contains("CUSTOMER_CONTEXT"), "The block is appended at preparation time only");
+        assert_eq!(question_prompt(&question, &redactor).unwrap(), before);
+        assert_eq!(crate::scheduler::fingerprint(&meeting), fingerprint, "The scheduler fingerprint is unchanged");
+        assert!(
+            !PREPARATION_PROMPT.contains("CUSTOMER_"),
+            "The preparation prompt, part of the analysis revision, is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_customer_read_ends_the_preparation_and_stays_visible_to_the_request() {
+        let customer = |name: &str, id: &str| {
+            crate::customers::Customer::new(
+                "owner@contoso.com",
+                name,
+                &[format!("{}.example", name.to_lowercase())],
+                Some(crate::customers::MsxAccount {
+                    id: id.into(),
+                    name: name.into(),
+                    tpid: None,
+                    confidence: Some(0.9),
+                }),
+                chrono::Utc::now(),
+            )
+            .unwrap()
+        };
+        let input = crate::customers::PreparationInput {
+            customers: vec![
+                customer("Northstar", "0f8fad5b-d9cb-469f-a165-70867728950e"),
+                customer("Cedar", "7c9e6679-7425-40de-944b-e07fc1f90ae7"),
+            ],
+            communications: Vec::new(),
+        };
+        let (cancel, cancelled) = watch::channel(false);
+        let started = Arc::new(AtomicUsize::new(0));
+        let reads = started.clone();
+        let user = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.send(true).unwrap();
+            cancel
+        });
+        let begun = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            customer_reads(&input, &cancelled, move |_| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<Result<crate::customers::MsxSnapshot, String>>()
+            }),
+        )
+        .await
+        .expect("A cancelled MSX read ends promptly instead of waiting for its 45-second timeout");
+        assert_eq!(result.unwrap_err(), CUSTOMER_CANCELLED);
+        assert!(begun.elapsed() < Duration::from_secs(10));
+        assert_eq!(started.load(Ordering::SeqCst), 1, "No further customer is read after cancellation");
+        let _cancel = user.await.unwrap();
+        // ask() returns on this error, and its session-creation and WorkIQ selects still observe
+        // the change: waiting for customer context did not consume it.
+        assert!(cancelled.has_changed().unwrap(), "The cancellation is still pending for the request");
+        assert!(*cancelled.borrow());
+        let already = customer_context(&input, None, &cancelled).await;
+        assert_eq!(already.unwrap_err(), CUSTOMER_CANCELLED, "A cancelled request reads nothing");
     }
 }

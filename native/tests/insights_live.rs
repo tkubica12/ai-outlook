@@ -56,6 +56,7 @@ fn live_insight(engine: &Engine, event: Event, account: String) -> Result<Answer
             account: Some(account),
             connector_revision: None,
             previous: None,
+            customer: None,
             reply,
             wake,
         })))

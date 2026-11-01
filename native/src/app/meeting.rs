@@ -479,6 +479,7 @@ impl Tomlook {
             ui.label(format!("{}: {}", language.text("Organizer"),
                 event.organizer.split('<').next().unwrap_or(&event.organizer).trim())).on_hover_text(&event.organizer);
         }
+        let mut clicked_company = None;
         ui.horizontal_wrapped(|ui| {
         for ((external, company), people) in companies.iter().take(8) {
             let domain = if *external {
@@ -489,17 +490,18 @@ impl Tomlook {
             let icon = self.companies.get(domain);
             let tooltip = format!("{company}\n{}", people.iter().map(|person| person.as_str()).collect::<Vec<_>>().join("\n"));
             ui.horizontal(|ui| {
-                if let Some(image) = icon.and_then(|icon| icon.image.as_ref()) {
+                let response = if let Some(image) = icon.and_then(|icon| icon.image.as_ref()) {
                     egui::Frame::new()
                         .fill(Color32::WHITE)
                         .corner_radius(4)
                         .inner_margin(3)
                         .show(ui, |ui| {
-                            ui.add(egui::Image::new((image.id(), Vec2::splat(20.0))))
-                                .on_hover_text(&tooltip);
-                        });
+                            ui.add(egui::Image::new((image.id(), Vec2::splat(20.0))).sense(egui::Sense::click()))
+                                .on_hover_text(&tooltip)
+                        })
+                        .inner
                 } else {
-                let label = ui.label(
+                let label = ui.add(egui::Label::new(
                     RichText::new(language.text(company))
                         .small()
                         .strong()
@@ -508,10 +510,13 @@ impl Tomlook {
                         } else {
                             self.accent()
                         }),
-                );
+                ).sense(egui::Sense::click()));
                 label.on_hover_text(if let Some(error) = icon.and_then(|icon| icon.error.as_ref()) {
                     format!("{tooltip}\n{}", language.text(error))
-                } else { tooltip });
+                } else { tooltip })
+                };
+                if *external && response.clicked() {
+                    clicked_company = Some((company.clone(), people.iter().map(|person| (*person).clone()).collect::<Vec<_>>()));
                 }
             });
             if !self.companies_busy
@@ -531,6 +536,10 @@ impl Tomlook {
         {
             self.companies_busy = true;
         }
+        if let Some((domain, people)) = clicked_company {
+            self.open_company(&domain, people, Some(event.id.clone()));
+        }
+        self.customer_card(ui, &event);
         let people_label = if event.attendee_count() > event.attendees.len() {
             format!(
                 "People ({} of {})",

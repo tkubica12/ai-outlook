@@ -305,6 +305,8 @@ pub fn tool_label(name: &str) -> &'static str {
         crate::workiq::connection::SDK_TOOL => "Reading mail or calendar in Microsoft 365",
         crate::workiq::connection::CONTEXT_TOOL => "Searching Microsoft 365 context",
         crate::workiq::connection::cloud::SDK_TOOL => "Reading cloud materials",
+        crate::msx::tools::QUERY_TOOL | crate::msx::tools::DESCRIBE_TOOL => "Reading MSX (Dataverse)",
+        crate::msx::tools::ACR_TOOL => "Reading Azure consumption (Power BI)",
         name if name.contains("github") => "Searching GitHub",
         name if name.starts_with("WebIQ") => "Searching public sources",
         _ => "Reading an authorized source",

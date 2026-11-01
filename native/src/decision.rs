@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
-    process::Stdio,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -109,28 +108,7 @@ pub fn routing_error(error: &str) -> Option<Status> {
     }
 }
 
-fn device_code(bytes: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(bytes);
-    if !text.split_whitespace().any(|word| {
-        matches!(
-            word,
-            "https://microsoft.com/devicelogin" | "https://aka.ms/devicelogin"
-        )
-    }) {
-        return None;
-    }
-    let code = text
-        .split_once("enter the code ")?
-        .1
-        .split_once(char::is_whitespace)?
-        .0;
-    (code.len() >= 6
-        && code.len() <= 16
-        && code
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-'))
-    .then(|| code.to_owned())
-}
+use crate::azure_cli::device_code;
 
 async fn login_output(
     mut reader: impl AsyncRead + Unpin,
@@ -398,52 +376,7 @@ impl Router {
     }
 
     fn cli_command(&self, args: &[&str]) -> Result<tokio::process::Command, String> {
-        #[cfg(windows)]
-        let mut command = if self
-            .config
-            .azure_cli
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd"))
-        {
-            // Match the installed MSI az.cmd bootstrap, without an intermediate shell.
-            let python = self
-                .config
-                .azure_cli
-                .parent()
-                .and_then(Path::parent)
-                .ok_or(CLI_FAILED)?
-                .join("python.exe");
-            if !python.is_file() {
-                return Err(CLI_FAILED.into());
-            }
-            let mut command = tokio::process::Command::new(python);
-            command
-                .args(["-u", "-IBm", "azure.cli"])
-                .args(args)
-                .env("AZ_INSTALLER", "MSI");
-            command
-        } else {
-            let mut command = tokio::process::Command::new(&self.config.azure_cli);
-            command.args(args);
-            command
-        };
-        #[cfg(not(windows))]
-        let mut command = {
-            let mut command = tokio::process::Command::new(&self.config.azure_cli);
-            command.args(args);
-            command
-        };
-        #[cfg(windows)]
-        command.creation_flags(0x08000000);
-        command
-            .kill_on_drop(true)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "no")
-            .env("AZURE_CORE_COLLECT_TELEMETRY", "0")
-            .env("AZURE_CORE_NO_COLOR", "true");
-        Ok(command)
+        crate::azure_cli::command(&self.config.azure_cli, args).map_err(|()| CLI_FAILED.into())
     }
 
     fn login_command(&self) -> Result<tokio::process::Command, String> {

@@ -124,6 +124,7 @@ pub enum Command {
         key: String,
     },
     SaveWeeklySummary(Box<crate::weekly::Saved>),
+    Customer(CustomerCommand),
     AttachAi {
         commands: tokio::sync::mpsc::Sender<ai::Command>,
         ready: Arc<AtomicBool>,
@@ -171,6 +172,42 @@ impl TaskCommand {
             | Self::SetDone { account, .. }
             | Self::Delete { account, .. }
             | Self::Restore { account, .. } => account,
+        }
+    }
+}
+
+/// Local customer changes of the calendar owner (the fixed demo account in previews).
+pub enum CustomerCommand {
+    /// Saves a confirmed or edited customer; its domains move to it from other customers.
+    Save(Box<crate::customers::Customer>),
+    Delete {
+        account: String,
+        id: String,
+    },
+    /// The user's choice for one meeting: one customer, or not a customer meeting.
+    Choose(Box<crate::customers::Override>),
+    /// Returns a meeting to automatic detection.
+    Reset {
+        account: String,
+        occurrence: String,
+    },
+    SaveMsx {
+        account: String,
+        customer: String,
+        snapshot: Box<crate::customers::MsxSnapshot>,
+    },
+    SaveCommunication(Box<crate::customers::research::Communication>),
+}
+
+impl CustomerCommand {
+    fn account(&self) -> &str {
+        match self {
+            Self::Save(customer) => &customer.account,
+            Self::Choose(choice) => &choice.account,
+            Self::SaveCommunication(saved) => &saved.account,
+            Self::Delete { account, .. }
+            | Self::Reset { account, .. }
+            | Self::SaveMsx { account, .. } => account,
         }
     }
 }
@@ -375,6 +412,8 @@ pub struct Activity {
     pub proposals: Arc<std::collections::BTreeMap<String, crate::scheduling::Proposal>>,
     /// Proposal ID of every BLOCKER event Tomlook created and still holds, by event ID.
     pub blockers: Arc<std::collections::BTreeMap<String, String>>,
+    /// Confirmed customers, meeting choices and cached customer data of `task_account`.
+    pub customers: Arc<crate::customers::Book>,
 }
 
 pub struct Shutdown {
@@ -499,6 +538,66 @@ fn reload_tasks(store: &Store, account: Option<&str>, views: &mut TaskViews) -> 
         None => Default::default(),
     };
     Ok(())
+}
+
+/// An account's customers; the offline preview seeds its fictional customers once, with the
+/// fictional ended meeting set to Northstar to show a per-meeting choice.
+fn load_customers(
+    store: &Store,
+    account: &str,
+    calendar: &Calendar,
+    language: crate::i18n::Language,
+    demo: bool,
+) -> Result<crate::customers::Book, String> {
+    let book = store.customer_book(account)?;
+    if !demo || !book.customers.is_empty() {
+        return Ok(book);
+    }
+    let now = chrono::Utc::now();
+    let samples = crate::showcase::sample_customers(account, language, now)?;
+    for sample in &samples {
+        store.save_customer(&sample.customer)?;
+        if let Some(snapshot) = &sample.msx {
+            store.save_customer_msx(account, &sample.customer.id, snapshot)?;
+        }
+        if let Some(saved) = &sample.communication {
+            store.save_customer_communication(saved)?;
+        }
+    }
+    if let (Some(northstar), Some(event)) = (
+        samples.first(),
+        calendar
+            .events
+            .iter()
+            .find(|event| event.title == crate::showcase::ENDED_MEETING),
+    ) {
+        store.save_customer_override(&crate::customers::Override::new(
+            account,
+            event,
+            Some(northstar.customer.id.clone()),
+            now,
+        ))?;
+    }
+    store.customer_book(account)
+}
+
+/// Customers of the calendar owner; addresses of the signed-in identity are the own organization.
+fn customer_detector(
+    owner: Option<&str>,
+    identity: Option<&crate::workiq::connection::Identity>,
+    work_email: &str,
+    demo: bool,
+) -> crate::customers::Detector {
+    let mut own = vec![work_email];
+    own.extend(owner);
+    if let Some(identity) = identity {
+        own.push(&identity.account);
+        own.extend(identity.mail.as_deref());
+    }
+    crate::customers::Detector::new(
+        own,
+        demo.then_some(crate::showcase::DEMO_DOMAIN),
+    )
 }
 
 type Proposals = std::collections::BTreeMap<String, crate::scheduling::Proposal>;
@@ -1136,6 +1235,7 @@ impl Worker {
                 let mut published_recaps_revision = u64::MAX;
                 let mut task_account: Option<String> = None;
                 let mut task_views: TaskViews = Default::default();
+                let mut customer_book: Arc<crate::customers::Book> = Default::default();
                 let mut tasks_revision = 0_u64;
                 let mut published_tasks_revision = u64::MAX;
                 let mut proposals = std::collections::BTreeMap::<String, crate::scheduling::Proposal>::new();
@@ -1231,6 +1331,15 @@ impl Worker {
                             }
                         };
                         tasks_revision += 1;
+                        customer_book = match task_account.as_deref()
+                            .map(|account| load_customers(&store, account, &calendar, preferences.language, options.demo.is_some()))
+                            .transpose() {
+                            Ok(book) => Arc::new(book.unwrap_or_default()),
+                            Err(error) => {
+                                notify(Notice::Error(format!("Customers could not be loaded: {error}")));
+                                Default::default()
+                            }
+                        };
                         // Writes still waiting for their outcome in this process were not
                         // interrupted; only those of an earlier run or an ended executor were.
                         let active = |proposal: &crate::scheduling::Proposal| {
@@ -1677,6 +1786,13 @@ impl Worker {
                                                 queue.flights.get_mut(&id).ok_or("Preparation flight disappeared before translation")?.translation_only = true;
                                                 store.save_queue(&queue)?;
                                             }
+                                            let customer = (preferences.customer_context && previous.is_none())
+                                                .then_some(owner.as_deref()).flatten()
+                                                .and_then(|account| crate::customers::preparation_input(
+                                                    &customer_book,
+                                                    &customer_detector(Some(account), identity.as_deref(), &preferences.work_email, options.demo.is_some()),
+                                                    account, event))
+                                                .map(Box::new);
                                             if commands.try_send(ai::Command::Prepare(Box::new(ai::Preparation {
                                                 id, event: {
                                                     let mut event = event.clone();
@@ -1693,7 +1809,7 @@ impl Worker {
                                                         }
                                                     }
                                                     event
-                                                }, foreground: flight.foreground, account: store.calendar_owner()?, connector_revision: Some(connector_revision.clone()), previous, reply: result_sender.clone(), wake: wake.clone(),
+                                                }, foreground: flight.foreground, account: store.calendar_owner()?, connector_revision: Some(connector_revision.clone()), previous, customer, reply: result_sender.clone(), wake: wake.clone(),
                                             }))).is_err() { queue.defer(id, "SDK admission channel is unavailable; request was not sent".into()); failure = Some("SDK admission channel is unavailable".into()); }
                                         } else { queue.finish(id, Err("Meeting disappeared before dispatch".into())); }
                                     }
@@ -1736,7 +1852,7 @@ impl Worker {
                         } else { (previous.proposals.clone(), previous.blockers.clone()) };
                         let next = Activity { revision, queue: queue.clone(), index, enabled: preferences.prepare_enabled, paused: preferences.paused, error: failure.clone(), sync, recommendations: Arc::new(inbox.clone()), recommendation_view: recommendation_view.clone(), identity: identity.clone(), event_creations: Arc::new(event_creations.clone()), recaps: recap_snapshot,
                             task_account: task_account.clone(), tasks: task_views.0.clone(), followups: task_views.1.clone(), weekly_summaries: task_views.2.clone(),
-                            proposals: proposal_snapshot, blockers: blocker_snapshot,
+                            proposals: proposal_snapshot, blockers: blocker_snapshot, customers: customer_book.clone(),
                             queued: queue.jobs.values().filter(|job| job.state == crate::scheduler::State::Queued).count(),
                             deferred: queue.jobs.values().filter(|job| job.state == crate::scheduler::State::Deferred).count() };
                         *state.lock().map_err(|_| "Preparation state is unavailable")? = Arc::new(next);
@@ -2386,6 +2502,27 @@ impl Worker {
                                 .and_then(|()| store.save_weekly_summary(&saved));
                             if let Err(error) = reload_tasks(&store, task_account.as_deref(), &mut task_views) {
                                 notify(Notice::Error(error));
+                            }
+                            tasks_revision += 1;
+                            if let Err(error) = outcome { notify(Notice::Error(error)); }
+                            Ok(())
+                        }
+                        // Customer changes are local; failures are reported but never stop preparation.
+                        Command::Customer(command) => {
+                            let outcome = task_owner(&store, options.demo.is_some(), command.account())
+                                .and_then(|()| match &command {
+                                    CustomerCommand::Save(customer) => store.save_customer(customer),
+                                    CustomerCommand::Delete { account, id } => store.delete_customer(account, id).map(|_| ()),
+                                    CustomerCommand::Choose(choice) => store.save_customer_override(choice),
+                                    CustomerCommand::Reset { account, occurrence } =>
+                                        store.clear_customer_override(account, occurrence).map(|_| ()),
+                                    CustomerCommand::SaveMsx { account, customer, snapshot } =>
+                                        store.save_customer_msx(account, customer, snapshot),
+                                    CustomerCommand::SaveCommunication(saved) => store.save_customer_communication(saved),
+                                });
+                            match task_account.as_deref().map(|account| store.customer_book(account)).transpose() {
+                                Ok(book) => customer_book = Arc::new(book.unwrap_or_default()),
+                                Err(error) => { notify(Notice::Error(error)); }
                             }
                             tasks_revision += 1;
                             if let Err(error) = outcome { notify(Notice::Error(error)); }
@@ -3152,6 +3289,40 @@ mod tests {
         assert_eq!(activity.tasks.len(), 7, "Four sample tasks and three tasks imported from the sample notes");
         assert_eq!(activity.tasks.iter().filter(|task| task.source == crate::tasks::Source::MeetingNotes).count(), 3);
         assert!(activity.followups.values().all(|saved| saved.title == crate::showcase::ENDED_MEETING));
+        worker.commands.send(Command::Exit).unwrap();
+        worker.done.take().unwrap().recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    }
+
+    #[test]
+    fn offline_preview_seeds_sample_customers_and_customer_changes_stay_local_and_owned() {
+        let root = tempfile::tempdir().unwrap();
+        let mut worker = Worker::start(Options {state:root.path().join("demo"), legacy_root:root.path().join("absent"), demo:Some(200)},
+            egui::Context::default()).unwrap();
+        let read = |worker: &Worker, done: &dyn Fn(&Activity) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let activity = worker.activity.lock().unwrap().clone();
+                if done(&activity) { break activity; }
+                assert!(std::time::Instant::now() < deadline, "Customers were not published");
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let activity = read(&worker, &|activity| activity.customers.customers.len() == 2);
+        let account = crate::feedback::PREVIEW_ACCOUNT;
+        assert_eq!(activity.customers.account.as_deref(), Some(account));
+        let northstar = activity.customers.customers.values().find(|customer| customer.name == "Northstar").unwrap().clone();
+        assert!(northstar.sample && activity.customers.snapshot(&northstar).is_some_and(|snapshot| snapshot.sample));
+        assert!(activity.customers.communications.get(&northstar.id).is_some_and(|saved| saved.sample));
+        assert!(activity.customers.overrides.values().all(|choice| choice.customer.as_ref() == Some(&northstar.id)));
+        assert_eq!(activity.customers.overrides.len(), 1, "The ended sample meeting is set to Northstar");
+        let orbit = crate::customers::Customer::new(account, "Orbit", &["orbit.invalid".into()], None, chrono::Utc::now()).unwrap();
+        worker.commands.send(Command::Customer(CustomerCommand::Save(Box::new(orbit.clone())))).unwrap();
+        let intruder = crate::customers::Customer::new("intruder@example.com", "Other", &["other.example".into()], None, chrono::Utc::now()).unwrap();
+        worker.commands.send(Command::Customer(CustomerCommand::Save(Box::new(intruder)))).unwrap();
+        let activity = read(&worker, &|activity| activity.customers.customers.contains_key(&orbit.id));
+        assert_eq!(activity.customers.customers.len(), 3, "Another account's customer is refused");
+        worker.commands.send(Command::Customer(CustomerCommand::Delete { account: account.into(), id: orbit.id.clone() })).unwrap();
+        read(&worker, &|activity| !activity.customers.customers.contains_key(&orbit.id));
         worker.commands.send(Command::Exit).unwrap();
         worker.done.take().unwrap().recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
     }

@@ -494,7 +494,7 @@ fn http_reason(status: u16) -> String {
     format!("HTTP {status}: {guidance}")
 }
 
-fn transport_reason(error: &rmcp::transport::DynamicTransportError) -> String {
+pub(crate) fn transport_reason(error: &rmcp::transport::DynamicTransportError) -> String {
     use rmcp::transport::streamable_http_client::StreamableHttpError;
     let Some(error) = error
         .error

@@ -6,6 +6,7 @@ pub(super) enum PaletteCommand {
     Today,
     MyDay,
     WeeklyReview,
+    Customers,
     Search,
     Ask,
     Tasks,
@@ -28,6 +29,7 @@ impl PaletteCommand {
             Self::Today => "Go to today",
             Self::MyDay => "My day",
             Self::WeeklyReview => "Weekly review",
+            Self::Customers => "Customers",
             Self::Search => "Search meetings",
             Self::Ask => "Ask a question",
             Self::Tasks => "Open tasks",
@@ -57,6 +59,7 @@ pub(super) fn command_matches_in(query: &str, language: tomlook::i18n::Language)
         PaletteCommand::Today,
         PaletteCommand::MyDay,
         PaletteCommand::WeeklyReview,
+        PaletteCommand::Customers,
         PaletteCommand::Search,
         PaletteCommand::Ask,
         PaletteCommand::Tasks,
@@ -102,6 +105,7 @@ impl Tomlook {
             PaletteCommand::Today => self.go_today(),
             PaletteCommand::MyDay => self.open_myday(),
             PaletteCommand::WeeklyReview => self.open_weekly(None),
+            PaletteCommand::Customers => self.open_customers(None, None),
             PaletteCommand::Search => {
                 self.focus_search = true;
                 context.request_repaint();

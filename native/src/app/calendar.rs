@@ -91,6 +91,7 @@ impl Tomlook {
                 || self.meeting_menu.take().is_some()
                 || self.date_drag.take().is_some()
                 || self.tasks.editing.take().is_some()
+                || self.customers.confirm.take().is_some()
             {
                 context.request_repaint();
             } else if self.palette {
@@ -99,6 +100,8 @@ impl Tomlook {
                 self.tasks_open = false;
             } else if self.weekly.open {
                 self.weekly.open = false;
+            } else if self.customers.open {
+                self.customers.open = false;
             } else if self.myday.open {
                 self.myday.open = false;
             } else if self.insights_expanded {
@@ -144,6 +147,8 @@ impl Tomlook {
             || self.tasks_open
             || self.myday.open
             || self.weekly.open
+            || self.customers.open
+            || self.customers.confirm.is_some()
             || self.meeting_action.is_some()
             || self.event_draft.is_some()
             || self.find_time.is_some()

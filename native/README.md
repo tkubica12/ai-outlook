@@ -49,7 +49,7 @@ have loaded. It cannot be used in production or combined with measurements.
 Only the demo window content is captured, not other desktop windows or the
 Windows title bar. PNG encoding and exclusive-create file output run on the
 bounded storage worker. Existing images are never overwritten.
-`--demo-scene <details|feedback|prompts|tasks|followup|myday|notifications|weekly|invite|findtime|teams>` chooses what that screenshot shows:
+`--demo-scene <details|feedback|prompts|tasks|followup|myday|notifications|weekly|invite|findtime|teams|customer>` chooses what that screenshot shows:
 the default details pane, expanded Insights with a saved rating and an open
 reason panel, **Settings > AI prompts** after fictional sample feedback is
 saved into the isolated demo profile through the normal storage path, the
@@ -79,7 +79,14 @@ Insights replaces the empty day. Demo all-day items are shown as free, like
 Outlook's default. The demo also fills the two previous weeks (synced, for the
 weekly review's comparison), gives meetings fictional invitation texts (real
 agendas, empty descriptions and Teams join blocks only) and adds a fictional
-customer contact to customer meetings.
+customer contact to customer meetings. `customer` opens the customer timeline
+of the fictional customer Northstar next to the workshop's details: its
+meetings, the sample notes and tasks of the ended pilot planning (set to
+Northstar for that meeting), fictional MSX opportunities and milestones, a
+fictional Azure consumption chart and a fictional communication summary, all
+marked as sample data. Cedar is a confirmed local customer without MSX and Orbit
+stays an unconfirmed customer. The demo never reads MSX or Power BI and never
+asks AI.
 
 ## Native interaction measurement
 
@@ -1412,7 +1419,7 @@ granting any new collection scope.
 
 ### WebIQ and GitHub sign-in
 
-The bottom status bar uses frameless clickable text for GitHub Copilot, Foundry, WorkIQ, WebIQ,
+The bottom status bar uses frameless clickable text for GitHub Copilot, Foundry, WorkIQ, MSX, WebIQ,
 GitHub and activity. Hover underlines and keyboard-focus outlines preserve
 discoverability without permanent gray button boxes. The neutral inbox bell
 also remains clickable without a filled box.
@@ -1586,6 +1593,155 @@ The separate window uses a deferred viewport: typing repaints that window, not
 the calendar. Its bounded action channel and shared view use nonblocking access;
 final notices update the chat even when the main window is hidden. Animation
 repaints only a visible Ask surface; streaming preparation runs on the executor.
+
+### MSX and Azure consumption
+
+The **MSX** status-bar entry connects read-only to the Microsoft sales Dataverse
+(`https://microsoftsales.crm.dynamics.com/api/mcp`) and the Fabric Power BI MCP
+(`https://api.fabric.microsoft.com/v1/mcp/powerbi`). **Settings > MSX** can turn
+it off entirely and holds the Microsoft Entra tenant (default
+`72f988bf-86f1-41af-91ab-2d7cd011db47`).
+
+- **Authentication.** Tokens for `https://microsoftsales.crm.dynamics.com` and
+  `https://analysis.windows.net/powerbi/api` come from the machine-wide MSI
+  Azure CLI (`az account get-access-token --resource … --tenant …`), run through
+  its own isolated Python without a shell. They stay in memory, the tenant (and
+  the token's own `tid`) must match, and they are renewed silently five minutes
+  before expiry. A background read waits at most 20 seconds; on timeout or an
+  interaction-required error the status becomes **sign-in required** and the
+  CLI is not started again until you act. Only **Sign in to MSX** (browser or
+  Windows/WAM prompt, `az login --tenant … --scope <resource>/.default`) or
+  **Use device code** starts an interactive, cancellable and bounded sign-in;
+  both may change Azure CLI's default account, as any `az login` does.
+  **Disconnect** forgets Tomlook's in-memory tokens only; nothing reconnects in
+  that session until you check the connection or sign in again. With MSX
+  enabled, startup performs one quiet token check and otherwise stays idle.
+- **Reads.** Tools are discovered at connection time and only allowlisted
+  read tools are ever called (Dataverse `read_query`, `describe`, `search`,
+  `search_data`; Power BI `ExecuteQuery`, `GetSemanticModelSchema` and other
+  query/report/schema reads). Create, update, delete, upload and refresh tools
+  are never invoked. Responses are limited to 2 MiB per call, a 60-second
+  deadline and bounded rows; transient connection failures reconnect with the
+  usual 30-second to 15-minute backoff, authentication failures do not.
+- **Typed data** (`tomlook::msx`): the signed-in `systemuser` (resolved from the
+  token's Entra object ID or sign-in name, and resolved again when a new token
+  belongs to another account); customer account candidates for e-mail domains
+  and company names with a confidence score and evidence
+  (website domain, contact e-mail domain, name similarity), never selected
+  silently when ambiguous and always requiring user confirmation; open
+  opportunities, active future `msp_engagementmilestone` records and the
+  user's own milestone tasks (`has_user_task` is unknown, not false, when the
+  user cannot be resolved or results are truncated); and monthly ACR from
+  `AzureBlueSubscriptionSL4` labelled as completed, current partial or model
+  prediction, in USD, with the latest month and retrieval time. Every result
+  carries its table/query and `retrieved_at`. Column names are discovered with
+  `describe` and cached for the session. Domains are normalized to ASCII and
+  quotes, wildcards and statements are escaped or rejected.
+- **AI tools.** When MSX is connected, Thorough Ask (including Auto routed to
+  Thorough) and meeting preparation get `tomlook_msx_describe`,
+  `tomlook_msx_query` (one SELECT without subqueries, at most 50 rows: `TOP` is
+  added after `DISTINCT`/`ALL` or capped at 50; every table in `FROM` and
+  `JOIN ... ON` must be one of `account`, `contact`, `opportunity`,
+  `msp_engagementmilestone`, `task` and `systemuser`, and comma joins, `APPLY`,
+  `UNION` and qualified or bracketed names are rejected) and
+  `tomlook_acr_query` (one DAX `EVALUATE`, at most 200 rows, fixed model).
+  Results are bounded to 60,000 bytes and marked untrusted; they spend the
+  remote-read budget (six MSX reads per preparation). There is no write tool.
+
+`msx-probe [tenant-id]` is a non-interactive diagnostic: one bounded token read
+per resource, tool discovery, user resolution and a `TOP 1` read. It prints tool
+names, row counts and column names only, never tokens or customer values.
+
+### Customer context
+
+A customer is a durable, user-confirmed association of one or more e-mail
+domains with a name and, optionally, an MSX account (ID, name and TPID). It is
+stored locally per calendar account (`customers`, `customer_domains`,
+`customer_overrides` and `customer_cache` in `tomlook.db`) and never written to
+MSX or any other service.
+
+- **Detection.** Attendees and the organizer are grouped by e-mail domain. A
+  domain is external unless it is (a subdomain of, or a parent of) one of your
+  own domains, taken from the calendar owner, the signed-in WorkIQ identity and
+  the work e-mail; consumer mail (gmail.com, outlook.com, hotmail.com,
+  seznam.cz and similar) is never a customer, and when you sign in with a
+  Microsoft domain, Microsoft-owned domains (GitHub, LinkedIn and others) are
+  internal too. An external domain maps to the confirmed customer whose domain
+  covers it (the most specific domain wins); a meeting can have several
+  customers. Anything else is shown as **Unconfirmed customer: domain**.
+- **Confirmation.** **Confirm customer** opens a dialog with an editable name
+  and domains. When MSX is connected it searches account candidates (Part A
+  lookup by website, contact domain and name) and shows each with its
+  confidence, TPID, owner and evidence; a clearly leading candidate is
+  preselected and marked **Likely match**, but nothing is linked or saved until
+  you click **Confirm**. Without MSX you confirm a local customer and can link
+  MSX later. You can also add the domain to an existing customer. A domain
+  belongs to one customer at a time. **Edit**, **Unlink MSX** and **Remove
+  customer** are in the customer panel. Per meeting, **Not a customer
+  meeting** or **Only this customer** overrides detection for that occurrence;
+  **Detect automatically** returns to automatic detection.
+- **Customer panel.** Open it from the **Customers in this meeting** card in
+  meeting details, by clicking a company icon or name there, from the command
+  palette (**Customers**) or from Settings > MSX. It is computed from local caches on
+  open (at most once a minute) and shows: the header (name, domains, linked MSX
+  account with TPID, **Open in MSX** only as a safe HTTPS record URL on the
+  Dataverse organization, last MSX refresh and **Refresh**); **Meetings** from
+  the local calendar (one month back, six months ahead) with notes and Insights
+  badges, meetings and hours together in the last 90 days and the next
+  meeting; **Notes and decisions** from the newest saved post-meeting notes
+  (summary, decisions, discussion and your tasks, bounded); **Tasks from these
+  meetings** with checkboxes; **MSX** open opportunities (stage, estimated
+  close, owner), active future milestones (status, due date, owner and *my
+  task: yes/no/unknown*) and your milestone tasks; and **Azure consumption** as
+  a monthly bar chart of the last 12 months drawn with the egui painter:
+  filled completed months, a lighter outlined current partial month and dashed
+  model predictions, with unit, dataset and the latest month with data.
+- **MSX states.** The section says explicitly whether MSX is off, the customer
+  is not linked, you are not signed in (with **Open MSX connection**; a saved
+  read stays visible and is labelled), the read is loading, unavailable or
+  partial (truncated lists, an unknown task check or unavailable consumption).
+  "None found" is only said after a complete read; a failed or truncated read
+  is never shown as no opportunities or milestones. While MSX is connected, a
+  saved read older than an hour is refreshed once per session when the panel
+  shows it; reads run on the AI executor with a 150-second bound, never start a
+  sign-in and are saved locally with their retrieval time.
+- **Recent communication.** **Find related communication** sends one
+  Thorough-profile request whose session has only the WorkIQ mail/calendar read
+  and workplace search tools (mail, Teams and meetings), at most 12 reads and
+  300 seconds. It searches the last 60 days of communication with the
+  customer's people and domains, focused on the meeting the panel was opened
+  from or the next one, and must return strict JSON: items (mail, Teams or
+  meeting, date, people, subject, one-line summary, why it matters, link or
+  ID), open questions, commitments by you or them, risks and coverage gaps.
+  Links and IDs are kept only when a successful tool result returned exactly
+  that link (compared after URL normalization) or item ID (`id`,
+  `internetMessageId`, `chatId`, `messageId` or the read item's path) and the
+  link is a safe source URL; words or collection paths that merely occur in a
+  result do not count. Others are removed and counted, and such items
+  are marked as not among the retrieved results. The request counts toward the
+  daily AI limit and telemetry, can be cancelled and is disabled with a reason
+  when GitHub Copilot or WorkIQ is not connected or in the demo. The last result
+  of each customer is kept locally.
+- **Preparation.** With **Settings > MSX > Add customer context to meeting
+  preparation** (on by default), preparing a meeting with confirmed customers
+  (at most two) appends a `CUSTOMER_CONTEXT` block of at most 4 KiB to the
+  preparation prompt: customer, domains, MSX account, top open opportunities,
+  next milestones with status and dates, the labelled ACR trend and the last
+  communication summary, all marked as untrusted data with record URLs and
+  retrieval times, followed by guidance to connect the meeting to relevant
+  opportunities and milestones only with cited evidence and never to treat a
+  failed or truncated read as absence. MSX is read at preparation time (45
+  seconds, only when already connected); otherwise the block says that nothing
+  was read. Cancelling during these reads ends the preparation before any AI
+  session or WorkIQ read starts. The block is not part of the meeting data, so
+  the scheduler fingerprint and the analysis revision do not change and
+  existing meetings are not prepared again because of a customer association.
+  Translations and meeting notes never get the block. Cited MSX records appear
+  as ordinary Insights sources.
+- **Privacy.** Customer names, domains, MSX reads and communication summaries
+  stay in the local profile. Company icons are fetched only for public domains
+  from the company's own website, as before. The communication research never
+  uses public web search, and customer terms are protected from it.
 
 ### Ask profiles, cache and durable research
 

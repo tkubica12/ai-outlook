@@ -31,6 +31,9 @@ pub enum Scene {
     FindTime,
     /// **Find a time** with the Teams proposal approval preview (never sent).
     Teams,
+    /// The customer panel of the fictional customer Northstar with sample MSX data, Azure
+    /// consumption and a sample communication summary, next to the workshop's details.
+    Customer,
 }
 
 impl Scene {
@@ -47,7 +50,8 @@ impl Scene {
             "invite" => Ok(Self::Invite),
             "findtime" => Ok(Self::FindTime),
             "teams" => Ok(Self::Teams),
-            _ => Err("--demo-scene must be details, feedback, prompts, tasks, followup, myday, notifications, weekly, invite, findtime or teams".into()),
+            "customer" => Ok(Self::Customer),
+            _ => Err("--demo-scene must be details, feedback, prompts, tasks, followup, myday, notifications, weekly, invite, findtime, teams or customer".into()),
         }
     }
 
@@ -1187,6 +1191,287 @@ pub fn sample_followup(
     );
     saved.validate()?;
     Ok(saved)
+}
+
+/// The reserved e-mail domain of the demo user and the fictional colleagues.
+pub const DEMO_DOMAIN: &str = "example.invalid";
+/// The fictional customer the `customer` scene opens.
+pub const SAMPLE_CUSTOMER: &str = "Northstar";
+
+/// One fictional customer of the preview with its sample MSX data and communication summary.
+pub struct SampleCustomer {
+    pub customer: crate::customers::Customer,
+    pub msx: Option<crate::customers::MsxSnapshot>,
+    pub communication: Option<crate::customers::research::Communication>,
+}
+
+/// Fictional customers of the preview: Northstar is linked to a fictional MSX account with sample
+/// opportunities, milestones and Azure consumption; Cedar is a local customer without MSX; Orbit
+/// stays unconfirmed. Nothing here comes from MSX, Power BI or AI.
+pub fn sample_customers(
+    account: &str,
+    language: crate::i18n::Language,
+    now: DateTime<Utc>,
+) -> Result<Vec<SampleCustomer>, String> {
+    use crate::customers::{
+        Consumption, Customer, Dataverse, MilestoneRow, MonthKind, MonthRow, MsxAccount,
+        MsxSnapshot, OpportunityRow, SourceRow, TaskRow,
+        research::{Commitment, Communication, Item, Kind, Side},
+    };
+    let czech = language == crate::i18n::Language::Cs;
+    let text = |english: &str, czech_text: &str| -> String {
+        (if czech { czech_text } else { english }).to_owned()
+    };
+    let today = Local::now().date_naive();
+    let day = |days: i64| Some(today + Duration::days(days));
+    let account_id = "00000000-0000-4000-8000-00000000a001";
+    let mut northstar = Customer::new(
+        account,
+        SAMPLE_CUSTOMER,
+        &["northstar.invalid".into()],
+        Some(MsxAccount {
+            id: account_id.into(),
+            name: "Northstar Holdings (sample)".into(),
+            tpid: Some("1000001".into()),
+            confidence: Some(0.82),
+        }),
+        now,
+    )?;
+    northstar.sample = true;
+    let mut cedar = Customer::new(account, "Cedar", &["cedar.invalid".into()], None, now)?;
+    cedar.sample = true;
+    let retrieved = now - Duration::hours(2);
+    let source = |table: &str, rows: usize| SourceRow {
+        system: "Dataverse (sample)".into(),
+        table: table.into(),
+        rows,
+        truncated: false,
+        retrieved_at: retrieved,
+    };
+    let current = today.with_day(1).ok_or("Invalid demo month")?;
+    let month = |offset: i32| {
+        if offset >= 0 {
+            current.checked_add_months(chrono::Months::new(offset as u32))
+        } else {
+            current.checked_sub_months(chrono::Months::new(offset.unsigned_abs()))
+        }
+        .ok_or("Invalid demo month")
+    };
+    const ACTUAL: [f64; 11] = [
+        8_200.0, 8_650.0, 8_400.0, 9_100.0, 9_800.0, 10_250.0, 10_900.0, 11_400.0, 11_150.0,
+        12_300.0, 12_950.0,
+    ];
+    let mut months = Vec::new();
+    for (index, value) in ACTUAL.iter().enumerate() {
+        months.push(MonthRow {
+            month: month(index as i32 - 11)?,
+            value: *value,
+            kind: MonthKind::Actual,
+        });
+    }
+    months.push(MonthRow {
+        month: current,
+        value: 6_100.0,
+        kind: MonthKind::Partial,
+    });
+    for (offset, value) in [(0, 13_400.0), (1, 13_900.0)] {
+        months.push(MonthRow {
+            month: month(offset)?,
+            value,
+            kind: MonthKind::Prediction,
+        });
+    }
+    let snapshot = MsxSnapshot {
+        account_id: account_id.into(),
+        retrieved_at: retrieved,
+        sample: true,
+        dataverse: Dataverse::Loaded {
+            opportunities: vec![
+                OpportunityRow {
+                    name: text("Intake workflow pilot (sample)", "Pilot příjmu požadavků (ukázka)"),
+                    stage: Some(text("2 - Qualify", "2 - Kvalifikace")),
+                    close: day(45),
+                    owner: Some("Taylor Quinn".into()),
+                    url: None,
+                },
+                OpportunityRow {
+                    name: text("Support renewal (sample)", "Obnova podpory (ukázka)"),
+                    stage: Some(text("3 - Solution & propose", "3 - Řešení a nabídka")),
+                    close: day(30),
+                    owner: Some("Alex Rivers".into()),
+                    url: None,
+                },
+                OpportunityRow {
+                    name: text("Phase two rollout (sample)", "Nasazení druhé fáze (ukázka)"),
+                    stage: Some(text("1 - Listen & consult", "1 - Naslouchání a konzultace")),
+                    close: day(120),
+                    owner: Some("Jamie Brooks".into()),
+                    url: None,
+                },
+            ],
+            opportunities_truncated: false,
+            milestones: vec![
+                MilestoneRow {
+                    name: text("Pilot success criteria agreed", "Kritéria úspěchu pilotu odsouhlasena"),
+                    status: Some(text("On track", "Podle plánu")),
+                    due: day(7),
+                    owner: Some("Taylor Quinn".into()),
+                    workload: Some("Azure AI".into()),
+                    my_task: Some(true),
+                    url: None,
+                },
+                MilestoneRow {
+                    name: text("Architecture decision record", "Záznam architektonického rozhodnutí"),
+                    status: Some(text("At risk", "Ohroženo")),
+                    due: day(14),
+                    owner: Some("Morgan Lee".into()),
+                    workload: Some("App Innovation".into()),
+                    my_task: Some(false),
+                    url: None,
+                },
+                MilestoneRow {
+                    name: text("Pilot go-live", "Spuštění pilotu"),
+                    status: Some(text("Not started", "Nezahájeno")),
+                    due: day(35),
+                    owner: Some("Jamie Brooks".into()),
+                    workload: Some("Azure AI".into()),
+                    my_task: None,
+                    url: None,
+                },
+            ],
+            milestones_truncated: false,
+            tasks: vec![TaskRow {
+                subject: text(
+                    "Send the pilot success criteria to Northstar",
+                    "Poslat Northstaru kritéria úspěchu pilotu",
+                ),
+                due: day(5),
+                state: Some(text("Open", "Otevřený")),
+                milestone: Some(text("Pilot success criteria agreed", "Kritéria úspěchu pilotu odsouhlasena")),
+                url: None,
+            }],
+            tasks_note: None,
+            sources: vec![
+                source("opportunity", 3),
+                source("msp_engagementmilestone", 3),
+                source("task", 1),
+            ],
+        },
+        consumption: Consumption::Available {
+            months,
+            unit: "USD".into(),
+            dataset: "AzureBlueSubscriptionSL4 (sample)".into(),
+            latest_month: Some(current),
+            matched_by: "TPID".into(),
+            prediction_note: text(
+                "Sample prediction; fictional.",
+                "Ukázková předpověď; smyšlená.",
+            ),
+        },
+    };
+    let item = |kind, days: i64, people: &[&str], subject: (&str, &str), summary: (&str, &str), why: (&str, &str)| Item {
+        kind,
+        date: day(-days),
+        people: people.iter().map(|person| (*person).to_owned()).collect(),
+        subject: text(subject.0, subject.1),
+        summary: text(summary.0, summary.1),
+        why_relevant: text(why.0, why.1),
+        url: None,
+        source_id: None,
+        verified: false,
+    };
+    let communication = Communication {
+        account: account.into(),
+        customer: northstar.id.clone(),
+        created_at: now - Duration::hours(20),
+        days: crate::customers::research::DAYS,
+        topic: Some("Northstar / Architecture workshop".into()),
+        language,
+        items: vec![
+            item(
+                Kind::Mail,
+                3,
+                &["Dana Novak"],
+                ("Pilot scope and success criteria", "Rozsah pilotu a kritéria úspěchu"),
+                (
+                    "Dana confirmed the three pilot success criteria and asked when reporting arrives.",
+                    "Dana potvrdila tři kritéria úspěchu pilotu a ptala se, kdy přijde reporting.",
+                ),
+                (
+                    "The workshop agenda agrees on the success criteria.",
+                    "Agenda workshopu počítá s odsouhlasením kritérií úspěchu.",
+                ),
+            ),
+            item(
+                Kind::Teams,
+                6,
+                &["Dana Novak", "Alex Rivers"],
+                ("Northstar pilot chat", "Chat k pilotu Northstar"),
+                (
+                    "Alex shared the prototype recording; Dana's team will try it before the workshop.",
+                    "Alex nasdílel záznam prototypu; Danin tým ho před workshopem vyzkouší.",
+                ),
+                (
+                    "The workshop demos the prototype.",
+                    "Na workshopu se prototyp předvádí.",
+                ),
+            ),
+            item(
+                Kind::Meeting,
+                14,
+                &["Dana Novak", "Jamie Brooks"],
+                ("Northstar / Pilot planning", "Northstar / Pilot planning"),
+                (
+                    "A two-week pilot was agreed; the pilot owner is still open.",
+                    "Byl dohodnut dvoutýdenní pilot; vlastník pilotu je stále otevřený.",
+                ),
+                (
+                    "The open owner affects the go-live milestone.",
+                    "Nevyjasněný vlastník ovlivňuje milník spuštění pilotu.",
+                ),
+            ),
+        ],
+        open_questions: vec![text(
+            "Who owns the pilot on the Northstar side?",
+            "Kdo za Northstar převezme odpovědnost za pilot?",
+        )],
+        commitments: vec![
+            Commitment {
+                by: Side::Me,
+                text: text(
+                    "Send a one-page summary of the success criteria",
+                    "Poslat jednostránkové shrnutí kritérií úspěchu",
+                ),
+                due: day(2),
+            },
+            Commitment {
+                by: Side::Them,
+                text: text("Share the pilot test data set", "Nasdílet testovací data pro pilot"),
+                due: day(5),
+            },
+        ],
+        risks: vec![text(
+            "The phase-two budget is not confirmed yet.",
+            "Rozpočet druhé fáze zatím není potvrzený.",
+        )],
+        gaps: Vec::new(),
+        dropped_sources: 0,
+        sample: true,
+    };
+    snapshot.validate()?;
+    communication.validate()?;
+    Ok(vec![
+        SampleCustomer {
+            customer: northstar,
+            msx: Some(snapshot),
+            communication: Some(communication),
+        },
+        SampleCustomer {
+            customer: cedar,
+            msx: None,
+            communication: None,
+        },
+    ])
 }
 
 pub fn save_screenshot(

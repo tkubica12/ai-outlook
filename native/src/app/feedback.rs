@@ -767,6 +767,24 @@ impl Tomlook {
                 }
                 ready && self.demo_frames > 8
             }
+            Scene::Customer => {
+                let customer = self
+                    .customer_book()
+                    .customers
+                    .values()
+                    .find(|customer| customer.name == tomlook::showcase::SAMPLE_CUSTOMER)
+                    .map(|customer| customer.id.clone());
+                let Some(id) = customer else {
+                    self.demo_frames = 0;
+                    return false;
+                };
+                if !self.customers.open || self.customers.selected.as_ref() != Some(&id) {
+                    let meeting = self.selected.map(|index| self.calendar.events[index].id.clone());
+                    self.open_customers(Some(id), meeting);
+                    self.demo_frames = 0;
+                }
+                self.demo_frames > 10
+            }
         }
     }
 }

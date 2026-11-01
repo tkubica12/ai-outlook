@@ -74,6 +74,14 @@ pub struct Preferences {
     pub weekly_review_day: u8,
     /// Minutes after local midnight of the weekly review notification.
     pub weekly_review_time: u16,
+    /// MSX (Dataverse) and Azure consumption (Power BI). Idle until the user signs in or a
+    /// cached Azure CLI token exists.
+    pub msx_enabled: bool,
+    /// Microsoft Entra tenant of the MSX sign-in.
+    pub msx_tenant: String,
+    /// Meeting preparation of confirmed customer meetings adds a bounded customer context
+    /// (MSX, Azure consumption and cached communication) read at preparation time.
+    pub customer_context: bool,
 }
 
 impl Default for Preferences {
@@ -105,11 +113,21 @@ impl Default for Preferences {
             weekly_review: true,
             weekly_review_day: crate::weekly::DEFAULT_DAY,
             weekly_review_time: crate::weekly::DEFAULT_TIME,
+            msx_enabled: true,
+            msx_tenant: crate::msx::DEFAULT_TENANT.into(),
+            customer_context: true,
         }
     }
 }
 
 impl Preferences {
+    pub fn msx(&self) -> crate::msx::Settings {
+        crate::msx::Settings {
+            enabled: self.msx_enabled,
+            tenant: self.msx_tenant.clone(),
+        }
+    }
+
     pub fn sources(&self) -> crate::source_index::Config {
         crate::source_index::Config {
             folders: self.context_folders.clone(),
@@ -562,7 +580,20 @@ impl Store {
                  CREATE TABLE IF NOT EXISTS proposals(
                    id TEXT PRIMARY KEY,account TEXT NOT NULL,status TEXT NOT NULL,
                    created_at TEXT NOT NULL,updated_at TEXT NOT NULL,payload TEXT NOT NULL);
-                 CREATE INDEX IF NOT EXISTS proposals_by_account ON proposals(account,created_at);",
+                 CREATE INDEX IF NOT EXISTS proposals_by_account ON proposals(account,created_at);
+                 CREATE TABLE IF NOT EXISTS customers(
+                   account TEXT NOT NULL,id TEXT NOT NULL,updated_at TEXT NOT NULL,
+                   payload TEXT NOT NULL,PRIMARY KEY(account,id));
+                 CREATE TABLE IF NOT EXISTS customer_domains(
+                   account TEXT NOT NULL,domain TEXT NOT NULL,customer TEXT NOT NULL,
+                   PRIMARY KEY(account,domain));
+                 CREATE TABLE IF NOT EXISTS customer_overrides(
+                   account TEXT NOT NULL,occurrence TEXT NOT NULL,customer TEXT,
+                   updated_at TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(account,occurrence));
+                 CREATE TABLE IF NOT EXISTS customer_cache(
+                   account TEXT NOT NULL,customer TEXT NOT NULL,kind TEXT NOT NULL,
+                   updated_at TEXT NOT NULL,payload TEXT NOT NULL,
+                   PRIMARY KEY(account,customer,kind));",
             )
             .map_err(|e| e.to_string())?;
         Ok(Self {
@@ -589,6 +620,7 @@ impl Store {
 
     pub fn save_preferences(&self, preferences: &Preferences) -> Result<()> {
         preferences.prompts.validate()?;
+        crate::msx::validate_tenant(&preferences.msx_tenant)?;
         let json = serde_json::to_string(preferences).map_err(|e| e.to_string())?;
         self.connection
             .execute(
@@ -1967,6 +1999,338 @@ impl Store {
         transaction
             .commit()
             .map_err(|_| "Commit weekly summary failed".into())
+    }
+
+    /// An account's confirmed customers with their domains, per-meeting choices and cached MSX
+    /// and communication data. A damaged cache entry is skipped; it is only a cache.
+    pub fn customer_book(&self, account: &str) -> Result<crate::customers::Book> {
+        use crate::customers::{Book, CACHE_LIMIT, CUSTOMER_LIMIT, Customer, OVERRIDE_LIMIT};
+        let mut book = Book {
+            account: Some(account.into()),
+            ..Default::default()
+        };
+        let read = |sql: &str, limit: usize| -> Result<Vec<(String, Option<String>, String)>> {
+            let mut statement = self
+                .connection
+                .prepare(sql)
+                .map_err(|_| "Read customers failed")?;
+            statement
+                .query_map(params![account, limit as i64], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|_| "Read customers failed")?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| "Read customers failed".into())
+        };
+        let owners = read(
+            "SELECT domain,customer,'' FROM customer_domains WHERE account=?1 LIMIT ?2",
+            CUSTOMER_LIMIT * crate::customers::DOMAIN_LIMIT,
+        )?
+        .into_iter()
+        .map(|(domain, customer, _)| (domain, customer.unwrap_or_default()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+        for (id, _, payload) in read(
+            "SELECT id,NULL,payload FROM customers WHERE account=?1 ORDER BY updated_at DESC LIMIT ?2",
+            CUSTOMER_LIMIT,
+        )? {
+            if payload.len() > 64 * 1024 {
+                return Err("Saved customer exceeds its safety limit".into());
+            }
+            let mut customer: Customer =
+                serde_json::from_str(&payload).map_err(|_| "Saved customer is invalid")?;
+            customer
+                .domains
+                .retain(|domain| owners.get(domain) == Some(&customer.id));
+            customer.validate()?;
+            if customer.id != id || customer.account != account {
+                return Err("Saved customer does not match its account".into());
+            }
+            book.customers.insert(id, customer);
+        }
+        for (occurrence, _, payload) in read(
+            "SELECT occurrence,NULL,payload FROM customer_overrides WHERE account=?1
+             ORDER BY updated_at DESC LIMIT ?2",
+            OVERRIDE_LIMIT,
+        )? {
+            let Ok(choice) = serde_json::from_str::<crate::customers::Override>(&payload) else {
+                continue;
+            };
+            if choice.validate().is_ok()
+                && choice.account == account
+                && choice.occurrence == occurrence
+                && choice
+                    .customer
+                    .as_ref()
+                    .is_none_or(|id| book.customers.contains_key(id))
+            {
+                book.overrides.insert(occurrence, choice);
+            }
+        }
+        for (customer, kind, payload) in read(
+            "SELECT customer,kind,payload FROM customer_cache WHERE account=?1 LIMIT ?2",
+            CUSTOMER_LIMIT * 2,
+        )? {
+            if payload.len() > CACHE_LIMIT || !book.customers.contains_key(&customer) {
+                continue;
+            }
+            match kind.as_deref() {
+                Some("msx") => {
+                    if let Ok(snapshot) =
+                        serde_json::from_str::<crate::customers::MsxSnapshot>(&payload)
+                        && snapshot.validate().is_ok()
+                    {
+                        book.msx.insert(customer, snapshot);
+                    }
+                }
+                Some("communication") => {
+                    if let Ok(saved) = serde_json::from_str::<
+                        crate::customers::research::Communication,
+                    >(&payload)
+                        && saved.validate().is_ok()
+                        && saved.account == account
+                        && saved.customer == customer
+                    {
+                        book.communications.insert(customer, saved);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(book)
+    }
+
+    /// Saves a customer the user confirmed or edited. Its domains move to it from any other
+    /// customer of the account; a domain belongs to one customer at a time.
+    pub fn save_customer(&self, customer: &crate::customers::Customer) -> Result<()> {
+        customer.validate()?;
+        let payload = serde_json::to_string(customer).map_err(|_| "Encode customer failed")?;
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| "Begin customer storage failed")?;
+        let others: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM customers WHERE account=?1 AND id<>?2",
+                params![customer.account, customer.id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Read customers failed")?;
+        if others >= crate::customers::CUSTOMER_LIMIT as i64 {
+            return Err("At most 1,000 customers can be saved".into());
+        }
+        for domain in &customer.domains {
+            let owner: Option<String> = transaction
+                .query_row(
+                    "SELECT customer FROM customer_domains WHERE account=?1 AND domain=?2",
+                    params![customer.account, domain],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| "Read customer domains failed")?;
+            let Some(owner) = owner.filter(|owner| *owner != customer.id) else {
+                continue;
+            };
+            let previous: Option<String> = transaction
+                .query_row(
+                    "SELECT payload FROM customers WHERE account=?1 AND id=?2",
+                    params![customer.account, owner],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| "Read customers failed")?;
+            if let Some(previous) = previous {
+                let mut other: crate::customers::Customer =
+                    serde_json::from_str(&previous).map_err(|_| "Saved customer is invalid")?;
+                other.domains.retain(|own| own != domain);
+                other.updated_at = customer.updated_at.max(other.created_at);
+                transaction
+                    .execute(
+                        "UPDATE customers SET updated_at=?3,payload=?4 WHERE account=?1 AND id=?2",
+                        params![
+                            other.account,
+                            other.id,
+                            feedback_time(other.updated_at),
+                            serde_json::to_string(&other).map_err(|_| "Encode customer failed")?
+                        ],
+                    )
+                    .map_err(|_| "Save customer failed")?;
+            }
+        }
+        transaction
+            .execute(
+                "DELETE FROM customer_domains WHERE account=?1 AND customer=?2",
+                params![customer.account, customer.id],
+            )
+            .map_err(|_| "Save customer failed")?;
+        for domain in &customer.domains {
+            transaction
+                .execute(
+                    "INSERT INTO customer_domains VALUES(?1,?2,?3)
+                     ON CONFLICT(account,domain) DO UPDATE SET customer=excluded.customer",
+                    params![customer.account, domain, customer.id],
+                )
+                .map_err(|_| "Save customer domains failed")?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO customers VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(account,id) DO UPDATE SET updated_at=excluded.updated_at,payload=excluded.payload",
+                params![customer.account, customer.id, feedback_time(customer.updated_at), payload],
+            )
+            .map_err(|_| "Save customer failed")?;
+        transaction
+            .commit()
+            .map_err(|_| "Commit customer failed".into())
+    }
+
+    /// Removes a customer with its domains, meeting choices and cached data.
+    pub fn delete_customer(&self, account: &str, id: &str) -> Result<bool> {
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| "Begin customer removal failed")?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM customers WHERE account=?1 AND id=?2",
+                params![account, id],
+            )
+            .map_err(|_| "Remove customer failed")?;
+        for sql in [
+            "DELETE FROM customer_domains WHERE account=?1 AND customer=?2",
+            "DELETE FROM customer_overrides WHERE account=?1 AND customer=?2",
+            "DELETE FROM customer_cache WHERE account=?1 AND customer=?2",
+        ] {
+            transaction
+                .execute(sql, params![account, id])
+                .map_err(|_| "Remove customer failed")?;
+        }
+        transaction
+            .commit()
+            .map_err(|_| "Commit customer removal failed")?;
+        Ok(removed > 0)
+    }
+
+    /// Saves the user's choice for one meeting; the oldest choices beyond the limit are removed.
+    pub fn save_customer_override(&self, choice: &crate::customers::Override) -> Result<()> {
+        choice.validate()?;
+        if let Some(customer) = &choice.customer {
+            let known: Option<i64> = self
+                .connection
+                .query_row(
+                    "SELECT 1 FROM customers WHERE account=?1 AND id=?2",
+                    params![choice.account, customer],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| "Read customers failed")?;
+            if known.is_none() {
+                return Err("This customer no longer exists".into());
+            }
+        }
+        let payload = serde_json::to_string(choice).map_err(|_| "Encode meeting choice failed")?;
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(|_| "Begin meeting choice storage failed")?;
+        transaction
+            .execute(
+                "INSERT INTO customer_overrides VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(account,occurrence) DO UPDATE SET customer=excluded.customer,
+                   updated_at=excluded.updated_at,payload=excluded.payload",
+                params![
+                    choice.account,
+                    choice.occurrence,
+                    choice.customer,
+                    feedback_time(choice.updated_at),
+                    payload
+                ],
+            )
+            .map_err(|_| "Save meeting choice failed")?;
+        transaction
+            .execute(
+                "DELETE FROM customer_overrides WHERE account=?1 AND occurrence NOT IN (
+                   SELECT occurrence FROM customer_overrides WHERE account=?1
+                   ORDER BY updated_at DESC LIMIT ?2)",
+                params![choice.account, crate::customers::OVERRIDE_LIMIT as i64],
+            )
+            .map_err(|_| "Save meeting choice failed")?;
+        transaction
+            .commit()
+            .map_err(|_| "Commit meeting choice failed".into())
+    }
+
+    /// Returns a meeting to automatic detection; returns whether a choice existed.
+    pub fn clear_customer_override(&self, account: &str, occurrence: &str) -> Result<bool> {
+        self.connection
+            .execute(
+                "DELETE FROM customer_overrides WHERE account=?1 AND occurrence=?2",
+                params![account, occurrence],
+            )
+            .map(|count| count > 0)
+            .map_err(|_| "Reset meeting choice failed".into())
+    }
+
+    fn save_customer_cache(
+        &self,
+        account: &str,
+        customer: &str,
+        kind: &str,
+        updated_at: chrono::DateTime<chrono::Utc>,
+        payload: &str,
+    ) -> Result<()> {
+        if payload.len() > crate::customers::CACHE_LIMIT {
+            return Err("Customer data exceeds its safety limit".into());
+        }
+        let known: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM customers WHERE account=?1 AND id=?2",
+                params![account, customer],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| "Read customers failed")?;
+        if known.is_none() {
+            return Err("This customer no longer exists".into());
+        }
+        self.connection
+            .execute(
+                "INSERT INTO customer_cache VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(account,customer,kind) DO UPDATE SET
+                   updated_at=excluded.updated_at,payload=excluded.payload",
+                params![account, customer, kind, feedback_time(updated_at), payload],
+            )
+            .map(|_| ())
+            .map_err(|_| "Save customer data failed".into())
+    }
+
+    /// Keeps the last MSX and Azure consumption read of a customer.
+    pub fn save_customer_msx(
+        &self,
+        account: &str,
+        customer: &str,
+        snapshot: &crate::customers::MsxSnapshot,
+    ) -> Result<()> {
+        snapshot.validate()?;
+        let payload = serde_json::to_string(snapshot).map_err(|_| "Encode MSX data failed")?;
+        self.save_customer_cache(account, customer, "msx", snapshot.retrieved_at, &payload)
+    }
+
+    /// Keeps the last communication research of a customer.
+    pub fn save_customer_communication(
+        &self,
+        saved: &crate::customers::research::Communication,
+    ) -> Result<()> {
+        saved.validate()?;
+        let payload =
+            serde_json::to_string(saved).map_err(|_| "Encode customer communication failed")?;
+        self.save_customer_cache(
+            &saved.account,
+            &saved.customer,
+            "communication",
+            saved.created_at,
+            &payload,
+        )
     }
 }
 

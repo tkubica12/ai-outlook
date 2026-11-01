@@ -2,7 +2,7 @@
 fn settings_content_has_clear_padding_from_navigation_in_both_sections_and_themes() {
     for dark in [true, false] {
         for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
-            for section in [PreferencesSection::Display, PreferencesSection::Notifications, PreferencesSection::Prompts, PreferencesSection::Updates] {
+            for section in [PreferencesSection::Display, PreferencesSection::Notifications, PreferencesSection::Prompts, PreferencesSection::Msx, PreferencesSection::Updates] {
                 let mut app = Tomlook::initial(None, None, None);
                 app.preferences.dark = dark;
                 app.preferences.language = language;
@@ -30,6 +30,7 @@ fn settings_content_has_clear_padding_from_navigation_in_both_sections_and_theme
                     PreferencesSection::Display => "Display",
                     PreferencesSection::Notifications => "Notifications",
                     PreferencesSection::Prompts => "AI prompts",
+                    PreferencesSection::Msx => "MSX and Azure consumption",
                     PreferencesSection::Updates => "Updates",
                 });
                 let content = output.shapes.iter().find_map(|shape| match &shape.shape {
@@ -2842,6 +2843,185 @@ fn auto_authentication_has_separate_status_and_explicit_device_login_controls() 
         assert!(app.ai_ready && app.auto_status.phase == Phase::SignedIn);
         assert_eq!(app.chat.turns[0].error.as_deref(), Some(error));
         assert!(commands.try_recv().is_err(), "Successful login must not repeat a failed question");
+    }
+}
+
+fn msx_status(phase: tomlook::msx::Phase, message: &str, code: Option<&str>) -> tomlook::msx::Status {
+    let service = tomlook::msx::Service { phase, message: message.into() };
+    tomlook::msx::Status {
+        phase,
+        message: message.into(),
+        tenant: tomlook::msx::DEFAULT_TENANT.into(),
+        account: (phase == tomlook::msx::Phase::Connected).then(|| "someone@example.test".into()),
+        dataverse: service.clone(),
+        powerbi: service,
+        device_code: code.map(Into::into),
+        tools: Vec::new(),
+    }
+}
+
+#[test]
+fn msx_connection_offers_only_explicit_sign_in_and_is_localized() {
+    use tomlook::msx::{Phase, auth::TOKEN_TIMEOUT};
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, notices, mut commands) = assistant_fixture();
+        app.preferences.language = language;
+        app.preferences.msx_enabled = true;
+        app.connection_panel = Some(ConnectionPanel::Msx);
+        notices.send(ai::Notice::Msx(msx_status(Phase::SignInRequired, TOKEN_TIMEOUT, None))).unwrap();
+        app.receive();
+        assert_eq!(app.msx_status.label(), "MSX: sign-in required");
+        let context = egui::Context::default();
+        let draw = |app: &mut Tomlook, events| {
+            let mut output = context.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1200.0, 1000.0))),
+                events, ..Default::default()
+            }, |ui| app.connection_dialog(ui.ctx()));
+            output.textures_delta.clear();
+            output
+        };
+        let text = |app: &mut Tomlook| {
+            draw(app, vec![]);
+            let output = draw(app, vec![]);
+            let mut text = String::new();
+            for shape in &output.shapes { append_shape_text(&shape.shape, &mut text); }
+            (text, output.platform_output.commands.is_empty())
+        };
+        let click = |app: &mut Tomlook, label: &str| {
+            draw(app, vec![]);
+            let output = draw(app, vec![]);
+            let position = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == label =>
+                    Some(text.pos + text.galley.size() * 0.5),
+                _ => None,
+            }).unwrap_or_else(|| panic!("Missing MSX connection control: {label}"));
+            for pressed in [true, false] {
+                draw(app, vec![egui::Event::PointerMoved(position), egui::Event::PointerButton {
+                    pos: position, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+                }]);
+            }
+        };
+        let (shown, quiet) = text(&mut app);
+        for expected in [
+            "MSX connection",
+            "MSX · Dataverse and Power BI",
+            TOKEN_TIMEOUT,
+            "Sign in to MSX",
+            "Use device code",
+            "Check connection",
+            "Disconnect",
+            "Signed-in Azure account",
+            "Not known yet",
+            "Uses your Azure CLI sign-in; may change Azure CLI's default account.",
+            "Read-only: Tomlook never creates or changes MSX records. Tokens stay in memory.",
+        ] {
+            assert!(shown.contains(language.text(expected).as_ref()), "{language:?}: missing {expected} in {shown}");
+        }
+        assert!(shown.contains(tomlook::msx::DEFAULT_TENANT));
+        if language == tomlook::i18n::Language::Cs {
+            assert!(shown.contains("Přihlásit se k MSX") && shown.contains("Je nutné přihlášení k MSX"));
+        }
+        assert!(quiet, "Rendering never opens a browser or copies anything");
+        assert!(commands.try_recv().is_err(), "Opening the dialog never starts a check or sign-in");
+
+        click(&mut app, language.text("Sign in to MSX").as_ref());
+        assert!(matches!(commands.try_recv().unwrap(), ai::Command::SignInMsx { device_code: false }));
+        assert!(commands.try_recv().is_err());
+        assert!(app.msx_status.busy());
+        click(&mut app, language.text("Cancel").as_ref());
+        assert!(matches!(commands.try_recv().unwrap(), ai::Command::CancelMsx));
+
+        notices.send(ai::Notice::Msx(msx_status(Phase::SigningIn, tomlook::msx::DEVICE_PROMPT, Some("ABCD-EF12")))).unwrap();
+        app.receive();
+        let (shown, quiet) = text(&mut app);
+        assert!(shown.contains("ABCD-EF12") && shown.contains(language.text("Open Microsoft device sign-in").as_ref()));
+        assert!(!shown.contains(language.text("Sign in to MSX").as_ref()), "No second sign-in while one runs");
+        assert!(quiet, "A device code is never copied or opened automatically");
+
+        notices.send(ai::Notice::Msx(msx_status(Phase::SignInRequired, tomlook::msx::auth::DEVICE_CODE_TIMEOUT, None))).unwrap();
+        app.receive();
+        click(&mut app, language.text("Use device code").as_ref());
+        assert!(matches!(commands.try_recv().unwrap(), ai::Command::SignInMsx { device_code: true }));
+
+        notices.send(ai::Notice::Msx(msx_status(Phase::Connected, tomlook::msx::CONNECTED, None))).unwrap();
+        app.receive();
+        let (shown, _) = text(&mut app);
+        assert!(shown.contains("someone@example.test") && shown.contains(language.text("Connected").as_ref()));
+        click(&mut app, language.text("Check connection").as_ref());
+        assert!(matches!(commands.try_recv().unwrap(), ai::Command::CheckMsx));
+        notices.send(ai::Notice::Msx(msx_status(Phase::Connected, tomlook::msx::CONNECTED, None))).unwrap();
+        app.receive();
+        click(&mut app, language.text("Disconnect").as_ref());
+        assert!(matches!(commands.try_recv().unwrap(), ai::Command::DisconnectMsx));
+        assert_eq!(app.msx_status.message, tomlook::msx::DISCONNECTED);
+        assert!(commands.try_recv().is_err());
+    }
+}
+
+#[test]
+fn msx_settings_default_on_can_be_turned_off_and_validate_the_tenant() {
+    let legacy: tomlook::storage::Preferences = serde_json::from_str(r#"{"dark":false,"language":"Cs"}"#).unwrap();
+    assert!(legacy.msx_enabled);
+    assert_eq!(legacy.msx_tenant, tomlook::msx::DEFAULT_TENANT);
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, _, mut ai_commands) = assistant_fixture();
+        let (sender, receiver) = mpsc::sync_channel(16);
+        app.worker = Some(Worker {
+            commands: sender, notices: Arc::new(Default::default()),
+            activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+            stop: Arc::new(Default::default()), done: None,
+        });
+        app.loading = false;
+        app.preferences.language = language;
+        app.preferences_open = true;
+        app.preferences_section = PreferencesSection::Msx;
+        let context = egui::Context::default();
+        let draw = |app: &mut Tomlook, events| {
+            let mut output = context.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                events, ..Default::default()
+            }, |ui| app.preferences_dialog(ui.ctx()));
+            output.textures_delta.clear();
+            output
+        };
+        let click = |app: &mut Tomlook, label: &str| {
+            draw(app, vec![]);
+            let output = draw(app, vec![]);
+            let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == label =>
+                    Some(text.pos + text.galley.size() * 0.5),
+                _ => None,
+            }).unwrap_or_else(|| panic!("Missing MSX setting: {label}"));
+            for pressed in [true, false] {
+                draw(app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                    pos,button:egui::PointerButton::Primary,pressed,modifiers:Modifiers::NONE,
+                }]);
+            }
+        };
+        click(&mut app, language.text("Use MSX and Azure consumption").as_ref());
+        assert!(!app.preferences.msx_enabled);
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Preferences(preferences) if !preferences.msx_enabled));
+        assert!(matches!(ai_commands.try_recv().unwrap(), ai::Command::MsxSettings(settings) if !settings.enabled));
+        assert_eq!(app.msx_status.phase, tomlook::msx::Phase::Disabled);
+        click(&mut app, language.text("Use MSX and Azure consumption").as_ref());
+        assert!(matches!(ai_commands.try_recv().unwrap(), ai::Command::MsxSettings(settings) if settings.enabled));
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Preferences(preferences) if preferences.msx_enabled));
+        app.msx_tenant_editor = "not-a-tenant".into();
+        let mut output = draw(&mut app, vec![]);
+        output.textures_delta.clear();
+        let mut text = String::new();
+        for shape in &output.shapes { append_shape_text(&shape.shape, &mut text); }
+        assert!(text.contains(language.text(tomlook::msx::INVALID_TENANT).as_ref()));
+        click(&mut app, language.text("Save tenant").as_ref());
+        assert_eq!(app.preferences.msx_tenant, tomlook::msx::DEFAULT_TENANT, "An invalid tenant is never saved");
+        assert!(receiver.try_recv().is_err());
+        let tenant = "00000000-0000-0000-0000-0000000000AB";
+        app.msx_tenant_editor = tenant.into();
+        click(&mut app, language.text("Save tenant").as_ref());
+        assert_eq!(app.preferences.msx_tenant, tenant.to_ascii_lowercase());
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Preferences(preferences) if preferences.msx_tenant == tenant.to_ascii_lowercase()));
+        assert!(matches!(ai_commands.try_recv().unwrap(), ai::Command::MsxSettings(settings) if settings.enabled && settings.tenant == tenant.to_ascii_lowercase()));
+        assert!(ai_commands.try_recv().is_err(), "Settings never start a sign-in");
     }
 }
 
@@ -6586,5 +6766,424 @@ fn find_time_demo_scenes_show_fictional_candidates_and_a_disabled_teams_preview_
             assert!(text.contains("The offline demo never changes a calendar or contacts anyone."), "Writes are disabled with a reason\n{text}");
         }
         assert!(ai_commands.try_recv().is_err(), "The demo never calls WorkIQ or AI");
+    }
+}
+
+const CUSTOMER_ACCOUNT_ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
+fn customer_meeting(id: &str, title: &str, start: chrono::DateTime<Local>, minutes: i64, people: &[&str]) -> Event {
+    let mut event = myday_meeting(id, title, start, minutes, "accepted");
+    event.organizer = "Owner <owner@example.com>".into();
+    event.attendees = std::iter::once("Owner <owner@example.com>").chain(people.iter().copied()).map(Into::into).collect();
+    event
+}
+
+fn customer_snapshot(retrieved: chrono::DateTime<chrono::Utc>, truncated: bool) -> tomlook::customers::MsxSnapshot {
+    use tomlook::customers::*;
+    let today = Local::now().date_naive();
+    let current = today.with_day(1).unwrap();
+    let month = |back: u32| current.checked_sub_months(chrono::Months::new(back)).unwrap();
+    let mut months = (1..=6).rev().map(|back| MonthRow { month: month(back), value: 9000.0 + f64::from(6 - back) * 500.0, kind: MonthKind::Actual }).collect::<Vec<_>>();
+    months.push(MonthRow { month: current, value: 4000.0, kind: MonthKind::Partial });
+    months.push(MonthRow { month: current, value: 12500.0, kind: MonthKind::Prediction });
+    MsxSnapshot {
+        account_id: CUSTOMER_ACCOUNT_ID.into(),
+        retrieved_at: retrieved,
+        sample: false,
+        dataverse: Dataverse::Loaded {
+            opportunities: vec![OpportunityRow {
+                name: "Intake pilot".into(),
+                stage: Some("2 - Qualify".into()),
+                close: Some(today + chrono::Duration::days(40)),
+                owner: Some("Taylor Quinn".into()),
+                url: Some("https://microsoftsales.crm.dynamics.com/main.aspx?etn=opportunity&id=bbbbbbbb-0000-4000-8000-000000000001&pagetype=entityrecord".into()),
+            }],
+            opportunities_truncated: false,
+            milestones: if truncated { vec![] } else { vec![MilestoneRow {
+                name: "Pilot go-live".into(),
+                status: Some("On track".into()),
+                due: Some(today + chrono::Duration::days(20)),
+                owner: Some("Jamie Brooks".into()),
+                workload: None,
+                my_task: None,
+                url: None,
+            }] },
+            milestones_truncated: truncated,
+            tasks: Vec::new(),
+            tasks_note: None,
+            sources: vec![SourceRow { system: "Dataverse".into(), table: "opportunity".into(), rows: 1, truncated: false, retrieved_at: retrieved }],
+        },
+        consumption: Consumption::Available {
+            months,
+            unit: "USD".into(),
+            dataset: "AzureBlueSubscriptionSL4".into(),
+            latest_month: Some(current),
+            matched_by: "TPID".into(),
+            prediction_note: "Prediction from the model measure [Forecast]; not extrapolated by Tomlook.".into(),
+        },
+    }
+}
+
+/// A confirmed customer with past and upcoming meetings, notes, a linked task, a saved MSX read
+/// (cached, MSX not signed in) and a saved communication summary.
+fn customer_fixture(language: tomlook::i18n::Language) -> (
+    Tomlook,
+    mpsc::Receiver<Command>,
+    tokio::sync::mpsc::Receiver<ai::Command>,
+    Arc<ai::Notices>,
+    String,
+) {
+    use tomlook::customers::{research, *};
+    let (mut app, receiver, ai_commands, notices) = task_fixture(language);
+    let account = "owner@example.com";
+    let now = Local::now();
+    app.customers.now = Some(now);
+    // Company icons are fetched from public websites; this fixture never asks for them.
+    app.companies_busy = true;
+    let at = |days: i64, hour: u32| myday_at(now.date_naive() + chrono::Duration::days(days), hour, 0);
+    let dana = "Dana Novak <dana@northstar.example>";
+    let past = customer_meeting("past", "Northstar pilot planning", at(-3, 10), 60, &[dana]);
+    let older = customer_meeting("older", "Northstar discovery", at(-20, 10), 90, &[dana, "Riley Chen <riley@eu.northstar.example>"]);
+    let next = customer_meeting("next", "Northstar architecture workshop", at(2, 9), 90, &[dana]);
+    let orbit = customer_meeting("orbit", "Orbit kickoff", at(1, 13), 30, &["Kim Lambert <kim@orbit.example>"]);
+    app.calendar = Arc::new(Calendar::build(vec![past.clone(), older, next, orbit], Default::default(), vec![]).unwrap());
+    let customer = Customer::new(account, "Northstar", &["northstar.example".into()], Some(MsxAccount {
+        id: CUSTOMER_ACCOUNT_ID.into(), name: "Northstar Holdings".into(), tpid: Some("123456".into()), confidence: Some(0.82),
+    }), chrono::Utc::now()).unwrap();
+    let id = customer.id.clone();
+    let communication = research::Communication {
+        account: account.into(),
+        customer: id.clone(),
+        created_at: chrono::Utc::now() - chrono::Duration::days(1),
+        days: 60,
+        topic: Some("Northstar architecture workshop".into()),
+        language,
+        items: vec![
+            research::Item { kind: research::Kind::Mail, date: Some(now.date_naive() - chrono::Duration::days(4)), people: vec!["Dana Novak".into()],
+                subject: "Pilot scope".into(), summary: "Dana confirmed the pilot scope.".into(), why_relevant: "It is on the workshop agenda.".into(),
+                url: Some("https://outlook.office.com/mail/id/AAMk1".into()), source_id: None, verified: true },
+            research::Item { kind: research::Kind::Teams, date: None, people: vec![], subject: "Prototype chat".into(),
+                summary: "The recording was shared.".into(), why_relevant: String::new(), url: None, source_id: None, verified: false },
+        ],
+        open_questions: vec!["Who owns the pilot?".into()],
+        commitments: vec![research::Commitment { by: research::Side::Me, text: "Send the summary".into(), due: None }],
+        risks: Vec::new(),
+        gaps: Vec::new(),
+        dropped_sources: 1,
+        sample: false,
+    };
+    let book = Book {
+        account: Some(account.into()),
+        customers: BTreeMap::from([(id.clone(), customer)]),
+        msx: BTreeMap::from([(id.clone(), customer_snapshot(chrono::Utc::now() - chrono::Duration::hours(2), false))]),
+        communications: BTreeMap::from([(id.clone(), communication)]),
+        ..Default::default()
+    };
+    let key = tomlook::recaps::key(account, &past);
+    let ledger = tomlook::recaps::Ledger { records: BTreeMap::from([(key, tomlook::recaps::Record {
+        account: account.into(), event_id: "past".into(), checking: false, next_check: now.fixed_offset(),
+        message: "AI meeting notes ready".into(), failures: 0, payload: Some(notes_payload()),
+    })]) };
+    let mut task = tomlook::tasks::New::manual("Send the comparison to Dana", Some(now.date_naive() + chrono::Duration::days(1)), language).unwrap();
+    task.meeting = Some(tomlook::tasks::Meeting::new(account, &past));
+    let mut task = task.task(account, chrono::Utc::now()).unwrap();
+    task.id = 7;
+    app.activity = Arc::new(tomlook::worker::Activity {
+        task_account: Some(account.into()),
+        tasks: Arc::new(vec![task]),
+        recaps: Arc::new(ledger),
+        customers: Arc::new(book),
+        ..Default::default()
+    });
+    app.open_customers(Some(id.clone()), None);
+    (app, receiver, ai_commands, notices, id)
+}
+
+#[test]
+fn customer_panel_shows_timeline_notes_tasks_msx_states_consumption_and_communication() {
+    use tomlook::msx::Phase;
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let czech = language == tomlook::i18n::Language::Cs;
+        let (mut app, receiver, mut ai_commands, notices, id) = customer_fixture(language);
+        let context = egui::Context::default();
+        let show: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| app.customers_panel(ui);
+        let text = settled(&context, &mut app, show);
+        for label in [
+            "All customers", "Meetings with this customer", "Meetings in the last 90 days", "Hours together in the last 90 days", "Next meeting",
+            "Upcoming", "Earlier meetings", "Notes ready", "Notes and decisions", "Decisions", "My tasks", "Tasks from these meetings",
+            "Not signed in to MSX. Sign in to read opportunities, milestones and consumption.", "Open MSX connection",
+            "Open opportunities", "Active future milestones", "My task: unknown", "Azure consumption", "Completed month",
+            "Current month (partial)", "Model prediction", "Consumption is technical evidence, not business intent.",
+            "Recent communication", "Find related communication", "Connect GitHub Copilot and WorkIQ first.",
+            "Source not among the retrieved results", "Open source", "Commitments", "Open questions", "Edit", "Remove customer",
+        ] {
+            assert!(text.contains(language.text(label).as_ref()), "{language:?}: missing {label}\n{text}");
+        }
+        for expected in [
+            "Northstar", "northstar.example", "Northstar pilot planning", "Northstar discovery", "Northstar architecture workshop",
+            if czech { "Pilot dohodnut." } else { "Pilot agreed." }, "Send the comparison to Dana", "Intake pilot", "Pilot go-live", "Pilot scope", "Who owns the pilot?",
+            if czech { "Zákazník v MSX: Northstar Holdings" } else { "MSX customer: Northstar Holdings" },
+            if czech { "Poslední měsíc s daty:" } else { "Latest month with data:" },
+            if czech { "Zobrazuji uložená data z" } else { "Showing the saved read from" },
+            if czech { "Jednotka: USD" } else { "Unit: USD" },
+            if czech { "Můj závazek: Send the summary" } else { "My commitment: Send the summary" },
+            if czech { "Odstraněné citované zdroje, které nebyly načtené nebo nebyly bezpečné: 1." } else { "1 cited sources were removed because they were not retrieved or not safe." },
+            "TPID 123456",
+        ] {
+            assert!(text.contains(expected), "{language:?}: missing {expected}\n{text}");
+        }
+        assert!(text.contains(if czech { "2,5 h" } else { "2.5 h" }), "Hours together in the last 90 days\n{text}");
+        assert!(!text.contains("Orbit kickoff"), "Other customers' meetings are not in this timeline");
+        assert!(text.contains(language.text("None found in a complete read.").as_ref()), "A complete read without MSX tasks says so");
+        if czech {
+            assert!(!text.contains("účet") && !text.contains("Účet"), "A customer is never an 'účet'\n{text}");
+        }
+        assert!(ai_commands.try_recv().is_err(), "Not signed in to MSX: nothing is read and no AI is asked");
+        click_text(&context, &mut app, show, language.text("Open MSX connection").as_ref());
+        assert!(app.connection_panel == Some(ConnectionPanel::Msx), "The MSX dialog opens; sign-in still needs its own click");
+        assert!(ai_commands.try_recv().is_err());
+
+        app.connection_panel = None;
+        notices.send(ai::Notice::Msx(msx_status(Phase::Connected, tomlook::msx::CONNECTED, None))).unwrap();
+        app.receive();
+        draw_with(&context, &mut app, vec![], show);
+        let request = match ai_commands.try_recv() {
+            Ok(ai::Command::CustomerMsx { id: request, customer, account }) => {
+                assert_eq!((customer.as_str(), account.id.as_str()), (id.as_str(), CUSTOMER_ACCOUNT_ID));
+                request
+            }
+            _ => panic!("A stale saved read is refreshed once while MSX is connected"),
+        };
+        draw_with(&context, &mut app, vec![], show);
+        assert!(ai_commands.try_recv().is_err(), "One refresh per session");
+        assert!(output_text(&draw_with(&context, &mut app, vec![], show)).contains(language.text("Loading MSX...").as_ref()));
+        notices.send(ai::Notice::CustomerMsx { id: request, customer: id.clone(), result: Err("Dataverse is unreachable: timeout".into()) }).unwrap();
+        app.receive();
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains(&language.text("MSX unavailable: Dataverse is unreachable: timeout").into_owned()), "{text}");
+        assert!(text.contains(language.text("A failed read is not evidence that nothing exists.").as_ref()));
+        assert!(text.contains("Intake pilot"), "The saved read stays visible, labelled as saved");
+
+        click_text(&context, &mut app, show, language.text("Refresh").as_ref());
+        let request = match ai_commands.try_recv() {
+            Ok(ai::Command::CustomerMsx { id: request, .. }) => request,
+            _ => panic!("Refresh reads again"),
+        };
+        notices.send(ai::Notice::CustomerMsx { id: request, customer: id.clone(), result: Ok(customer_snapshot(chrono::Utc::now(), true)) }).unwrap();
+        app.receive();
+        let saved = receiver.try_iter().find_map(|command| match command {
+            Command::Customer(tomlook::worker::CustomerCommand::SaveMsx { customer, snapshot, .. }) => Some((customer, snapshot)),
+            _ => None,
+        }).expect("The read is saved locally");
+        assert_eq!(saved.0, id);
+        let text = settled(&context, &mut app, show);
+        for label in ["Partial MSX data:", "Milestones reached the read limit; more may exist.", "The read reached its limit; more may exist."] {
+            assert!(text.contains(language.text(label).as_ref()), "{label}\n{text}");
+        }
+        assert!(!text.contains(language.text("No active future milestones in a complete read.").as_ref()), "A truncated read never says none");
+
+        app.workiq_ready = true;
+        click_text(&context, &mut app, show, language.text("Find related communication").as_ref());
+        let research = loop {
+            match ai_commands.try_recv() {
+                Ok(ai::Command::CustomerResearch(request)) => break request,
+                Ok(_) => continue,
+                Err(_) => panic!("One explicit research request"),
+            }
+        };
+        assert_eq!((research.customer.as_str(), research.account.as_str(), research.language), (id.as_str(), "owner@example.com", language));
+        assert_eq!(research.people, ["dana@northstar.example", "riley@eu.northstar.example"]);
+        assert_eq!(research.topic.as_ref().map(|topic| topic.title.as_str()), Some("Northstar architecture workshop"), "Focused on the next meeting");
+        assert!(research.prompt().unwrap().len() <= tomlook::customers::research::INPUT_LIMIT);
+        assert!(output_text(&draw_with(&context, &mut app, vec![], show)).contains(language.text("Searching mail, Teams and meetings...").as_ref()));
+        let mut result = app.activity.customers.communications[&id].clone();
+        result.items.truncate(1);
+        result.dropped_sources = 0;
+        result.created_at = chrono::Utc::now();
+        notices.send(ai::Notice::CustomerResearch { id: research.id + 50, result: Ok(result.clone()) }).unwrap();
+        app.receive();
+        assert!(app.customers.research.is_some(), "Unknown results are ignored");
+        notices.send(ai::Notice::CustomerResearch { id: research.id, result: Ok(result) }).unwrap();
+        app.receive();
+        assert!(receiver.try_iter().any(|command| matches!(command,
+            Command::Customer(tomlook::worker::CustomerCommand::SaveCommunication(saved)) if saved.customer == id)));
+        let text = settled(&context, &mut app, show);
+        assert!(!text.contains("Prototype chat"), "The newest summary replaces the older one\n{text}");
+        click_text(&context, &mut app, show, language.text("All customers").as_ref());
+        let text = settled(&context, &mut app, show);
+        assert!(app.customers.selected.is_none());
+        assert!(text.contains(&language.text("Unconfirmed customer: orbit.example").into_owned()), "{text}");
+        assert!(text.contains(language.text("Unconfirmed customers in your meetings").as_ref()));
+    }
+}
+
+#[test]
+fn meeting_card_confirms_customers_only_after_an_explicit_choice() {
+    use tomlook::msx::Phase;
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, mut ai_commands, notices, id) = customer_fixture(language);
+        app.customers.open = false;
+        let context = egui::Context::default();
+        let orbit = app.calendar.events[app.calendar.event_index("orbit").unwrap()].clone();
+        let card = orbit.clone();
+        let show: Show = &move |app: &mut Tomlook, ui: &mut egui::Ui| { app.customer_card(ui, &card); app.confirm_customer_dialog(ui.ctx()); };
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains(&language.text("Unconfirmed customer: orbit.example").into_owned()), "{text}");
+        assert!(text.contains("Kim Lambert") && text.contains(language.text("Not a customer meeting").as_ref()));
+        click_text(&context, &mut app, show, language.text("Confirm customer").as_ref());
+        assert!(app.customers.confirm.is_some());
+        assert!(ai_commands.try_recv().is_err(), "MSX is not connected: no account search");
+        let text = settled(&context, &mut app, show);
+        for label in ["Customer name", "E-mail domains", "Local customer only (no MSX link)",
+            "MSX is not connected; you can confirm a local customer now and link MSX later.",
+            "Inferred matches are never linked without your confirmation.", "Confirm"] {
+            assert!(text.contains(language.text(label).as_ref()), "{language:?}: missing {label}\n{text}");
+        }
+        assert!(receiver.try_iter().all(|command| !matches!(command, Command::Customer(_))), "Opening the dialog saves nothing");
+        click_text(&context, &mut app, show, language.text("Confirm").as_ref());
+        let saved = receiver.try_iter().find_map(|command| match command {
+            Command::Customer(tomlook::worker::CustomerCommand::Save(customer)) => Some(customer),
+            _ => None,
+        }).expect("Confirm saves the local customer");
+        assert_eq!((saved.name.as_str(), saved.domains.as_slice(), saved.msx.is_none(), saved.confirmed), ("Orbit", &["orbit.example".to_owned()][..], true, true));
+        assert!(app.customers.confirm.is_none());
+
+        notices.send(ai::Notice::Msx(msx_status(Phase::Connected, tomlook::msx::CONNECTED, None))).unwrap();
+        app.receive();
+        click_text(&context, &mut app, show, language.text("Confirm customer").as_ref());
+        let search = match ai_commands.try_recv() {
+            Ok(ai::Command::CustomerAccounts { id, domains, names }) => {
+                assert_eq!((domains, names), (vec!["orbit.example".to_owned()], vec!["Orbit".to_owned()]));
+                id
+            }
+            _ => panic!("MSX connected: candidates are searched"),
+        };
+        assert!(settled(&context, &mut app, show).contains(language.text("Searching MSX for matching customers...").as_ref()));
+        let candidate = |id: &str, name: &str, confidence: f32| tomlook::msx::dataverse::AccountCandidate {
+            id: id.into(), name: name.into(), tpid: Some("777".into()), account_number: None, website: Some("https://www.orbit.example".into()),
+            owner: Some(tomlook::msx::dataverse::Owner { id: None, name: Some("Jamie Brooks".into()) }),
+            url: tomlook::msx::dataverse::record_url("account", id), confidence,
+            evidence: vec![tomlook::msx::dataverse::Evidence::WebsiteDomain { domain: "orbit.example".into(), website: "https://www.orbit.example".into() }],
+        };
+        let likely = "11111111-0000-4000-8000-000000000001";
+        notices.send(ai::Notice::CustomerAccounts { id: search, result: Ok(tomlook::msx::dataverse::AccountLookup {
+            candidates: vec![candidate(likely, "Orbit Systems", 0.82), candidate("22222222-0000-4000-8000-000000000002", "Orbit Travel", 0.4)],
+            selection: tomlook::msx::dataverse::Selection::Likely { account_id: likely.into() },
+            requires_confirmation: true, rejected_inputs: vec![], sources: vec![],
+        }) }).unwrap();
+        app.receive();
+        assert!(receiver.try_iter().all(|command| !matches!(command, Command::Customer(_))), "A likely match is never saved silently");
+        let text = settled(&context, &mut app, show);
+        for expected in [
+            language.text("Likely match").into_owned(), "Orbit Systems".into(), "Orbit Travel".into(), "TPID 777".into(),
+            language.text("Confidence 82%").into_owned(), language.text("Website https://www.orbit.example matches orbit.example").into_owned(),
+            language.text("Owner: Jamie Brooks").into_owned(),
+        ] {
+            assert!(text.contains(&expected), "{language:?}: missing {expected}\n{text}");
+        }
+        click_text(&context, &mut app, show, language.text("Confirm").as_ref());
+        let saved = receiver.try_iter().find_map(|command| match command {
+            Command::Customer(tomlook::worker::CustomerCommand::Save(customer)) => Some(customer),
+            _ => None,
+        }).expect("One click confirms the shown candidate");
+        let msx = saved.msx.clone().unwrap();
+        assert_eq!((saved.name.as_str(), msx.id.as_str(), msx.tpid.as_deref(), msx.confidence), ("Orbit Systems", likely, Some("777"), Some(0.82)));
+
+        let book = Arc::make_mut(&mut Arc::make_mut(&mut app.activity).customers);
+        book.customers.insert(saved.id.clone(), *saved.clone());
+        draw_with(&context, &mut app, vec![], show);
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains("Orbit Systems") && text.contains(&language.text("MSX: Orbit Systems").into_owned()), "{text}");
+        click_text(&context, &mut app, show, language.text("Customer timeline").as_ref());
+        assert_eq!((app.customers.open, app.customers.selected.as_deref(), app.customers.focus.as_deref()), (true, Some(saved.id.as_str()), Some("orbit")));
+        click_text(&context, &mut app, show, language.text("Not a customer meeting").as_ref());
+        let choice = receiver.try_iter().find_map(|command| match command {
+            Command::Customer(tomlook::worker::CustomerCommand::Choose(choice)) => Some(choice),
+            _ => None,
+        }).expect("The meeting is marked as not a customer meeting");
+        assert_eq!((choice.customer.as_ref(), choice.event_id.as_str()), (None, "orbit"));
+        let book = Arc::make_mut(&mut Arc::make_mut(&mut app.activity).customers);
+        book.overrides.insert(choice.occurrence.clone(), *choice);
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains(language.text("Marked as not a customer meeting.").as_ref()) && !text.contains("Orbit Systems"), "{text}");
+        click_text(&context, &mut app, show, language.text("Detect automatically").as_ref());
+        assert!(receiver.try_iter().any(|command| matches!(command, Command::Customer(tomlook::worker::CustomerCommand::Reset { .. }))));
+        assert!(app.activity.customers.customers.contains_key(&id));
+    }
+}
+
+#[test]
+fn customers_open_from_the_palette_and_company_names_and_escape_closes_them() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, _, _, _, id) = customer_fixture(language);
+        app.customers.open = false;
+        let matches = command_matches_in(if language == tomlook::i18n::Language::Cs { "zákazníci" } else { "customers" }, language);
+        assert_eq!(matches.first(), Some(&PaletteCommand::Customers));
+        let context = egui::Context::default();
+        app.run_palette_command(PaletteCommand::Customers, &context);
+        assert!(app.customers.open && app.customers.selected.is_none(), "The palette lists all customers");
+        let show: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| app.customers_panel(ui);
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains("Northstar") && text.contains(&language.text("MSX: Northstar Holdings").into_owned()), "{text}");
+        click_text(&context, &mut app, show, "Northstar");
+        assert_eq!(app.customers.selected.as_deref(), Some(id.as_str()));
+        app.open_company("eu.northstar.example", vec![], Some("next".into()));
+        assert_eq!((app.customers.selected.as_deref(), app.customers.focus.as_deref()), (Some(id.as_str()), Some("next")));
+        app.open_company("orbit.example", vec!["Kim Lambert <kim@orbit.example>".into()], None);
+        assert_eq!(app.customers.confirm.as_ref().and_then(|draft| draft.domain.as_deref()), Some("orbit.example"));
+        app.open_company("example.com", vec![], None);
+        assert_eq!(app.customers.confirm.as_ref().and_then(|draft| draft.domain.as_deref()), Some("orbit.example"), "Own domains are not customers");
+        let escape = egui::RawInput { events: vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }], ..Default::default() };
+        let _ = context.run_ui(escape.clone(), |ui| app.shortcuts(ui.ctx()));
+        assert!(app.customers.confirm.is_none() && app.customers.open, "Escape first closes the confirmation");
+        let _ = context.run_ui(escape, |ui| app.shortcuts(ui.ctx()));
+        assert!(!app.customers.open, "Then the panel");
+    }
+}
+
+#[test]
+fn demo_customer_panel_shows_marked_sample_data_and_never_reads_msx_or_asks_ai() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, _, mut ai_commands) = assistant_fixture();
+        app.preview = true;
+        app.loading = false;
+        app.preferences.language = language;
+        app.msx_status = tomlook::msx::Status::demo();
+        let now = Local::now();
+        app.calendar = Arc::new(Calendar::build(tomlook::showcase::preview_events(now, 198), Default::default(), Vec::new()).unwrap());
+        let account = tomlook::feedback::PREVIEW_ACCOUNT;
+        let samples = tomlook::showcase::sample_customers(account, language, chrono::Utc::now()).unwrap();
+        let id = samples[0].customer.id.clone();
+        let book = tomlook::customers::Book {
+            account: Some(account.into()),
+            customers: samples.iter().map(|sample| (sample.customer.id.clone(), sample.customer.clone())).collect(),
+            msx: samples.iter().filter_map(|sample| Some((sample.customer.id.clone(), sample.msx.clone()?))).collect(),
+            communications: samples.iter().filter_map(|sample| Some((sample.customer.id.clone(), sample.communication.clone()?))).collect(),
+            ..Default::default()
+        };
+        let mut book = book;
+        let ended = app.calendar.events.iter().find(|event| event.title == tomlook::showcase::ENDED_MEETING).unwrap();
+        let choice = tomlook::customers::Override::new(account, ended, Some(id.clone()), chrono::Utc::now());
+        book.overrides.insert(choice.occurrence.clone(), choice);
+        app.activity = Arc::new(tomlook::worker::Activity { customers: Arc::new(book), ..Default::default() });
+        app.open_customers(Some(id), None);
+        let context = egui::Context::default();
+        let show: Show = &|app: &mut Tomlook, ui: &mut egui::Ui| app.customers_panel(ui);
+        let text = settled(&context, &mut app, show);
+        for label in [
+            "Sample data", tomlook::customers::SAMPLE_NOTE, "Sample communication summary: fictional, not produced by AI.",
+            "Offline demo never sends AI requests.", "Azure consumption", "Open opportunities", "My task: yes", "My task: no",
+            "My task: unknown", "Northstar / Architecture workshop", "Northstar / Pilot planning", "Notes ready",
+        ] {
+            assert!(text.contains(language.text(label).as_ref()), "{language:?}: missing {label}\n{text}");
+        }
+        assert!(!text.contains(language.text("Open in MSX").as_ref()), "Sample data never links to MSX");
+        assert!(!text.contains(language.text("Source not among the retrieved results").as_ref()));
+        assert!(ai_commands.try_recv().is_err(), "The demo never reads MSX or asks AI");
+        let card_event = app.calendar.events.iter().find(|event| event.title == "Orbit / Project kickoff").unwrap().clone();
+        let card: Show = &move |app: &mut Tomlook, ui: &mut egui::Ui| app.customer_card(ui, &card_event);
+        let text = settled(&context, &mut app, card);
+        assert!(text.contains(&language.text("Unconfirmed customer: orbit.invalid").into_owned()), "{text}");
+        assert!(!text.contains("example.invalid"), "Fictional colleagues are the demo user's own organization");
     }
 }

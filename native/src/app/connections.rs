@@ -103,6 +103,117 @@ impl Tomlook {
         }
     }
 
+    fn msx_pending(&mut self, phase: tomlook::msx::Phase, message: &str) {
+        self.msx_status.phase = phase;
+        self.msx_status.message = message.into();
+        self.msx_status.device_code = None;
+    }
+
+    /// MSX (Dataverse) and Azure consumption (Power BI). Every sign-in is an explicit click.
+    fn msx_connection(&mut self, ui: &mut egui::Ui) {
+        use tomlook::msx::Phase;
+        let language = self.preferences.language;
+        let status = self.msx_status.clone();
+        ui.strong(language.text("MSX · Dataverse and Power BI"));
+        ui.label(language.text(if status.message.is_empty() {
+            status.label()
+        } else {
+            &status.message
+        }));
+        egui::Grid::new("msx-connection")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                ui.weak(language.text("Microsoft tenant"));
+                ui.monospace(&self.preferences.msx_tenant);
+                ui.end_row();
+                ui.weak(language.text("Signed-in Azure account"));
+                match &status.account {
+                    Some(account) => ui.label(account),
+                    None => ui.label(language.text("Not known yet")),
+                };
+                ui.end_row();
+                for (label, service) in [
+                    ("Dataverse (MSX)", &status.dataverse),
+                    ("Power BI (Azure consumption)", &status.powerbi),
+                ] {
+                    ui.weak(language.text(label));
+                    let state = ui.label(language.text(service.phase.label()));
+                    if !service.message.is_empty() {
+                        state.on_hover_text(language.text(&service.message));
+                    }
+                    ui.end_row();
+                }
+            });
+        if let Some(code) = &status.device_code {
+            ui.horizontal(|ui| {
+                ui.monospace(code);
+                if ui.button(language.text("Copy code")).clicked() {
+                    ui.ctx().copy_text(code.clone());
+                }
+            });
+            ui.hyperlink_to(
+                language.text("Open Microsoft device sign-in"),
+                tomlook::decision::DEVICE_LOGIN_URL,
+            );
+        }
+        if status.busy() {
+            ui.horizontal(|ui| {
+                if status.device_code.is_none() {
+                    ui.spinner();
+                }
+                if ui.button(language.text("Cancel")).clicked() {
+                    self.ai_command(ai::Command::CancelMsx);
+                }
+            });
+        } else if status.phase != Phase::Disabled {
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button(language.text("Sign in to MSX"))
+                    .on_hover_text(language.text(
+                        "Opens Microsoft sign-in through Azure CLI (browser or Windows prompt).",
+                    ))
+                    .clicked()
+                    && self.ai_command(ai::Command::SignInMsx { device_code: false })
+                {
+                    self.msx_pending(Phase::SigningIn, tomlook::msx::BROWSER_PROMPT);
+                }
+                if ui
+                    .button(language.text("Use device code"))
+                    .on_hover_text(language.text(
+                        "Alternative sign-in with a code on another device; your tenant may block it.",
+                    ))
+                    .clicked()
+                    && self.ai_command(ai::Command::SignInMsx { device_code: true })
+                {
+                    self.msx_pending(Phase::SigningIn, tomlook::msx::DEVICE_REQUEST);
+                }
+                if ui.button(language.text("Check connection")).clicked()
+                    && self.ai_command(ai::Command::CheckMsx)
+                {
+                    self.msx_pending(Phase::Checking, tomlook::msx::CHECKING);
+                }
+                if ui
+                    .button(language.text("Disconnect"))
+                    .on_hover_text(language.text(
+                        "Forgets Tomlook's in-memory MSX tokens; your Azure CLI sign-in stays.",
+                    ))
+                    .clicked()
+                    && self.ai_command(ai::Command::DisconnectMsx)
+                {
+                    self.msx_pending(Phase::NotConnected, tomlook::msx::DISCONNECTED);
+                }
+            });
+        }
+        ui.add_space(6.0);
+        ui.weak(language.text(
+            "Uses your Azure CLI sign-in; may change Azure CLI's default account.",
+        ));
+        ui.weak(language.text(
+            "Read-only: Tomlook never creates or changes MSX records. Tokens stay in memory.",
+        ));
+    }
+
     pub(super) fn connection_dialog(&mut self, context: &egui::Context) {
         let language = self.preferences.language;
         let Some(panel) = self.connection_panel else {
@@ -117,6 +228,7 @@ impl Tomlook {
         egui::Window::new(language.text(match panel {
             ConnectionPanel::Ai => "AI connection",
             ConnectionPanel::Workiq => "WorkIQ connection",
+            ConnectionPanel::Msx => "MSX connection",
             ConnectionPanel::External(tomlook::connectors::Kind::Webiq) => "WebIQ connection",
             ConnectionPanel::External(tomlook::connectors::Kind::Github) => "GitHub connection",
         }))
@@ -180,6 +292,8 @@ impl Tomlook {
                         self.auto_status = tomlook::decision::Status::new(tomlook::decision::Phase::Checking, "Checking Foundry Azure sign-in...");
                     }
                 }
+            } else if panel == ConnectionPanel::Msx {
+                self.msx_connection(ui);
             } else if panel == ConnectionPanel::External(tomlook::connectors::Kind::Github) {
                 self.github_connection(ui);
             } else if let ConnectionPanel::External(kind) = panel {

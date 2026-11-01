@@ -16,6 +16,7 @@ use tomlook::{
 mod ask_panel;
 mod calendar;
 mod connections;
+mod customers;
 mod event_editor;
 mod feedback;
 mod find_time;
@@ -103,6 +104,7 @@ struct PersonPhoto {
 enum ConnectionPanel {
     Ai,
     Workiq,
+    Msx,
     External(tomlook::connectors::Kind),
 }
 
@@ -194,6 +196,7 @@ pub struct Tomlook {
     myday: myday::MyDayUi,
     weekly: weekly::WeeklyUi,
     followup: followup::FollowUpUi,
+    customers: customers::CustomersUi,
     preview: bool,
     demo_screenshot: Option<std::path::PathBuf>,
     demo_scene: tomlook::showcase::Scene,
@@ -233,6 +236,10 @@ pub struct Tomlook {
     ai_login_busy: bool,
     ai_login_status: Option<String>,
     auto_status: tomlook::decision::Status,
+    msx_status: tomlook::msx::Status,
+    /// MSX settings last handed to the AI executor.
+    msx_settings_sent: Option<tomlook::msx::Settings>,
+    msx_tenant_editor: String,
     external_status: BTreeMap<tomlook::connectors::Kind, ExternalStatus>,
     brand_color: Option<Color32>,
     brand_language: Option<tomlook::i18n::Language>,
@@ -491,6 +498,7 @@ impl Tomlook {
             myday: Default::default(),
             weekly: Default::default(),
             followup: Default::default(),
+            customers: Default::default(),
             preview: false,
             demo_screenshot: None,
             demo_scene: Default::default(),
@@ -529,6 +537,9 @@ impl Tomlook {
             ai_login_busy: false,
             ai_login_status: None,
             auto_status: Default::default(),
+            msx_status: tomlook::msx::Status::new(tomlook::msx::DEFAULT_TENANT),
+            msx_settings_sent: None,
+            msx_tenant_editor: tomlook::msx::DEFAULT_TENANT.into(),
             external_status: BTreeMap::new(),
             brand_color: None,
             brand_language: None,
@@ -718,9 +729,13 @@ impl Tomlook {
                     if self.loading && self.github_client_id.is_empty() {
                         self.github_client_id = preferences.github_client_id.clone();
                     }
+                    if self.loading || self.msx_tenant_editor == self.preferences.msx_tenant {
+                        self.msx_tenant_editor = preferences.msx_tenant.clone();
+                    }
                     self.preferences = *preferences;
                     self.loading = false;
                     self.sync_reminders();
+                    self.sync_msx();
                     if let Some(trace) = &mut self.startup
                         && !self.startup_built
                     {
@@ -784,6 +799,7 @@ impl Tomlook {
             };
             match notice {
                 ai::Notice::Auto(status) => self.auto_status = status,
+                ai::Notice::Msx(status) => self.msx_status = status,
                 ai::Notice::External {
                     kind,
                     busy,
@@ -991,10 +1007,16 @@ impl Tomlook {
                 }
                 ai::Notice::FollowUp { id, result } => self.receive_followup(id, result),
                 ai::Notice::WeeklySummary { id, result } => self.receive_weekly_summary(id, result),
+                ai::Notice::CustomerMsx { id, customer, result } => {
+                    self.receive_customer_msx(id, customer, result)
+                }
+                ai::Notice::CustomerAccounts { id, result } => self.receive_customer_accounts(id, result),
+                ai::Notice::CustomerResearch { id, result } => self.receive_customer_research(id, result),
                 ai::Notice::Stopped => {
                     self.stop_prompt_suggestion();
                     self.stop_followup();
                     self.stop_weekly_summary();
+                    self.stop_customer_research();
                     if !self.ai_ready && self.connection != "Not connected" {
                         self.error = Some(format!("AI stopped: {}", self.connection));
                     }
@@ -1173,6 +1195,25 @@ impl Tomlook {
     fn save_preferences(&mut self) {
         self.command(Command::Preferences(self.preferences.clone()));
         self.sync_reminders();
+        self.sync_msx();
+    }
+
+    /// Hands changed MSX settings to the AI executor. Enabling MSX starts only a quiet,
+    /// non-interactive check; sign-in always needs an explicit click.
+    fn sync_msx(&mut self) {
+        let settings = self.preferences.msx();
+        if self.ai.is_none() || self.loading || self.msx_settings_sent.as_ref() == Some(&settings) {
+            return;
+        }
+        if !settings.enabled {
+            self.msx_status = tomlook::msx::Status::disabled();
+            if self.connection_panel == Some(ConnectionPanel::Msx) {
+                self.connection_panel = None;
+            }
+        }
+        if self.ai_command(ai::Command::MsxSettings(settings.clone())) {
+            self.msx_settings_sent = Some(settings);
+        }
     }
 
     /// Hands the cached calendar and reminder preferences to the reminder thread.
@@ -1456,6 +1497,13 @@ impl eframe::App for Tomlook {
                     .clicked()
                 {
                     self.connection_panel = Some(ConnectionPanel::Workiq);
+                }
+                if self.preferences.msx_enabled
+                    && status_text(ui, "status-msx", language.text(self.msx_status.label()))
+                        .on_hover_text(language.text(&self.msx_status.message))
+                        .clicked()
+                {
+                    self.connection_panel = Some(ConnectionPanel::Msx);
                 }
                 for kind in [tomlook::connectors::Kind::Webiq, tomlook::connectors::Kind::Github] {
                     let status = self.external_status.entry(kind).or_default();
