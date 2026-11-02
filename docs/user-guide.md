@@ -73,6 +73,7 @@ Right-click a meeting, press **Shift+F10**, or use **Meeting actions**:
 
 | Action | Behavior |
 |---|---|
+| **Join Teams meeting** | Opens the clicked meeting's saved join link, just like the detail pane. Available for upcoming or ongoing meetings with a safe join link, even when AI or WorkIQ is disconnected. |
 | **Prepare for this meeting** | Opens Ask AI with the clicked meeting as context and runs `/prepare`. |
 | **Check BLOCKER** | Opens Ask AI with the clicked meeting as context and runs `/blocker` to investigate whether the reservation is still needed. |
 | Category | Sets one existing category or clears categories immediately; the Follow marker is preserved. |
@@ -103,7 +104,7 @@ and selected outline as the new-event dialog. A fast local rule can preselect on
 | Teams or another recognized online-only location, or online metadata with no physical-location clue | Call |
 | Your own/employer's office | Office |
 | Customer/client premises | Mimo office |
-| `BLOCKER` as a title word | Blocker, otherwise Nejisté |
+| `BLOCKER` as a title word | Nejisté, even if accepted or linked to Teams; no fallback to Blocker or Call |
 
 Rules use the cached title, location and invitation preview, never AI or a
 network call. Apart from an explicit BLOCKER title, ambiguous, conflicting or
@@ -267,6 +268,22 @@ cards offer tentative/decline/cancel/delete according to your role.
 Automatic recommendations only cover the next 14 days; follow-ups appear
 after the meeting ends. Explicit AI-proposed changes can target any saved
 occurrence, including later meetings and old BLOCKERs.
+
+Category recommendations follow the same BLOCKER-first rule as invitation
+acceptance: a reservation marked `BLOCKER` in its title uses the existing
+`Nejisté`/`Nejiste` category, not its participation mode. If that category is
+unavailable or ambiguous, no automatic category is offered. Manual category
+choices remain available.
+
+**Missing materials** is exceptional, not a reminder that an invitation lacks
+an agenda or attachment. It requires a confirmed, externally organized,
+demonstrably high-profile customer meeting where both your role and the
+purpose of your attendance remain unknown after completed mail and Teams
+research. Existing Insights and retrieved conversations count as context;
+an empty invitation alone does not. BLOCKERs, tentative reservations, internal
+corporate events and incomplete or inaccessible research do not qualify.
+Uncertainty about eligibility suppresses the alert. Ordinary evidence gaps
+remain in Insights rather than becoming Messages.
 
 Preparation and travel blocks are placed on weekdays 08:00–18:00 in free
 time; arrival travel ends exactly at the meeting start and departure travel

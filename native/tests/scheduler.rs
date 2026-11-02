@@ -1375,12 +1375,15 @@ fn worker_completes_offsite_travel_drafts_without_dispatching_a_calendar_write()
                 .contains("employer's premises")
         );
         assert_eq!(request.event.id, event.id);
+        assert_eq!(request.event.extra["tomlook_materials_candidate"], false, "Unknown owner domains cannot qualify a missing-material alert");
         request.reply.blocking_send(ai::Prepared {
         id: request.id,
         result: ai::PreparationResult::Finished(Ok(Arc::new(serde_json::json!({
             "summary":"Client visit.", "sources":[], "gaps":[],
             "recommendations":[{"kind":"category","reason":"The invitation names client premises.",
-                "reason_cs":"Pozvanka uvadi kancelar zakaznika.", "category":"mimo office","minutes":null}]
+                "reason_cs":"Pozvanka uvadi kancelar zakaznika.", "category":"mimo office","minutes":null},
+                {"kind":"missing_materials","reason":"The invitation has no agenda.",
+                "reason_cs":"Pozvanka nema agendu.", "category":null,"minutes":null}]
         }).to_string()))),
     }).unwrap();
         request.wake.send(Command::Wake).unwrap();

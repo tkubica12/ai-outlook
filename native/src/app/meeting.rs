@@ -65,6 +65,16 @@ pub(super) struct MeetingActionDraft {
 }
 
 impl Tomlook {
+    fn join_meeting_button(&mut self, ui: &mut egui::Ui, event: &Event) -> bool {
+        if event.end <= Local::now().fixed_offset() { return false; }
+        let Some(url) = event.join_url() else { return false; };
+        if !ui.button(self.preferences.language.text("Join Teams meeting")).clicked() { return false; }
+        if let Err(error) = tomlook::browser::open(url) {
+            self.error = Some(error);
+        }
+        true
+    }
+
     pub(super) fn choose_meeting_action(&mut self, event: Event, mut change: tomlook::recommendations::Change) {
         let Some(account) = self.calendar_owner.clone() else {
             self.error = Some("Connect WorkIQ before confirming a calendar change".into());
@@ -111,6 +121,10 @@ impl Tomlook {
         if ui.button(language.text("Open Insights")).clicked() {
             self.select(index);
             self.insights_expanded = true;
+            self.meeting_menu = None;
+            ui.close();
+        }
+        if self.join_meeting_button(ui, event) {
             self.meeting_menu = None;
             ui.close();
         }
@@ -455,11 +469,7 @@ impl Tomlook {
                     }
                 });
         }
-        if !ended && let Some(url) = event.join_url()
-            && ui.button(language.text("Join Teams meeting")).clicked()
-            && let Err(error) = tomlook::browser::open(url) {
-                self.error = Some(error);
-        }
+        self.join_meeting_button(ui, &event);
         if ui
             .button(language.text("Meeting actions"))
             .on_hover_text(language.text("Shift+F10: meeting actions"))

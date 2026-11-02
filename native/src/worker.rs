@@ -965,6 +965,8 @@ struct Briefing {
     cs: Option<CzechBriefing>,
     #[serde(default)]
     recommendations: Vec<crate::recommendations::Suggestion>,
+    #[serde(default)]
+    materials_assessment: Option<crate::recommendations::MaterialsAssessment>,
 }
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -998,6 +1000,7 @@ fn validate_prepared_with_limit(
     let briefing: Briefing =
         serde_json::from_str(raw).map_err(|e| format!("Invalid briefing JSON: {e}"))?;
     crate::recommendations::validate_suggestions(&briefing.recommendations)?;
+    if let Some(assessment) = &briefing.materials_assessment { assessment.validate()?; }
     if briefing.summary.trim().is_empty()
         || briefing.summary.len() > 16_000
         || briefing.sources.len() > 20
@@ -1550,9 +1553,11 @@ impl Worker {
                                                     let review = queue.jobs.get(&flight.event_id).and_then(|job| job.review.as_ref());
                                                     let publish_kind = |kind| review.is_none_or(|review|
                                                         !flight.translation_only && review.covers(event, now) && review.includes(kind));
-                                                    let suggestions: Vec<crate::recommendations::Suggestion> =
+                                                    let mut suggestions: Vec<crate::recommendations::Suggestion> =
                                                         serde_json::from_value(payload.get("recommendations").cloned().unwrap_or_else(|| serde_json::json!([])))
                                                             .map_err(|_| "Invalid saved recommendation schema")?;
+                                                    crate::recommendations::filter_missing_materials(event,
+                                                        &account, identity.as_deref(), &payload, &mut suggestions)?;
                                                     let suggestions = crate::recommendations::complete_suggestions(&calendar, event, suggestions)?;
                                                     payload["recommendations"] = serde_json::to_value(&suggestions)
                                                         .map_err(|_| "Encode completed recommendations failed")?;
@@ -1880,6 +1885,8 @@ impl Worker {
                                                     let mut event = event.clone();
                                                     let categories = known_categories(&calendar);
                                                     event.extra.insert("tomlook_category_meanings".into(), crate::recommendations::category_meanings(&categories));
+                                                    event.extra.insert("tomlook_materials_candidate".into(), serde_json::json!(crate::recommendations::materials_candidate(
+                                                        &event, owner.as_deref().unwrap_or(&preferences.work_email), identity.as_deref())));
                                                     event.extra.insert("tomlook_known_categories".into(), serde_json::json!(categories));
                                                     event.extra.insert("tomlook_calendar_context".into(), crate::recommendations::calendar_context(&calendar, &event));
                                                     event.extra.insert("tomlook_material_contacts".into(), serde_json::json!(crate::recommendations::material_contacts(&event, owner.as_deref().unwrap_or(&preferences.work_email), identity.as_deref())));

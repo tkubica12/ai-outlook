@@ -1483,6 +1483,11 @@ fn follow_up_opens_local_draft_request_without_submitting_or_erasing_questions()
 fn right_clicking_a_meeting_opens_actions_without_selecting_or_submitting() {
     let (mut app, _, mut commands) = assistant_fixture();
     let mut event = tomlook::calendar::fixture(1).remove(0);
+    event.start = Local::now().fixed_offset() + chrono::Duration::hours(1);
+    event.end = event.start + chrono::Duration::hours(1);
+    event.extra.insert("onlineMeeting".into(), serde_json::json!({
+        "joinUrl": "https://teams.microsoft.com/l/meetup-join/synthetic",
+    }));
     event
         .extra
         .insert("type".into(), serde_json::json!("singleInstance"));
@@ -1533,9 +1538,69 @@ fn right_clicking_a_meeting_opens_actions_without_selecting_or_submitting() {
         text.contains(app.preferences.language.text("Change category").as_ref()),
         "{text}"
     );
+    assert!(
+        text.contains(app.preferences.language.text("Join Teams meeting").as_ref()),
+        "{text}"
+    );
     assert!(app.selected.is_none());
     assert!(app.meeting_action.is_none());
     assert!(commands.try_recv().is_err());
+}
+
+#[test]
+fn meeting_menu_join_teams_uses_the_clicked_meeting_offline_and_reports_opening_errors() {
+    let join_url = "https://teams.microsoft.com/l/meetup-join/synthetic";
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        for (url, start_minutes, end_minutes, visible) in [
+            (Some(join_url), 60, 120, true),
+            (Some(join_url), -60, 60, true),
+            (Some(join_url), -120, -60, false),
+            (None, 60, 120, false),
+            (Some("javascript:alert(1)"), 60, 120, false),
+            (Some("http://teams.example.invalid/meeting"), 60, 120, true),
+        ] {
+            let (mut app, _, mut ai_commands) = assistant_fixture();
+            let (sender, writes) = mpsc::sync_channel(16);
+            app.worker = Some(Worker {
+                commands: sender, notices: Arc::new(Default::default()),
+                activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+                stop: Arc::new(Default::default()), done: None,
+            });
+            app.preferences.language = language;
+            app.ai_ready = false;
+            app.workiq_ready = false;
+            let mut selected = tomlook::calendar::fixture(1).remove(0);
+            selected.id = "selected-without-link".into();
+            selected.extra.remove("onlineMeeting");
+            let mut event = selected.clone();
+            event.id = "right-clicked-meeting".into();
+            event.title = "Clicked meeting".into();
+            let now = Local::now().fixed_offset();
+            event.start = now + chrono::Duration::minutes(start_minutes);
+            event.end = now + chrono::Duration::minutes(end_minutes);
+            if let Some(url) = url {
+                event.extra.insert("onlineMeeting".into(), serde_json::json!({"joinUrl":url}));
+            }
+            app.calendar = Arc::new(Calendar::build(vec![selected.clone(), event.clone()], Default::default(), vec![]).unwrap());
+            app.selected = app.calendar.event_index(&selected.id);
+            let original_selection = app.selected;
+            let index = app.calendar.event_index(&event.id).unwrap();
+            app.meeting_menu = Some(event.id.clone());
+            let context = egui::Context::default();
+            let show: Show = &|app, ui| app.meeting_actions(ui, index);
+            let text = settled(&context, &mut app, show);
+            let label = language.text("Join Teams meeting");
+            assert_eq!(text.contains(label.as_ref()), visible, "{url:?} / {start_minutes} / {end_minutes} / {language:?}: {text}");
+            if url.is_some_and(|url| url.starts_with("http:")) {
+                click_text(&context, &mut app, show, label.as_ref());
+                assert_eq!(app.error.as_deref(), Some("Only HTTPS sign-in addresses can be opened"));
+                assert!(app.meeting_menu.is_none(), "The clicked action closes the meeting menu");
+            }
+            assert_eq!(app.selected, original_selection, "Joining uses the clicked meeting, not the selection");
+            assert!(ai_commands.try_recv().is_err(), "Joining never starts AI");
+            assert!(writes.try_recv().is_err(), "Joining never submits a calendar write");
+        }
+    }
 }
 
 #[test]

@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const LIMIT: usize = 4;
-const POLICY_REVISION: u8 = 2;
+const POLICY_REVISION: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +67,10 @@ impl Kind {
 
     pub fn is_preparation(self) -> bool {
         matches!(self, Self::Preparation | Self::PreparationAdvance)
+    }
+
+    fn has_versioned_policy(self) -> bool {
+        self == Self::Category || self.is_travel() || self == Self::MissingMaterials
     }
 
     fn intent(self) -> Self {
@@ -230,7 +234,7 @@ impl Recommendation {
             suggestion.minutes,
         ))
         .map_err(|_| "Encode recommendation identity failed")?;
-        if suggestion.kind == Kind::Category || suggestion.kind.is_travel() {
+        if suggestion.kind.has_versioned_policy() {
             action.push(POLICY_REVISION);
         }
         Ok(Self {
@@ -293,8 +297,7 @@ impl Recommendation {
         now: DateTime<FixedOffset>,
     ) -> Option<&'a Event> {
         if owner != Some(self.account.as_str())
-            || ((self.suggestion.kind == Kind::Category || self.suggestion.kind.is_travel())
-                && self.policy_revision != POLICY_REVISION)
+            || (self.suggestion.kind.has_versioned_policy() && self.policy_revision != POLICY_REVISION)
         {
             return None;
         }
@@ -305,6 +308,7 @@ impl Recommendation {
                 crate::scheduler::fingerprint(event) == self.fingerprint
                     && (self.suggestion.kind == Kind::Manual || !event.unconfirmed())
                     && !cancelled(event)
+                    && (self.suggestion.kind != Kind::MissingMaterials || materials_event(event))
                     && (!matches!(
                         self.suggestion.kind,
                         Kind::Preparation
@@ -806,28 +810,38 @@ pub fn known_categories(calendar: &Calendar) -> Vec<String> {
         .collect()
 }
 
+fn blocker_title(title: &str) -> bool {
+    let words = crate::search::words(title);
+    let text = format!(" {} ", words.join(" "));
+    words.iter().any(|word| word == "blocker")
+        && !["not a blocker", "not blocker", "no blocker", "neni blocker", "nebude blocker",
+            "ne blocker", "nikoli blocker", "nikoliv blocker"].iter()
+            .any(|phrase| text.contains(&format!(" {phrase} ")))
+}
+
+fn named_category(known: &[String], name: &str) -> Option<String> {
+    let mut matches = known.iter().filter(|category| crate::search::key(category) == name);
+    let first = matches.next()?;
+    matches.next().is_none().then(|| first.clone())
+}
+
 /// Conservative, local-only suggestions; missing categories or conflicting evidence mean no guess.
 pub fn acceptance_category(event: &Event, known: &[String]) -> Option<String> {
     if real_categories(event).iter().any(|category| !category.eq_ignore_ascii_case("follow")) {
         return None;
     }
+    if blocker_title(&event.title) {
+        return named_category(known, "nejiste");
+    }
+    venue_category(event).and_then(|name| named_category(known, name))
+}
+
+fn venue_category(event: &Event) -> Option<&'static str> {
     let title = crate::search::words(&event.title);
     let location = crate::search::words(&event.location).join(" ");
     let preview = event.extra.get("bodyPreview").and_then(serde_json::Value::as_str).unwrap_or_default();
     let text = format!(" {} {} {} ", title.join(" "), location, crate::search::words(preview).join(" "));
     let has = |phrases: &[&str]| phrases.iter().any(|phrase| text.contains(&format!(" {phrase} ")));
-    let category = |name| {
-        let mut matches = known.iter().filter(|category| crate::search::key(category) == name);
-        let first = matches.next()?;
-        matches.next().is_none().then(|| first.clone())
-    };
-    if title.iter().any(|word| word == "blocker") {
-        if has(&["not a blocker", "not blocker", "no blocker", "neni blocker", "nebude blocker",
-            "ne blocker", "nikoli blocker", "nikoliv blocker"]) {
-            return None;
-        }
-        return category("blocker").or_else(|| category("nejiste"));
-    }
     if has(&["not", "no", "ne", "neni", "nikoli", "nikoliv", "nebude", "nebudeme", "nejsme",
         "maybe", "possibly", "mozna", "tbd", "to be confirmed", "to be decided",
         "unconfirmed", "nepotvrzeno", "nepotvrzeny"])
@@ -845,8 +859,8 @@ pub fn acceptance_category(event: &Event, known: &[String]) -> Option<String> {
     if (office && onsite) || ((office || onsite) && remote_only) {
         return None;
     }
-    if onsite { return category("mimooffice"); }
-    if office { return category("office"); }
+    if onsite { return Some("mimooffice"); }
+    if office { return Some("office"); }
     if has(&["onsite", "on site", "in person", "osobne", "adresa", "address", "location",
         "misto", "room", "budova", "zasedacka", "zasedaci mistnost"])
     {
@@ -859,7 +873,7 @@ pub fn acceptance_category(event: &Event, known: &[String]) -> Option<String> {
         || event.join_url().is_some()
         || (!location.is_empty() && remote_location)
         || remote_only;
-    if remote_location && online { category("call") } else { None }
+    (remote_location && online).then_some("call")
 }
 
 pub fn category_meanings(categories: &[String]) -> serde_json::Value {
@@ -868,8 +882,8 @@ pub fn category_meanings(categories: &[String]) -> serde_json::Value {
             "office" => "In person at the user's home office or employer's premises. A customer's or partner's office is not this category. Require affirmative evidence of the home/employer office.",
             "mimo office" => "In person away from the user's home/employer office, including a customer's or partner's premises within the home city.",
             "mimo prahu" => "A trip or in-person meeting outside Prague; do not infer a route or duration from the category alone.",
-            "call" => "Remote participation by video or phone. A conference link alone does not make an explicitly in-person or hybrid visit remote.",
-            "nejisté" | "nejiste" => "A genuinely uncertain or tentative event. Not a generic logistics, travel or preparation category. A buffer inherits uncertainty only from an uncertain parent meeting; confirmed meetings have uncategorized buffers.",
+            "call" => "Remote participation by video or phone. A conference link alone does not make an explicitly in-person or hybrid visit remote. A BLOCKER title takes priority: use the existing uncertainty category, not call, even if accepted or linked to Teams.",
+            "nejisté" | "nejiste" => "A genuinely uncertain or tentative event. A BLOCKER title requires this category even if the invitation is accepted or includes a Teams link; uncertainty takes priority over participation mode. Not a generic logistics, travel or preparation category. A buffer inherits uncertainty only from an uncertain parent meeting; confirmed meetings have uncategorized buffers.",
             _ => return None,
         };
         Some((category.clone(), serde_json::Value::String(meaning.into())))
@@ -887,14 +901,22 @@ pub fn complete_suggestions(
         return Ok(Vec::new());
     }
     let categories = known_categories(calendar);
-    suggestions.retain(|suggestion| {
-        suggestion.kind != Kind::Category
-            || (suggestion
-                .category
-                .as_ref()
-                .is_some_and(|category| categories.contains(category))
-                && real_categories(event)
-                    != suggestion.category.iter().cloned().collect::<Vec<_>>())
+    let blocker = blocker_title(&event.title);
+    let uncertain = named_category(&categories, "nejiste");
+    let mut current_categories = real_categories(event);
+    if blocker {
+        current_categories.retain(|category| !category.eq_ignore_ascii_case("follow"));
+    }
+    suggestions.retain_mut(|suggestion| {
+        if suggestion.kind != Kind::Category { return true; }
+        if blocker {
+            let Some(category) = &uncertain else { return false; };
+            suggestion.category = Some(category.clone());
+            suggestion.reason = format!("The title marks this meeting as a BLOCKER, so its reservation remains uncertain even if accepted or linked to Teams. Use the existing {category} category.");
+            suggestion.reason_cs = format!("Název označuje schůzku jako BLOCKER, jde proto o nejistou rezervaci i po přijetí pozvánky nebo s odkazem na Teams. Přiřaď jí kategorii {category}.");
+        }
+        suggestion.category.as_ref().is_some_and(|category| categories.contains(category))
+            && current_categories != suggestion.category.iter().cloned().collect::<Vec<_>>()
     });
     let offsite_category = |category: &String| {
         matches!(
@@ -907,17 +929,19 @@ pub fn complete_suggestions(
         .find_map(|suggestion| suggestion.category.as_ref())
         .map(|category| vec![category.clone()])
         .unwrap_or_else(|| real_categories(event));
-    let offsite = effective_categories.iter().any(offsite_category);
+    let venue = blocker.then(|| venue_category(event)).flatten();
+    let offsite = effective_categories.iter().any(offsite_category) || venue == Some("mimooffice");
     let remote = !offsite
-        && effective_categories
+        && (venue == Some("call") || effective_categories
             .iter()
-            .any(|category| category.trim().eq_ignore_ascii_case("call"));
+            .any(|category| category.trim().eq_ignore_ascii_case("call")));
     let placeholder = logistics_buffer(event);
     let context = calendar_context(calendar, event);
     suggestions.retain(|suggestion| {
         if suggestion.kind.is_travel() && (remote || event.is_all_day || placeholder)
             || suggestion.kind.is_preparation() && (event.is_all_day || placeholder)
             || suggestion.kind == Kind::FollowUp && placeholder
+            || suggestion.kind == Kind::MissingMaterials && !materials_event(event)
         {
             return false;
         }
@@ -1106,20 +1130,109 @@ pub struct MaterialContact {
     pub same_domain: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterialsAssessment {
+    pub customer_meeting: bool,
+    pub high_profile: bool,
+    pub high_profile_reason: String,
+    pub purpose_unknown: bool,
+    pub role_unknown: bool,
+    pub mail_searched: bool,
+    pub teams_searched: bool,
+    pub research_complete: bool,
+    pub context_found: bool,
+}
+
+impl MaterialsAssessment {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.high_profile_reason.len() > 800 || self.high_profile_reason.chars().any(char::is_control) {
+            return Err("Missing-material assessment exceeds its text bounds".into());
+        }
+        Ok(())
+    }
+}
+
+fn materials_event(event: &Event) -> bool {
+    event.accepted() && !cancelled(event) && !blocker_title(&event.title)
+        && !logistics_buffer(event) && buffer_category(event).is_none()
+}
+
+fn identity_emails(
+    work_email: &str,
+    identity: Option<&crate::workiq::connection::Identity>,
+) -> (Option<String>, Option<String>) {
+    let own_email = crate::calendar::person_email(work_email);
+    let primary_email = identity
+        .filter(|identity| own_email.as_deref().is_some_and(|email| identity.account.eq_ignore_ascii_case(email)))
+        .and_then(|identity| identity.mail.as_deref())
+        .and_then(crate::calendar::person_email);
+    (own_email, primary_email)
+}
+
+pub fn materials_candidate(
+    event: &Event,
+    work_email: &str,
+    identity: Option<&crate::workiq::connection::Identity>,
+) -> bool {
+    if !materials_event(event) || event.extra.get("isOrganizer") == Some(&serde_json::Value::Bool(true)) {
+        return false;
+    }
+    let Some(organizer) = crate::calendar::person_email(&event.organizer) else { return false; };
+    let Some((_, organizer_domain)) = organizer.split_once('@') else { return false; };
+    let (own_email, primary_email) = identity_emails(work_email, identity);
+    let Some(own_email) = own_email else { return false; };
+    [Some(own_email), primary_email].into_iter().flatten().all(|email| {
+        email.split_once('@').is_some_and(|(_, domain)| {
+            organizer_domain != domain && !organizer_domain.ends_with(&format!(".{domain}"))
+                && !domain.ends_with(&format!(".{organizer_domain}"))
+        })
+    })
+}
+
+pub fn filter_missing_materials(
+    event: &Event,
+    work_email: &str,
+    identity: Option<&crate::workiq::connection::Identity>,
+    payload: &serde_json::Value,
+    suggestions: &mut Vec<Suggestion>,
+) -> Result<(), String> {
+    if !suggestions.iter().any(|suggestion| suggestion.kind == Kind::MissingMaterials) { return Ok(()); }
+    let assessment = payload.get("materials_assessment").filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<MaterialsAssessment>(value.clone()))
+        .transpose().map_err(|_| "Invalid saved missing-material assessment")?;
+    let evidence = payload.get("retrieved_evidence")
+        .map(|value| serde_json::from_value::<crate::evidence::Snapshot>(value.clone()))
+        .transpose().map_err(|_| "Invalid saved missing-material research evidence")?;
+    if let Some(assessment) = &assessment { assessment.validate()?; }
+    if let Some(evidence) = &evidence { evidence.validate()?; }
+    let researched = evidence.as_ref().is_some_and(|evidence| {
+        let context = evidence.records.iter().any(|record|
+            record.succeeded && record.tool == crate::workiq::connection::CONTEXT_TOOL);
+        let mail = evidence.records.iter().any(|record| record.succeeded
+            && (record.tool.starts_with("WorkIQ-Mail-")
+                || (record.tool == crate::workiq::connection::SDK_TOOL && record.resource.as_deref()
+                    .is_some_and(|resource| resource.starts_with("/me/messages")))));
+        let teams = evidence.records.iter().any(|record|
+            record.succeeded && record.tool.starts_with("WorkIQ-Teams-"));
+        evidence.omitted == 0 && (context || (mail && teams))
+    });
+    let eligible = materials_candidate(event, work_email, identity) && researched
+        && assessment.as_ref().is_some_and(|assessment| assessment.customer_meeting && assessment.high_profile
+            && !assessment.high_profile_reason.trim().is_empty()
+            && assessment.purpose_unknown && assessment.role_unknown
+            && assessment.mail_searched && assessment.teams_searched
+            && assessment.research_complete && !assessment.context_found);
+    suggestions.retain(|suggestion| suggestion.kind != Kind::MissingMaterials || eligible);
+    Ok(())
+}
+
 pub fn material_contacts(
     event: &Event,
     work_email: &str,
     identity: Option<&crate::workiq::connection::Identity>,
 ) -> Vec<MaterialContact> {
-    let own_email = crate::calendar::person_email(work_email);
-    let primary_email = identity
-        .filter(|identity| {
-            own_email
-                .as_deref()
-                .is_some_and(|email| identity.account.eq_ignore_ascii_case(email))
-        })
-        .and_then(|identity| identity.mail.as_deref())
-        .and_then(crate::calendar::person_email);
+    let (own_email, primary_email) = identity_emails(work_email, identity);
     let own_domain = primary_email
         .as_ref()
         .or(own_email.as_ref())
@@ -1443,7 +1556,8 @@ mod tests {
         event.title = "BLOCKER: Planning".into();
         event.category.clear();
         event.extra.insert("categories".into(), serde_json::json!([]));
-        assert_eq!(acceptance_category(&event, &["Blocker".into(), "Nejisté".into()]).as_deref(), Some("Blocker"));
+        assert_eq!(acceptance_category(&event, &["Blocker".into(), "Nejisté".into()]).as_deref(), Some("Nejisté"));
+        assert_eq!(acceptance_category(&event, &["Blocker".into(), "Call".into()]), None, "A BLOCKER never falls back to another category");
         event.title = "Planning".into();
         event.location = "Teams".into();
         event.extra.insert("categories".into(), serde_json::json!(["Follow"]));

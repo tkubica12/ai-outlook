@@ -712,6 +712,171 @@ fn office_means_home_employer_premises_and_not_any_office() {
 }
 
 #[test]
+fn blocker_category_overrides_accepted_teams_and_venue_without_inventing_categories() {
+    let (_, mut event, now) = offsite_fixture();
+    event.location = "Microsoft Teams Meeting".into();
+    event.category.clear();
+    event.extra.insert("categories".into(), serde_json::json!([]));
+    event.extra.insert("isOnlineMeeting".into(), true.into());
+    let suggestion = |kind, category: Option<&str>| Suggestion {
+        kind, category: category.map(str::to_owned),
+        minutes: kind.is_travel().then_some(30),
+        reason: "Accepted Teams invitation, so use call.".into(),
+        reason_cs: "Prijata pozvanka na Teams, proto call.".into(),
+    };
+    for (known, expected) in [
+        (vec!["call", "office", "Blocker", "Nejisté"], Some("Nejisté")),
+        (vec!["call", "nejiste"], Some("nejiste")),
+        (vec!["call", "NEJISTÉ"], Some("NEJISTÉ")),
+        (vec!["call", "Blocker"], None),
+        (vec!["call", "Nejisté", "nejiste"], None),
+    ] {
+        for title in ["Blocker Example tech session", "BLOCKER: Planning", "Workshop (blocker)"] {
+            event.title = title.into();
+            let mut reference = event.clone();
+            reference.id = "category-reference".into();
+            reference.category = known.join(", ");
+            reference.extra.insert("categories".into(), serde_json::json!(known));
+            let calendar = Calendar::build(vec![event.clone(), reference], Default::default(), vec![]).unwrap();
+            assert_eq!(recommendations::acceptance_category(&event, &known.iter().map(|name| (*name).into()).collect::<Vec<_>>()).as_deref(), expected);
+            let completed = recommendations::complete_suggestions(&calendar, &event, vec![
+                suggestion(Kind::Category, Some("call")), suggestion(Kind::Travel, None), suggestion(Kind::TravelAfter, None),
+            ]).unwrap();
+            assert_eq!(completed.len(), usize::from(expected.is_some()), "{known:?} / {title}");
+            if let Some(category) = expected {
+                assert_eq!(completed[0].category.as_deref(), Some(category));
+                assert!(completed[0].reason.contains("BLOCKER") && completed[0].reason_cs.contains("BLOCKER"));
+                assert!(!completed[0].reason.contains("so use call"));
+                let record = Recommendation::from_insights(&event, "owner", completed[0].clone(), now).unwrap();
+                assert!(matches!(recommendations::proposed_change(&record, &calendar, Some("owner"), now, tomlook::i18n::Language::Cs).unwrap(),
+                    Change::Category(value) if value == category));
+                for tags in [vec![category], vec![category, "Follow"]] {
+                    event.extra.insert("categories".into(), serde_json::json!(tags));
+                    assert!(recommendations::complete_suggestions(&calendar, &event, vec![suggestion(Kind::Category, Some("call"))]).unwrap().is_empty());
+                }
+                event.extra.insert("categories".into(), serde_json::json!([]));
+            }
+        }
+    }
+    event.title = "BLOCKER: Customer workshop".into();
+    event.location = "Customer office".into();
+    let mut reference = event.clone();
+    reference.id = "category-reference".into();
+    reference.extra.insert("categories".into(), serde_json::json!(["call", "Nejisté"]));
+    let calendar = Calendar::build(vec![event.clone(), reference], Default::default(), vec![]).unwrap();
+    let completed = recommendations::complete_suggestions(&calendar, &event, vec![suggestion(Kind::Category, Some("call"))]).unwrap();
+    assert_eq!(completed[0].category.as_deref(), Some("Nejisté"));
+    assert!(completed.iter().any(|suggestion| suggestion.kind == Kind::Travel));
+    assert!(completed.iter().any(|suggestion| suggestion.kind == Kind::TravelAfter));
+    event.location = "Microsoft Teams Meeting".into();
+    event.title = "Not a blocker".into();
+    let completed = recommendations::complete_suggestions(&calendar, &event, vec![suggestion(Kind::Category, Some("call"))]).unwrap();
+    assert_eq!(completed[0].category.as_deref(), Some("call"), "An explicit negation is not an uncertain reservation");
+}
+
+#[test]
+fn missing_materials_requires_external_high_profile_customer_and_completed_contextless_research() {
+    let (_, mut event, now) = offsite_fixture();
+    event.organizer = "Customer host <host@customer.example>".into();
+    event.extra.insert("isOrganizer".into(), false.into());
+    event.category.clear();
+    event.extra.insert("categories".into(), serde_json::json!([]));
+    let owner = "user@employer.example";
+    let assessment = serde_json::json!({
+        "customer_meeting":true, "high_profile":true, "high_profile_reason":"An executive decision on a major customer commitment is at stake.",
+        "purpose_unknown":true, "role_unknown":true, "mail_searched":true, "teams_searched":true,
+        "research_complete":true, "context_found":false
+    });
+    let record = |tool: &str, succeeded: bool| tomlook::evidence::Record {
+        ordinal: 1, tool: tool.into(), observed_at: now.to_rfc3339(), succeeded,
+        resource: None, excerpt: "Mail and Teams searched; no relevant context found.".into(),
+        truncated: false, links: vec![],
+    };
+    let payload = serde_json::json!({
+        "materials_assessment": assessment,
+        "retrieved_evidence": tomlook::evidence::Snapshot {
+            records: vec![record(tomlook::workiq::connection::CONTEXT_TOOL, true)], omitted:0,
+        },
+    });
+    let suggestions = || [Kind::MissingMaterials, Kind::Transition].map(|kind| Suggestion {
+        kind, category: None, minutes: None,
+        reason: "The purpose and expected role remain unknown; ask the verified customer organizer.".into(),
+        reason_cs: "Ucel a ocekavana role zustavaji nezname; obrat se na overeneho organizatora.".into(),
+    }).to_vec();
+    let retained = |event: &calendar::Event, owner: &str, payload: &serde_json::Value| {
+        let mut suggestions = suggestions();
+        recommendations::filter_missing_materials(event, owner, None, payload, &mut suggestions).unwrap();
+        assert!(suggestions.iter().any(|suggestion| suggestion.kind == Kind::Transition));
+        suggestions.iter().any(|suggestion| suggestion.kind == Kind::MissingMaterials)
+    };
+    assert!(retained(&event, owner, &payload));
+    for field in ["customer_meeting", "high_profile", "purpose_unknown", "role_unknown", "mail_searched", "teams_searched", "research_complete"] {
+        let mut incomplete = payload.clone();
+        incomplete["materials_assessment"][field] = false.into();
+        assert!(!retained(&event, owner, &incomplete), "{field}");
+    }
+    for (field, value) in [("context_found", serde_json::json!(true)), ("high_profile_reason", serde_json::json!("   "))] {
+        let mut incomplete = payload.clone();
+        incomplete["materials_assessment"][field] = value;
+        assert!(!retained(&event, owner, &incomplete), "{field}");
+    }
+    let mut legacy = payload.clone();
+    legacy.as_object_mut().unwrap().remove("materials_assessment");
+    assert!(!retained(&event, owner, &legacy), "Old or unqualified material suggestions are suppressed");
+    for records in [
+        vec![], vec![record(tomlook::workiq::connection::CONTEXT_TOOL, false)],
+        vec![record("WorkIQ-Mail-SearchMessages", true)],
+        vec![record("WorkIQ-Mail-SearchMessages", true), record("WorkIQ-Teams-SearchTeamsMessages", false)],
+    ] {
+        let mut incomplete = payload.clone();
+        incomplete["retrieved_evidence"]["records"] = serde_json::to_value(records).unwrap();
+        assert!(!retained(&event, owner, &incomplete));
+    }
+    let mut targeted = payload.clone();
+    targeted["retrieved_evidence"]["records"] = serde_json::to_value(vec![
+        record("WorkIQ-Mail-SearchMessages", true), record("WorkIQ-Teams-SearchTeamsMessages", true),
+    ]).unwrap();
+    assert!(retained(&event, owner, &targeted));
+    targeted["retrieved_evidence"]["omitted"] = 1.into();
+    assert!(!retained(&event, owner, &targeted), "Missing captured coverage is not proof of no context");
+    for organizer in ["Colleague <person@employer.example>", "Corporate events <events@events.employer.example>", ""] {
+        let mut internal = event.clone();
+        internal.organizer = organizer.into();
+        assert!(!retained(&internal, owner, &payload), "{organizer}");
+    }
+    assert!(!retained(&event, "unknown owner", &payload), "Unknown ownership cannot establish an external organizer");
+    let identity = tomlook::workiq::connection::Identity {
+        account: "user@tenant.example".into(), mail: Some(owner.into()), display_name: None,
+    };
+    let mut corporate = event.clone();
+    corporate.organizer = "events@events.employer.example".into();
+    assert!(!recommendations::materials_candidate(&corporate, &identity.account, Some(&identity)), "The verified primary domain also identifies internal events");
+    corporate.organizer = "host@customer.example".into();
+    assert!(recommendations::materials_candidate(&corporate, &identity.account, Some(&identity)));
+    for title in ["BLOCKER: Customer workshop", "Blocker Example tech session", "Travel buffer", "Preparation"] {
+        let mut placeholder = event.clone();
+        placeholder.title = title.into();
+        assert!(!retained(&placeholder, owner, &payload), "{title}");
+        let calendar = Calendar::build(vec![placeholder.clone()], Default::default(), vec![]).unwrap();
+        assert!(!recommendations::complete_suggestions(&calendar, &placeholder, suggestions()).unwrap()
+            .iter().any(|suggestion| suggestion.kind == Kind::MissingMaterials));
+    }
+    for category in ["nejisté", "Nejiste", "Blocker", "Follow"] {
+        let mut uncertain = event.clone();
+        uncertain.extra.insert("categories".into(), serde_json::json!([category]));
+        assert!(!retained(&uncertain, owner, &payload), "{category}");
+    }
+    for status in ["tentative", "notResponded", "cancelled", "unknown"] {
+        let mut uncertain = event.clone();
+        uncertain.status = status.into();
+        assert!(!retained(&uncertain, owner, &payload), "{status}");
+    }
+    let mut malformed = payload;
+    malformed["materials_assessment"]["role_unknown"] = "yes".into();
+    assert!(recommendations::filter_missing_materials(&event, owner, None, &malformed, &mut suggestions()).is_err());
+}
+
+#[test]
 fn offsite_suggestions_cover_arrival_and_departure_without_inventing_a_route() {
     let (calendar, event, now) = offsite_fixture();
     let suggestions = recommendations::complete_suggestions(&calendar, &event, vec![]).unwrap();
@@ -963,6 +1128,17 @@ fn legacy_category_rules_expire_without_hiding_unknown_writes_or_discarding_prep
     assert!(!legacy.visible(&calendar, Some("owner"), now));
     legacy.state = State::Review;
     assert!(legacy.visible(&calendar, Some("owner"), now));
+    for kind in [Kind::Category, Kind::Travel, Kind::MissingMaterials] {
+        let mut previous_policy = record.clone();
+        previous_policy.policy_revision = 2;
+        previous_policy.suggestion.kind = kind;
+        previous_policy.suggestion.category = (kind == Kind::Category).then(|| "office".into());
+        previous_policy.suggestion.minutes = kind.is_travel().then_some(30);
+        assert!(previous_policy.current(&calendar, Some("owner"), now).is_none());
+        assert!(!previous_policy.visible(&calendar, Some("owner"), now));
+        previous_policy.state = State::Review;
+        assert!(previous_policy.visible(&calendar, Some("owner"), now), "Uncertain outcomes remain available for readback");
+    }
     legacy.state = State::Pending;
     legacy.suggestion.kind = Kind::Preparation;
     legacy.suggestion.category = None;
