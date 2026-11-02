@@ -91,7 +91,7 @@ pub(crate) fn key(text: &str) -> String {
         .collect()
 }
 
-fn words(text: &str) -> Vec<String> {
+pub(crate) fn words(text: &str) -> Vec<String> {
     let text = text
         .chars()
         .flat_map(char::to_lowercase)

@@ -35,7 +35,7 @@ safeguards are in [privacy-and-safety.md](privacy-and-safety.md).
 - **Status bar:** connections (GitHub Copilot, Foundry, WorkIQ, MSX, WebIQ,
   GitHub), the Insights activity count, the recommendation bell, and small
   **Setup x/5** and **Update X.Y.Z ready** indicators when relevant. Each entry
-  opens its dialog.
+  opens its dialog. The footer also shows the running Tomlook version.
 
 Closing or minimizing hides Tomlook to the tray; background work continues.
 Restore it from the tray icon (**Open Tomlook**) or by starting Tomlook again.
@@ -73,9 +73,11 @@ Right-click a meeting, press **Shift+F10**, or use **Meeting actions**:
 
 | Action | Behavior |
 |---|---|
+| **Prepare for this meeting** | Opens Ask AI with the clicked meeting as context and runs `/prepare`. |
+| **Check BLOCKER** | Opens Ask AI with the clicked meeting as context and runs `/blocker` to investigate whether the reservation is still needed. |
 | Category | Sets one existing category or clears categories immediately; the Follow marker is preserved. |
 | **Follow** / **Stop following** | Adds the `Follow` category and sets availability to free in one update; the organizer gets no response. Stop following removes only the category. Followed meetings are not prepared automatically or reminded. |
-| Accept / Tentative / Decline | Confirmation with optional comment and a "send response" choice; Decline defaults to not notifying the organizer. |
+| Accept / Tentative / Decline | Confirmation with optional comment and a "send response" choice; Accept also offers category chips. Decline defaults to not notifying the organizer. |
 | Cancel meeting | Organizer only; notifies attendees after confirmation. |
 | Delete | Only your own appointments without attendees, after confirmation. |
 | **Add travel blocks before and after** | Your own timed meetings: two adjacent busy blocks (15–180 minutes, default 30) after confirmation. |
@@ -85,6 +87,30 @@ Only single events, occurrences and exceptions can be changed; series masters
 are read-only. Every change is verified by reading it back; results and
 uncertain outcomes appear in **Messages**. An unavailable action stays visible
 with the reason on hover.
+
+The two Ask AI actions also work from **Shift+F10** and **Meeting actions**.
+They switch directly to **Thorough**, bypassing Auto, and preserve unsent questions.
+They require an AI connection and do not change the calendar or send messages.
+
+### Categories when accepting
+
+The acceptance dialog lets you choose any ordinary category already known
+from the synchronized calendar. Category buttons use the same colored backgrounds
+and selected outline as the new-event dialog. A fast local rule can preselect one:
+
+| Clear evidence | Suggested existing category |
+|---|---|
+| Teams or another recognized online-only location, or online metadata with no physical-location clue | Call |
+| Your own/employer's office | Office |
+| Customer/client premises | Mimo office |
+| `BLOCKER` as a title word | Blocker, otherwise Nejisté |
+
+Rules use the cached title, location and invitation preview, never AI or a
+network call. Apart from an explicit BLOCKER title, ambiguous, conflicting or
+tentative wording stays uncategorized; existing categories are kept.
+Override the suggestion or choose **No category**
+(**Keep current category** for an already categorized invitation). Nothing is
+written until you confirm **Accept invitation**; Follow is preserved.
 
 ## Creating events and inviting people
 
@@ -199,10 +225,25 @@ adds a line, **Stop** cancels; hiding the panel never cancels.
 
 Slash commands appear after typing `/`: `/today`, `/week`, `/search <words>`
 and `/insights` (with a meeting) run locally without AI or network;
-`/prepare` (with a meeting), `/conflicts` and `/find <text>` expand to model
+`/prepare` (with a meeting), `/conflicts`, `/find <text>` and `/blocker` expand to model
 questions; `/travel` and `/categories` review the next 14 days in the
 background and put proposals in the recommendation bell. `/search` is
 typo-tolerant and accent-insensitive.
+
+**`/blocker`** investigates the meeting selected as Ask's context;
+**`/blocker <topic or person>`** also works without a selected meeting.
+You can also right-click the reservation and choose **Check BLOCKER**.
+The ready-made prompt checks related reservations and possible final
+invitations, then dated email and Teams discussions, polls and decisions.
+It distinguishes original-source evidence from search summaries and missing
+access. The result says which reservations to keep, which look superseded
+and which remain unclear. If needed, it identifies the organizer or other
+evidence-backed contact and drafts a message asking whether to keep the
+reservation. It never sends that message or removes anything. Ask explicitly
+for cleanup afterward to get approval-gated deletion proposals.
+Both `/blocker` and `/prepare`, whether typed or started from a meeting menu,
+always use **Thorough** without an Auto decision. They report anything they
+could not verify within their limits.
 
 Conversations are kept in memory only (up to 32 turns per context) and
 cleared on exit. Thorough research saves private checkpoints, so after an
@@ -223,8 +264,9 @@ meeting, or a transition. Each card shows the action, the meeting and the
 rationale, with **Open Insights** and **Skip recommendation** (remembered
 permanently) at the top; the action button approves the change. Conflict
 cards offer tentative/decline/cancel/delete according to your role.
-Recommendations only cover the next 14 days; follow-ups appear after the
-meeting ends.
+Automatic recommendations only cover the next 14 days; follow-ups appear
+after the meeting ends. Explicit AI-proposed changes can target any saved
+occurrence, including later meetings and old BLOCKERs.
 
 Preparation and travel blocks are placed on weekdays 08:00–18:00 in free
 time; arrival travel ends exactly at the meeting start and departure travel
@@ -245,12 +287,32 @@ proposal instead of describing a change:
 - add one travel block (15–180 minutes) before or after an accepted timed
   meeting;
 - edit the title or description of an event you organize (Teams meetings:
-  append only, so the join information is kept).
+  append only, so the join information is kept);
+- create a timed event (up to 24 hours), optionally private, categorized,
+  with Teams and required/optional attendees;
+- remove specific saved events, including obsolete BLOCKERs created outside
+  Tomlook. Your own appointments without attendees are deleted; meetings
+  you organize with attendees are cancelled and notify everyone; invitations
+  are declined without sending a response. Each proposal targets only one
+  occurrence, never an entire recurring series.
 
 **Review changes** opens the exact proposal in Messages with a before/after
-preview; only **Approve change** applies it. Saying "approve" in chat never
-does. Approved document sections survive later automatic preparation. At
-most four proposals per question and sixteen pending per account.
+preview and the notification consequences; only **Approve change** applies
+it. Creation proposals appear under **Event creation** with the full times
+and UTC offsets, description, privacy, category, Teams setting, recipients
+and cached conflict warnings. Only **Approve and create event** or
+**Create and send invitations** submits them; **Dismiss event proposal**
+creates nothing. Attendee availability is not checked by this preview.
+Pending proposals survive restart; uncertain writes are never retried
+automatically. Saying "approve" in chat never executes a proposal.
+
+For example, after researching a final invitation, ask to remove the obsolete
+BLOCKERs. The assistant resolves each saved occurrence, stages the removals,
+and leaves the final invitation unchanged; review the proposed titles and
+times before approving. If multiple matches are ambiguous, clarify them
+first. At most four proposals per question and sixteen pending proposals of
+each type per account are allowed. Approved document sections survive later
+automatic preparation.
 
 ## Notes after meetings
 

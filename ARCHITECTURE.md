@@ -111,6 +111,12 @@ flowchart LR
   recommendations, proposals) are durable records bound to account, event
   occurrence and fingerprint; settings keys such as
   `meeting-reminders-fired-v1` record once-only notifications.
+  Ask's `tomlook_propose_meeting_change` stages both creation and removal
+  proposals, never provider writes. New events use the existing creation
+  ledger in `Pending` state; only the UI's exact approval consumes it into
+  `Creating`. Existing-event removals use the recommendation ledger and
+  organizer-aware delete/cancel/decline actions. Both flows reuse the typed
+  WorkIQ writers and read-back verification; chat has no approval tool.
 
 ## Calendar synchronization
 

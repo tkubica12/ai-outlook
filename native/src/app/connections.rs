@@ -405,6 +405,11 @@ impl Tomlook {
     }
 }
 
+pub(super) fn version_label(ui: &mut egui::Ui, language: tomlook::i18n::Language) {
+    ui.weak(concat!("v", env!("CARGO_PKG_VERSION")))
+        .on_hover_text(language.text("Current version"));
+}
+
 pub(super) fn status_text(
     ui: &mut egui::Ui,
     identity: &str,

@@ -36,6 +36,10 @@ pub enum Command {
         draft: Box<crate::event_creation::Draft>,
         parent: Option<Box<calendar::Event>>,
     },
+    DismissEventCreation {
+        id: String,
+        account: String,
+    },
     /// Saves a new scheduling proposal if needed and approves its BLOCKERs in your own calendar.
     HoldTimes {
         account: String,
@@ -679,9 +683,43 @@ fn blocker_index(proposals: &Proposals) -> std::collections::BTreeMap<String, St
         .collect()
 }
 
+fn record_blocker_removal(
+    store: &Store,
+    proposals: &mut Proposals,
+    account: &str,
+    event_id: &str,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> Result<bool, String> {
+    let mut changed = false;
+    for mut proposal in store.proposals_except(account, |_| true)?.into_values() {
+        let mut removed = false;
+        for blocker in &mut proposal.blockers {
+            if blocker.event_id.as_deref() == Some(event_id)
+                && matches!(blocker.state, crate::scheduling::BlockerState::Held
+                    | crate::scheduling::BlockerState::ReleaseReview)
+            {
+                blocker.state = crate::scheduling::BlockerState::Released;
+                blocker.message = "Calendar change verified by read-back".into();
+                removed = true;
+            }
+        }
+        if removed {
+            proposal.updated_at = now;
+            store.save_proposal(&proposal)?;
+            if proposals.get(&proposal.id).is_some_and(|current| current.account == account) {
+                proposals.insert(proposal.id.clone(), proposal);
+                changed = true;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn propose_change(
     store: &mut Store,
     inbox: &mut std::collections::BTreeMap<String, crate::recommendations::Recommendation>,
+    creations: &mut std::collections::BTreeMap<String, crate::event_creation::Record>,
     calendar: &Calendar,
     account: &str,
     request: crate::changes::Request,
@@ -692,6 +730,38 @@ fn propose_change(
     let owner = store.calendar_owner()?.ok_or("Refresh the signed-in calendar before proposing changes")?;
     if !owner.eq_ignore_ascii_case(account) {
         return Err("The calendar account changed; no proposal was saved".into());
+    }
+    if let Action::Create { event } = &request.action {
+        let draft = event.draft(language);
+        draft.validate_categories(&known_categories(calendar))?;
+        if draft.start <= chrono::Local::now().fixed_offset() {
+            return Err("The proposed event starts in the past; choose a future time".into());
+        }
+        if draft.attendees.iter().any(|attendee| attendee.email.eq_ignore_ascii_case(&owner)) {
+            return Err("Your own mailbox is the organizer and cannot be invited".into());
+        }
+        let mut record = crate::event_creation::Record::new(owner, draft)?;
+        if let Some(previous) = creations.get(&record.id) {
+            if previous.state != crate::event_creation::State::Pending {
+                return Err("This exact proposal was already handled; inspect its outcome before requesting a new change".into());
+            }
+        } else {
+            if creations.len() >= 512 || creations.values().filter(|previous|
+                previous.account == record.account && previous.state == crate::event_creation::State::Pending).count() >= 16
+            {
+                return Err("Review existing pending changes before asking for more proposals".into());
+            }
+            record.state = crate::event_creation::State::Pending;
+            record.message = match language {
+                crate::i18n::Language::En => request.reason,
+                crate::i18n::Language::Cs => request.reason_cs,
+            };
+            store.propose_event_creation(&record)?;
+            creations.insert(record.id.clone(), record.clone());
+        }
+        return Ok(serde_json::json!({"change_id":record.id,"state":"pending_approval",
+            "event":record.draft,
+            "note":"Only a pending event proposal was saved. No calendar write or invitation was sent. The user must click Review changes and approve the exact event in Tomlook Messages; chat cannot approve it."}));
     }
     let event = calendar.events.iter().find(|event| event.id == request.id)
         .ok_or("Choose a meeting from this account's saved calendar")?;
@@ -712,6 +782,8 @@ fn propose_change(
         if stale { record.state = State::Expired; }
     }
     let change = match request.action {
+        Action::Create { .. } => unreachable!("New event proposals are handled before resolving a meeting"),
+        Action::Delete {} => crate::recommendations::removal_change(event)?,
         Action::Document { document, revision, sections } => {
             let value = store.document(&owner, event, document)?.ok_or("This meeting has no saved document to edit")?;
             Change::Document(crate::changes::DocumentEdit::new(document, revision, sections, &value)?)
@@ -756,6 +828,7 @@ fn propose_change(
     *inbox = next;
     Ok(serde_json::json!({"change_id":proposal.id,"state":"pending_approval",
         "meeting":{"id":event.id,"title":event.title,"start":event.start,"end":event.end},
+        "action":proposal.manual_change,
         "note":"Only a pending proposal was saved. No Insights, notes or calendar event were changed. The user must review and approve this exact change in Tomlook Messages. You cannot approve it, including when a user says approve in chat."}))
 }
 
@@ -1683,9 +1756,14 @@ impl Worker {
                                     if id != recommendation.event_id {
                                         return Err("Calendar removal identity did not match its approval".into());
                                     }
-                                    calendar = Arc::new(store.remove_calendar_event(&id, &recommendation.account)?);
-                                    dirty = true;
-                                    notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: Some(recommendation.account.clone()) });
+                                    if record_blocker_removal(&store, &mut proposals, &recommendation.account, &id, now)? {
+                                        proposals_revision += 1;
+                                    }
+                                    if store.calendar_owner()?.as_deref() == Some(recommendation.account.as_str()) {
+                                        calendar = Arc::new(store.remove_calendar_event(&id, &recommendation.account)?);
+                                        dirty = true;
+                                        notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: Some(recommendation.account.clone()) });
+                                    }
                                 }
                                 crate::workiq::connection::calendar_write::Outcome::NotSent(message) => {
                                     recommendation.state = crate::recommendations::State::NotSent;
@@ -1912,14 +1990,14 @@ impl Worker {
                             break Command::Wake;
                         }
                     };
-                    let recommendation_command = matches!(&command, Command::ProposeChange { .. } | Command::CreateEvents { .. } | Command::ConfirmRecommendation { .. } | Command::ConfirmMeetingAction { .. } | Command::RecheckCalendarResult(_) | Command::DismissRecommendation(_) | Command::ReviewRecommendations { .. }
+                    let recommendation_command = matches!(&command, Command::ProposeChange { .. } | Command::CreateEvents { .. } | Command::DismissEventCreation { .. } | Command::ConfirmRecommendation { .. } | Command::ConfirmMeetingAction { .. } | Command::RecheckCalendarResult(_) | Command::DismissRecommendation(_) | Command::ReviewRecommendations { .. }
                         | Command::HoldTimes { .. } | Command::ProposeChat { .. } | Command::ReleaseBlockers { .. } | Command::ScheduleProposal { .. });
                     let result = match command {
                         Command::ProposeChange { account, request, run, reply } => {
                             let result = if exiting || options.demo.is_some() || run.cancelled.load(Ordering::Acquire) {
                                 Err("Question stopped or preview is active; no proposal was saved".into())
                             } else {
-                                propose_change(&mut store, &mut inbox, &calendar, &account, *request, preferences.language)
+                                propose_change(&mut store, &mut inbox, &mut event_creations, &calendar, &account, *request, preferences.language)
                             };
                             if result.is_ok() { inbox_revision += 1; }
                             let _ = reply.send(result);
@@ -1932,9 +2010,6 @@ impl Worker {
                                 return Err("Calendar account changed before confirmation".into());
                             }
                             if parent.is_none() { draft.validate_categories(&known_categories(&calendar))?; }
-                            if event_creations.len() >= 512 {
-                                return Err("Event creation history reached its safety limit".into());
-                            }
                             if event_creations.values().any(|record| record.state == crate::event_creation::State::Creating) {
                                 return Err("Wait for the current event creation to finish".into());
                             }
@@ -1967,6 +2042,15 @@ impl Worker {
                                 }
                                 crate::event_creation::Record::new(account, *draft)?
                             };
+                            if event_creations.len() >= 512 && !event_creations.contains_key(&record.id) {
+                                return Err("Event creation history reached its safety limit".into());
+                            }
+                            if event_creations.get(&record.id).is_some_and(|previous|
+                                matches!(previous.state, crate::event_creation::State::Pending | crate::event_creation::State::NotSent))
+                                && record.draft.start <= now
+                            {
+                                return Err("The proposed event starts in the past; choose a future time".into());
+                            }
                             store.approve_event_creation(&record)?;
                             if sdk.commands.try_send(ai::Command::CreateEvents {
                                 record: Box::new(record.clone()), reply: creation_sender.clone(), wake: wake.clone(),
@@ -1976,6 +2060,22 @@ impl Worker {
                                 store.save_event_creation(&record)?;
                             }
                             event_creations.insert(record.id.clone(), record);
+                            inbox_revision += 1;
+                            Ok(())
+                        })(),
+                        Command::DismissEventCreation { id, account } => (|| {
+                            if store.calendar_owner()?.as_deref() != Some(account.as_str()) {
+                                return Err("Calendar account changed before confirmation".into());
+                            }
+                            let previous = event_creations.get(&id)
+                                .filter(|record| record.account == account
+                                    && matches!(record.state, crate::event_creation::State::Pending | crate::event_creation::State::NotSent))
+                                .ok_or("Event proposal is no longer pending")?;
+                            let mut record = previous.clone();
+                            record.state = crate::event_creation::State::Dismissed;
+                            record.message = "Event proposal dismissed; nothing was created".into();
+                            store.save_event_creation(&record)?;
+                            event_creations.insert(id, record);
                             inbox_revision += 1;
                             Ok(())
                         })(),
@@ -2074,7 +2174,9 @@ impl Worker {
                                 return Err("Calendar account changed before confirmation".into());
                             }
                             if proposal_flights.contains_key(&id)
-                                || event_creations.values().any(|record| record.state == crate::event_creation::State::Creating) {
+                                || event_creations.values().any(|record| record.state == crate::event_creation::State::Creating)
+                                || inbox.values().any(|record| record.account == account && events.contains(&record.event_id)
+                                    && matches!(record.state, crate::recommendations::State::Dispatching | crate::recommendations::State::Review)) {
                                 return Err("Wait for the current calendar change to finish".into());
                             }
                             let mut proposal = proposals.get(&id).filter(|proposal| proposal.account == account).cloned()
@@ -2161,7 +2263,8 @@ impl Worker {
                                 && matches!(record.state, crate::recommendations::State::Dispatching | crate::recommendations::State::Review)) {
                                 return Err("Review the previous calendar operation before confirming another change".into());
                             }
-                            if let crate::recommendations::Change::Category(category) = &change {
+                            if let crate::recommendations::Change::Category(category)
+                                | crate::recommendations::Change::Respond { category: Some(category), .. } = &change {
                                 crate::recommendations::category_replacement(category, &known_categories(&calendar))?;
                             }
                             let sdk = sdk.as_ref().filter(|sdk| !sdk.terminated.load(Ordering::Acquire))
@@ -2216,6 +2319,16 @@ impl Worker {
                             let event = recommendation.current(&calendar, owner.as_deref(), now).ok_or("Recommendation expired after a calendar change")?.clone();
                             let expected_change = crate::recommendations::proposed_change(recommendation, &calendar, owner.as_deref(), now, preferences.language)?;
                             if change != expected_change { return Err("The proposed interval or action changed; review the current recommendation before confirming".into()); }
+                            if let crate::recommendations::Change::Category(category)
+                                | crate::recommendations::Change::Respond { category: Some(category), .. } = &change {
+                                crate::recommendations::category_replacement(category, &known_categories(&calendar))?;
+                            }
+                            if proposals.values().any(|proposal| proposal.account == recommendation.account
+                                && proposal.blockers.iter().any(|blocker| blocker.event_id.as_deref() == Some(event.id.as_str())
+                                    && matches!(blocker.state, crate::scheduling::BlockerState::Releasing | crate::scheduling::BlockerState::ReleaseReview)))
+                            {
+                                return Err("Review the previous calendar operation before confirming another change".into());
+                            }
                             if let crate::recommendations::Change::Document(edit) = &change {
                                 let current = store.document(owner.as_deref().ok_or("Calendar account disappeared")?, &event, edit.document)?;
                                 if current.as_ref().map(crate::changes::revision).transpose()?.as_deref() != Some(edit.revision.as_str()) {
@@ -2578,6 +2691,43 @@ impl Worker {
 mod tests {
     use super::*;
     use chrono::Local;
+
+    #[test]
+    fn ai_calendar_verified_removal_updates_only_the_matching_blocker_without_recovering_active_writes() {
+        use crate::scheduling::{BlockerState, Proposal, Slot};
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let now = Local::now().fixed_offset();
+        let start = now + chrono::Duration::days(3);
+        let proposal = |account: &str, topic: &str, held: bool| {
+            let mut proposal = Proposal::new(account, topic,
+                crate::attendees::parse_input("alex@example.invalid").unwrap(), 30,
+                vec![Slot { start, end: start + chrono::Duration::minutes(30) }],
+                crate::i18n::Language::En, now).unwrap();
+            let record = crate::event_creation::Record::blockers(account.into(), proposal.id.clone(),
+                proposal.hold_draft(false, None).unwrap(), proposal.candidates.clone()).unwrap();
+            proposal.begin_hold(&record, now).unwrap();
+            if held {
+                proposal.finish_hold(crate::event_creation::State::Created, &["tracked-blocker".into()], "", now);
+            }
+            store.save_proposal(&proposal).unwrap();
+            proposal
+        };
+        let held = proposal("owner@example.invalid", "Held", true);
+        let active = proposal("owner@example.invalid", "Still creating", false);
+        let foreign = proposal("other@example.invalid", "Held", true);
+        let mut proposals: Proposals = [held.clone(), active.clone()].into_iter()
+            .map(|proposal| (proposal.id.clone(), proposal)).collect();
+        assert!(record_blocker_removal(&store, &mut proposals, "owner@example.invalid",
+            "tracked-blocker", now + chrono::Duration::seconds(1)).unwrap());
+        assert_eq!(proposals[&held.id].blockers[0].state, BlockerState::Released);
+        assert!(!blocker_index(&proposals).contains_key("tracked-blocker"));
+        assert_eq!(store.proposal("owner@example.invalid", &held.id).unwrap().unwrap().blockers[0].state, BlockerState::Released);
+        assert_eq!(store.proposal("owner@example.invalid", &active.id).unwrap(), Some(active));
+        assert_eq!(store.proposal("other@example.invalid", &foreign.id).unwrap(), Some(foreign));
+        assert!(!record_blocker_removal(&store, &mut proposals, "owner@example.invalid",
+            "tracked-blocker", now).unwrap(), "Verified removals are idempotent");
+    }
 
     #[test]
     fn feedback_commands_run_on_the_worker_for_the_calendar_owner_only() {

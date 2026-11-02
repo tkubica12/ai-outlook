@@ -49,6 +49,198 @@ fn settings_content_has_clear_padding_from_navigation_in_both_sections_and_theme
 }
 
 #[test]
+fn acceptance_version_is_visible_and_meeting_slashes_always_bypass_auto_routing() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let context = egui::Context::default();
+        let mut text = String::new();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| version_label(ui, language));
+        output.textures_delta.clear();
+        for shape in output.shapes { append_shape_text(&shape.shape, &mut text); }
+        assert!(text.contains(concat!("v", env!("CARGO_PKG_VERSION"))), "{text}");
+        for mode in [tomlook::chat::Mode::Fast, tomlook::chat::Mode::Auto, tomlook::chat::Mode::Deep] {
+            for command in ["/PREPARE", "/blocker additional topic"] {
+                let (mut app, _, mut commands) = assistant_fixture();
+                app.preferences.language = language;
+                app.ask_mode = mode;
+                assert!(app.switch_assistant_context(Some(tomlook::calendar::fixture(1).remove(0))));
+                app.question = command.into();
+                app.ask_question();
+                let ai::Command::Chat(request) = commands.try_recv().unwrap() else { panic!("Expected an Ask request"); };
+                assert_eq!(request.mode, tomlook::chat::Mode::Deep);
+                assert_eq!(app.ask_mode, tomlook::chat::Mode::Deep);
+                assert!(app.active_request.is_none());
+                assert_eq!(app.chat.turns.back().unwrap().progress.mode, tomlook::chat::Mode::Deep);
+                assert!(commands.try_recv().is_err(), "There is no Auto decision request");
+            }
+        }
+    }
+}
+
+#[test]
+fn acceptance_dialog_preselects_clear_categories_and_allows_overrides_without_writes_or_ai() {
+    use tomlook::recommendations::{Change, MeetingResponse};
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        for (location, title, preview, suggested, existing) in [
+            ("Teams", "Planning", "", Some("Call"), None),
+            ("Office", "Planning", "", Some("Office"), None),
+            ("", "Planning", "Sejdeme se u zákazníka", Some("Mimo office"), None),
+            ("", "BLOCKER: Planning", "", Some("Nejisté"), None),
+            ("", "Planning", "TBD", None, None),
+            ("Teams", "Already categorized", "", None, Some("Office")),
+        ] {
+            for choice in [None, Some("Office"), Some("No category")] {
+                let (mut app, _, mut ai_commands) = assistant_fixture();
+                let (sender, receiver) = mpsc::sync_channel(16);
+                app.worker = Some(Worker {
+                    commands: sender, notices: Arc::new(Default::default()),
+                    activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+                    stop: Arc::new(Default::default()), done: None,
+                });
+                app.preferences.language = language;
+                app.calendar_owner = Some("owner".into());
+                app.workiq_ready = true;
+                let mut event = tomlook::calendar::fixture(1).remove(0);
+                event.title = title.into();
+                event.location = location.into();
+                event.category = existing.unwrap_or_default().into();
+                event.organizer = "organizer@example.invalid".into();
+                event.extra.insert("type".into(), serde_json::json!("singleInstance"));
+                event.extra.insert("isOrganizer".into(), serde_json::json!(false));
+                event.extra.insert("categories".into(), serde_json::json!(existing.into_iter().collect::<Vec<_>>()));
+                event.extra.insert("bodyPreview".into(), serde_json::json!(preview));
+                let mut catalog = event.clone();
+                catalog.id = "category-catalog".into();
+                catalog.extra.insert("categories".into(), serde_json::json!(["Call", "Office", "Mimo office", "Nejisté", "Follow"]));
+                app.calendar = Arc::new(Calendar::build(vec![event.clone(), catalog], Default::default(), vec![]).unwrap());
+                app.choose_meeting_action(event.clone(), Change::Respond {
+                    response: MeetingResponse::Accept, comment: String::new(), send_response: false, category: None,
+                });
+                assert!(matches!(&app.meeting_action.as_ref().unwrap().change,
+                    Change::Respond { category, .. } if category.as_deref() == suggested));
+                let context = egui::Context::default();
+                let show: Show = &|app, ui| app.meeting_action_dialog(ui.ctx());
+                let text = settled(&context, &mut app, show);
+                let keep = if existing.is_some() { "Keep current category" } else { "No category" };
+                assert!(text.contains(language.text(keep).as_ref()), "{text}");
+                assert!(!text.lines().any(|line| line.trim() == "Follow"), "Follow is not an acceptance category");
+                assert!(receiver.try_recv().is_err(), "A preselected category is not an approval");
+                if let Some(choice) = choice {
+                    click_text(&context, &mut app, show, language.text(if choice == "No category" { keep } else { choice }).as_ref());
+                }
+                assert!(receiver.try_recv().is_err(), "Choosing a category is not an approval");
+                click_text(&context, &mut app, show, language.text(MeetingResponse::Accept.label()).as_ref());
+                let Command::ConfirmMeetingAction { event: approved, change, .. } = receiver.try_recv().unwrap()
+                    else { panic!("Expected the combined explicit approval"); };
+                let expected = match choice { Some("No category") => None, Some(name) => Some(name), None => suggested };
+                assert_eq!(approved.id, event.id);
+                assert_eq!(tomlook::recommendations::real_categories(&approved), existing.into_iter().map(str::to_owned).collect::<Vec<_>>());
+                assert!(matches!(change, Change::Respond {
+                    response: MeetingResponse::Accept, category, send_response: false, ..
+                } if category.as_deref() == expected));
+                assert!(receiver.try_recv().is_err());
+                assert!(ai_commands.try_recv().is_err(), "Suggestions never call AI");
+            }
+        }
+    }
+}
+
+#[test]
+fn acceptance_research_send_button_checks_the_thorough_lane_before_forcing_the_visible_mode() {
+    for busy in [tomlook::chat::Mode::Fast, tomlook::chat::Mode::Deep] {
+        for command in ["/prepare", "/blocker"] {
+            let (mut app, _, mut commands) = assistant_fixture();
+            assert!(app.switch_assistant_context(Some(tomlook::calendar::fixture(1).remove(0))));
+            Arc::make_mut(&mut app.chat).admit(90, "Running question".into(), busy).unwrap();
+            app.ask_mode = if busy == tomlook::chat::Mode::Fast { tomlook::chat::Mode::Auto } else { tomlook::chat::Mode::Fast };
+            app.question = command.into();
+            let context = egui::Context::default();
+            let show: Show = &|app, ui| app.assistant_panel(ui);
+            settled(&context, &mut app, show);
+            click_text(&context, &mut app, show, "Send");
+            if busy == tomlook::chat::Mode::Fast {
+                let ai::Command::Chat(request) = commands.try_recv().unwrap() else { panic!("The Thorough lane is available"); };
+                assert_eq!(request.mode, tomlook::chat::Mode::Deep);
+                assert_eq!(app.ask_mode, tomlook::chat::Mode::Deep);
+            } else {
+                assert!(commands.try_recv().is_err(), "A busy Thorough lane cannot admit another research command");
+                assert_eq!(app.question, command);
+            }
+        }
+    }
+}
+
+#[test]
+fn acceptance_category_buttons_match_new_event_colors_and_selected_outlines_in_all_themes() {
+    use tomlook::recommendations::{Change, MeetingResponse};
+    let button = |output: &egui::FullOutput, label: &str| {
+        let center = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.job.text == label =>
+                Some(text.pos + text.galley.size() * 0.5),
+            _ => None,
+        }).unwrap_or_else(|| panic!("Missing category label: {label}"));
+        output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Rect(rect) if rect.rect.contains(center) => Some(rect),
+            _ => None,
+        }).min_by(|a, b| a.rect.area().total_cmp(&b.rect.area())).unwrap().clone()
+    };
+    for dark in [false, true] {
+        for accent in 0..ACCENTS.len() {
+            for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+                let (mut app, _, mut ai_commands) = assistant_fixture();
+                app.preferences.dark = dark;
+                app.preferences.accent = accent;
+                app.preferences.language = language;
+                app.calendar_owner = Some("owner".into());
+                let mut event = tomlook::calendar::fixture(1).remove(0);
+                event.title = "Planning".into();
+                event.location = "Teams".into();
+                event.category.clear();
+                event.organizer = "organizer@example.invalid".into();
+                event.extra.insert("isOrganizer".into(), serde_json::json!(false));
+                event.extra.insert("categories".into(), serde_json::json!([]));
+                let mut catalog = event.clone();
+                catalog.id = "category-catalog".into();
+                let categories = ["Call", "Office", "Mimo office", "Nejisté", "Osobní"];
+                catalog.extra.insert("categories".into(), serde_json::json!(categories));
+                app.calendar = Arc::new(Calendar::build(vec![event.clone(), catalog], Default::default(), vec![]).unwrap());
+                let context = egui::Context::default();
+                app.style(&context);
+                context.style_mut_of(if dark { egui::Theme::Dark } else { egui::Theme::Light },
+                    |style| style.animation_time = 0.0);
+                app.open_event_draft(Local::now().date_naive(), 540, 600);
+                app.event_draft.as_mut().unwrap().category = Some("Call".into());
+                let editor: Show = &|app, ui| app.event_creation_dialog(ui.ctx());
+                settled(&context, &mut app, editor);
+                let created = draw_with(&context, &mut app, vec![], editor);
+                app.event_draft = None;
+                app.choose_meeting_action(event, Change::Respond {
+                    response: MeetingResponse::Accept, comment: String::new(), send_response: false, category: None,
+                });
+                let acceptance: Show = &|app, ui| app.meeting_action_dialog(ui.ctx());
+                settled(&context, &mut app, acceptance);
+                let accepted = draw_with(&context, &mut app, vec![], acceptance);
+                for category in categories {
+                    let original = button(&created, category);
+                    let actual = button(&accepted, category);
+                    let fill = category_color(category, dark).gamma_multiply(if dark { 0.3 } else { 0.15 });
+                    assert_eq!(original.fill, fill, "{category} / {dark} / {accent} / {language:?}");
+                    assert_eq!(actual.fill, fill);
+                    assert_eq!(actual.stroke, original.stroke);
+                    assert_eq!(actual.stroke, if category == "Call" { Stroke::new(2.0, app.accent()) } else { Stroke::NONE });
+                }
+                assert_eq!(button(&accepted, language.text("No category").as_ref()).fill,
+                    button(&created, language.text("None").as_ref()).fill);
+                click_text(&context, &mut app, acceptance, "Office");
+                let changed = draw_with(&context, &mut app, vec![egui::Event::PointerGone], acceptance);
+                assert_eq!(button(&changed, "Office").stroke, Stroke::new(2.0, app.accent()));
+                assert_eq!(button(&changed, "Call").stroke, Stroke::NONE);
+                assert!(ai_commands.try_recv().is_err(), "Category buttons never call AI");
+            }
+        }
+    }
+}
+
+#[test]
 fn settings_have_left_navigation_and_language_is_only_in_display_preferences() {
     for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
         let (mut app, _, mut ai_commands) = assistant_fixture();
@@ -1421,6 +1613,7 @@ fn manual_menu_and_dialog_are_bilingual_local_and_escape_never_submits() {
                 response: tomlook::recommendations::MeetingResponse::Decline,
                 comment: "Unsent draft comment.".into(),
                 send_response: false,
+                category: None,
             },
         );
         let mut text = String::new();
@@ -1460,7 +1653,8 @@ fn manual_menu_and_dialog_are_bilingual_local_and_escape_never_submits() {
             tomlook::recommendations::Change::Respond {
                 response: tomlook::recommendations::MeetingResponse::Decline,
                 comment: "Unsent draft comment.".into(),
-                send_response: false
+                send_response: false,
+                category: None,
             }
         );
         assert!(receiver.try_recv().is_err());
@@ -1654,6 +1848,7 @@ fn compact_meeting_confirmation_submits_once_and_stays_quiet() {
                             response,
                             comment: comment.into(),
                             send_response,
+                            category: None,
                         })
                         .unwrap_or(Change::Delete),
                 );
@@ -1681,7 +1876,7 @@ fn compact_meeting_confirmation_submits_once_and_stays_quiet() {
                     append_shape_text(&shape.shape, &mut text);
                 }
                 assert!(
-                    text.lines().count() <= 12,
+                    text.lines().count() <= if response == Some(MeetingResponse::Accept) { 16 } else { 12 },
                     "Confirmation has too much text: {text}"
                 );
                 assert!(!text.contains("organizer@example.test"), "{text}");
@@ -1738,6 +1933,7 @@ fn compact_meeting_confirmation_submits_once_and_stays_quiet() {
                                 },
                                 send_response: send_response
                                     || response == MeetingResponse::Cancel,
+                                category: None,
                             })
                             .unwrap_or(Change::Delete)
                     ),
@@ -3202,6 +3398,230 @@ fn local_slash_is_admitted_offline_during_research_and_preserves_rejected_drafts
 }
 
 #[test]
+fn ai_calendar_creation_preview_requires_a_button_and_shows_exact_recipients_in_both_languages() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        for invite in [false, true] {
+            let (mut app, _, mut ai_commands) = assistant_fixture();
+            let (sender, receiver) = mpsc::sync_channel(16);
+            app.worker = Some(Worker {
+                commands: sender, notices: Arc::new(Default::default()),
+                activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+                stop: Arc::new(Default::default()), done: None,
+            });
+            app.preferences.language = language;
+            app.calendar_owner = Some("owner@example.invalid".into());
+            app.workiq_ready = true;
+            let start = Local::now().fixed_offset() + chrono::Duration::days(2);
+            let draft = tomlook::event_creation::Draft {
+                title: "Synthetic AI planning".into(), description: "Exact approved description".into(),
+                start, end: start + chrono::Duration::hours(1), category: None,
+                private: true, teams: true, travel_minutes: None, language,
+                attendees: if invite { tomlook::attendees::parse_input("Alex <alex@example.invalid>").unwrap() } else { vec![] },
+            };
+            let mut record = tomlook::event_creation::Record::new("owner@example.invalid".into(), draft.clone()).unwrap();
+            record.state = tomlook::event_creation::State::Pending;
+            Arc::make_mut(&mut Arc::make_mut(&mut app.activity).event_creations).insert(record.id.clone(), record.clone());
+            let context = egui::Context::default();
+            let show: Show = &|app, ui| {
+                let record = app.activity.event_creations.values().next().unwrap().clone();
+                app.event_creation_record(ui, &record);
+            };
+            let text = settled(&context, &mut app, show);
+            assert!(text.contains("Exact approved description"), "{text}");
+            assert!(text.contains(language.text("Private event").as_ref()), "{text}");
+            assert!(text.contains(language.text("Teams meeting").as_ref()), "{text}");
+            assert!(text.contains("owner@example.invalid"), "{text}");
+            if invite {
+                assert!(text.contains("alex@example.invalid"), "{text}");
+                assert!(text.contains(language.text("Attendee availability has not been verified.").as_ref()), "{text}");
+                assert!(text.contains(&tomlook::attendees::invitation_notice(&draft.attendees, language)), "{text}");
+            }
+            assert!(receiver.try_recv().is_err(), "Drawing a proposal cannot approve it");
+            let input = app.ask_view().input(ask::Action::ReviewChanges(vec![record.id.clone()]));
+            app.apply_ask_input(input, &context);
+            assert_eq!(app.recommendation_selected.as_deref(), Some(record.id.as_str()));
+            assert!(app.messages_open);
+            assert!(!app.recommendations_tab, "Creation review must not be replaced by an unrelated recommendation");
+            assert!(receiver.try_recv().is_err(), "Review is not approval");
+            let label = if invite { "Create and send invitations" } else { "Approve and create event" };
+            app.workiq_ready = false;
+            click_text(&context, &mut app, show, language.text(label).as_ref());
+            assert!(receiver.try_recv().is_err(), "Disconnected approval stays disabled");
+            app.workiq_ready = true;
+            click_text(&context, &mut app, show, language.text(label).as_ref());
+            let Command::CreateEvents { account, draft: approved, parent } = receiver.try_recv().unwrap() else { panic!("Exact creation approval"); };
+            assert_eq!(account, record.account);
+            assert_eq!(*approved, draft);
+            assert!(parent.is_none());
+            assert!(receiver.try_recv().is_err());
+            while let Ok(command) = ai_commands.try_recv() {
+                assert!(matches!(command, ai::Command::RefreshCalendarAvailability));
+            }
+        }
+    }
+}
+
+#[test]
+fn ai_calendar_blocker_slash_submits_the_ready_research_prompt_with_its_meeting_context() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, _, mut commands) = assistant_fixture();
+        let mut event = tomlook::calendar::fixture(1).remove(0);
+        event.title = "BLOCKER: Synthetic planning".into();
+        app.preferences.language = language;
+        app.ask_mode = tomlook::chat::Mode::Auto;
+        app.switch_assistant_context(Some(event.clone()));
+        app.question = "/blocker".into();
+        app.ask_question();
+        let ai::Command::Chat(request) = commands.try_recv().unwrap() else { panic!("Expected research question"); };
+        assert_eq!(request.question.question, language.text(ask::BLOCKER_PROMPT));
+        assert_eq!(request.question.meeting.as_ref().unwrap().id, event.id);
+        assert_eq!(request.question.language, language);
+        assert_eq!(request.mode, tomlook::chat::Mode::Deep);
+        assert_eq!(app.ask_mode, tomlook::chat::Mode::Deep);
+        assert_eq!(app.chat.turns.back().unwrap().question, "/blocker");
+        assert!(commands.try_recv().is_err(), "The slash command cannot approve calendar writes");
+    }
+}
+
+#[test]
+fn ai_calendar_removal_preview_requires_approval_and_labels_notification_consequences() {
+    use tomlook::recommendations::{Change, Recommendation};
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        for invite in [false, true] {
+            let (mut app, _, _) = assistant_fixture();
+            let (sender, receiver) = mpsc::sync_channel(16);
+            app.worker = Some(Worker {
+                commands: sender, notices: Arc::new(Default::default()),
+                activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+                stop: Arc::new(Default::default()), done: None,
+            });
+            let mut event = tomlook::calendar::fixture(1).remove(0);
+            event.title = if invite { "Synthetic organized meeting" } else { "BLOCKER: Synthetic planning" }.into();
+            event.extra.insert("isOrganizer".into(), serde_json::json!(true));
+            event.extra.insert("type".into(), serde_json::json!("singleInstance"));
+            event.extra.remove("tomlook_attendees_total");
+            event.attendees = if invite { vec!["Alex <alex@example.invalid>".into()] } else { vec![] };
+            let now = Local::now().fixed_offset();
+            let change = tomlook::recommendations::removal_change(&event).unwrap();
+            let record = Recommendation::from_manual(&event, "owner", change.clone(), now).unwrap();
+            app.preferences.language = language;
+            app.calendar_owner = Some("owner".into());
+            app.calendar = Arc::new(Calendar::build(vec![event], Default::default(), vec![]).unwrap());
+            Arc::make_mut(&mut Arc::make_mut(&mut app.activity).recommendations).insert(record.id.clone(), record.clone());
+            let show: Show = &|app, ui| {
+                let record = app.activity.recommendations.values().next().unwrap().clone();
+                let calendar = app.calendar.clone();
+                app.recommendation_card(ui, &record, &calendar, Local::now().fixed_offset());
+            };
+            let context = egui::Context::default();
+            let text = settled(&context, &mut app, show);
+            assert!(text.contains(language.text("This occurrence only").as_ref()), "{text}");
+            let notice = if invite { "Notifies all attendees." } else { "No attendees will be notified." };
+            assert!(text.contains(language.text(notice).as_ref()), "{text}");
+            assert!(receiver.try_recv().is_err(), "Viewing a removal must never approve it");
+            click_text(&context, &mut app, show, language.text("Approve change").as_ref());
+            let Command::ConfirmRecommendation { id, change: approved } = receiver.try_recv().unwrap()
+                else { panic!("Expected exact existing-event approval"); };
+            assert_eq!(id, record.id);
+            assert_eq!(approved, change);
+            assert_eq!(matches!(approved, Change::Delete), !invite);
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+}
+
+#[test]
+fn ai_calendar_meeting_menu_runs_prepare_and_blocker_for_the_clicked_meeting_without_erasing_drafts() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        for (command, label) in [
+            (ask::Command::Prepare, "Prepare for this meeting"),
+            (ask::Command::Blocker, "Check BLOCKER"),
+        ] {
+            let (mut app, _, mut ai_commands) = assistant_fixture();
+            let (sender, writes) = mpsc::sync_channel(16);
+            app.worker = Some(Worker {
+                commands: sender, notices: Arc::new(Default::default()),
+                activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+                stop: Arc::new(Default::default()), done: None,
+            });
+            app.calendar = Arc::new(Calendar::build(tomlook::calendar::fixture(2), Default::default(), vec![]).unwrap());
+            let event = app.calendar.events[1].clone();
+            app.preferences.language = language;
+            app.ask_mode = tomlook::chat::Mode::Auto;
+            app.selected = Some(0);
+            app.question = "Keep the global question".into();
+            assert!(app.switch_assistant_context(Some(event.clone())));
+            app.question = "Keep this meeting's unsent question".into();
+            assert!(app.switch_assistant_context(None));
+            let context = egui::Context::default();
+            let menu: Show = &|app, ui| app.event_card(ui, 1,
+                egui::Rect::from_min_size(egui::pos2(50.0, 50.0), Vec2::new(300.0, 90.0)));
+            settled(&context, &mut app, menu);
+            let point = egui::pos2(200.0, 95.0);
+            draw_with(&context, &mut app, vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton { pos: point, button: egui::PointerButton::Secondary, pressed: true, modifiers: Modifiers::NONE },
+            ], menu);
+            draw_with(&context, &mut app, vec![
+                egui::Event::PointerButton { pos: point, button: egui::PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE },
+            ], menu);
+            assert!(ai_commands.try_recv().is_err(), "Opening the menu never starts AI");
+            click_text(&context, &mut app, menu, language.text(label).as_ref());
+            let ai::Command::Chat(request) = ai_commands.try_recv().unwrap() else { panic!("Expected a contextual Ask command"); };
+            let ask::Submission::Question(expected) = ask::expand(command.name(), Some(&event), language).unwrap()
+                else { panic!("Expected the existing slash prompt"); };
+            assert_eq!(request.question.question, expected);
+            assert_eq!(request.question.meeting.as_ref().unwrap().fingerprint(), event.fingerprint());
+            assert_eq!(request.mode, tomlook::chat::Mode::Deep);
+            assert_eq!(request.question.language, language);
+            assert_eq!(app.chat.turns.back().unwrap().question, command.name());
+            assert_eq!(app.assistant_context.as_ref().unwrap().id, event.id);
+            assert_eq!(app.selected, Some(0), "Right-click context is independent of the selected meeting");
+            assert_eq!(app.question, "Keep this meeting's unsent question");
+            assert!(app.assistant && app.focus_assistant);
+            assert!(app.meeting_menu.is_none());
+            assert!(ai_commands.try_recv().is_err(), "One click starts exactly one request");
+            assert!(writes.try_recv().is_err(), "Research never submits a calendar write");
+            Arc::make_mut(&mut app.chat).finish(request.question.id, Ok(fixture_answer("Complete")));
+            assert!(app.switch_assistant_context(None));
+            assert_eq!(app.question, "Keep the global question");
+        }
+    }
+}
+
+#[test]
+fn ai_calendar_meeting_menu_shortcuts_are_disabled_offline_and_do_not_interrupt_another_context() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        for connected in [false, true] {
+            for label in ["Prepare for this meeting", "Check BLOCKER"] {
+                let (mut app, _, mut commands) = assistant_fixture();
+                app.calendar = Arc::new(Calendar::build(tomlook::calendar::fixture(2), Default::default(), vec![]).unwrap());
+                app.preferences.language = language;
+                let original = app.calendar.events[0].clone();
+                assert!(app.switch_assistant_context(Some(original.clone())));
+                app.question = "Unsent question in the original context".into();
+                app.ai_ready = connected;
+                if connected {
+                    Arc::make_mut(&mut app.chat).admit(90, "Running research".into(), tomlook::chat::Mode::Deep).unwrap();
+                }
+                let context = egui::Context::default();
+                let menu: Show = &|app, ui| app.meeting_actions(ui, 1);
+                let text = settled(&context, &mut app, menu);
+                assert!(text.contains(language.text(label).as_ref()), "{text}");
+                click_text(&context, &mut app, menu, language.text(label).as_ref());
+                assert_eq!(app.assistant_context.as_ref().unwrap().id, original.id);
+                assert_eq!(app.question, "Unsent question in the original context");
+                assert!(commands.try_recv().is_err());
+                if connected {
+                    assert!(app.chat.turns[0].running);
+                    assert!(app.ai_error.as_ref().unwrap().contains("Stop the current question"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn review_slashes_enqueue_typed_background_work_without_an_ask_or_calendar_write() {
     use tomlook::recommendations::Review;
     let (mut app, _, mut ai_commands) = assistant_fixture();
@@ -3748,7 +4168,8 @@ fn calendar_selection_does_not_retarget_an_active_contextual_question() {
     app.select(1);
     assert_eq!(app.assistant_context.as_ref().unwrap().id, original.id);
     assert_eq!(question.meeting.as_ref().unwrap().id, original.id);
-    assert_eq!(app.active_request, Some(question.id));
+    assert!(app.active_request.is_none(), "Preparation uses the Thorough lane, not the quick-answer slot");
+    assert!(app.chat.turns.iter().any(|turn| turn.id == question.id && turn.running));
     assert!(commands.try_recv().is_err());
     app.apply_ask_input(
         app.ask_view().input(ask::Action::Stop),

@@ -423,7 +423,9 @@ impl TextEdit {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub event_revision: String,
     pub reason: String,
     pub reason_cs: String,
@@ -433,6 +435,10 @@ pub struct Request {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
+    Create {
+        event: NewEvent,
+    },
+    Delete {},
     Document {
         document: Document,
         revision: String,
@@ -451,20 +457,59 @@ pub enum Action {
     },
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewEvent {
+    pub title: String,
+    pub start: chrono::DateTime<chrono::FixedOffset>,
+    pub end: chrono::DateTime<chrono::FixedOffset>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub private: bool,
+    #[serde(default)]
+    pub teams: bool,
+    #[serde(default)]
+    pub attendees: Vec<crate::attendees::Attendee>,
+}
+
+impl NewEvent {
+    pub fn draft(&self, language: crate::i18n::Language) -> crate::event_creation::Draft {
+        crate::event_creation::Draft {
+            title: self.title.clone(),
+            description: self.description.clone(),
+            start: self.start,
+            end: self.end,
+            category: self.category.clone(),
+            private: self.private,
+            teams: self.teams,
+            travel_minutes: None,
+            language,
+            attendees: self.attendees.clone(),
+        }
+    }
+}
+
 impl Request {
     pub fn validate(&self) -> Result<(), String> {
-        if self.id.is_empty()
-            || self.id.len() > 2000
-            || self.event_revision.len() != 64
-            || !self
-                .event_revision
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-            || [&self.reason, &self.reason_cs]
-                .iter()
-                .any(|text| text.trim().is_empty() || text.len() > 1600)
+        if [&self.reason, &self.reason_cs]
+            .iter()
+            .any(|text| text.trim().is_empty() || text.len() > 1600)
         {
-            return Err("A proposal needs a saved meeting id, current event revision and bounded English/Czech reasons".into());
+            return Err("A proposal needs bounded English/Czech reasons".into());
+        }
+        if let Action::Create { event } = &self.action {
+            if !self.id.is_empty() || !self.event_revision.is_empty() {
+                return Err("New events must not carry an existing meeting identity or revision".into());
+            }
+            return event.draft(crate::i18n::Language::En).validate();
+        }
+        if self.id.is_empty() || self.id.len() > 2000 || self.event_revision.len() != 64
+            || !self.event_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("A proposal needs a saved meeting id and current event revision".into());
         }
         match &self.action {
             Action::Document {

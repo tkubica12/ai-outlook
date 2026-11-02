@@ -330,6 +330,45 @@ pub enum SubmissionError {
 }
 
 pub async fn execute(api: &impl Api, operation: &Operation) -> Outcome {
+    let Change::Respond { response: MeetingResponse::Accept, category: Some(category), .. } = &operation.change else {
+        return execute_single(api, operation).await;
+    };
+    if operation.event.status.eq_ignore_ascii_case(MeetingResponse::Accept.status())
+        || real_categories(&operation.event) == crate::recommendations::replacement_categories(&operation.event, Some(category))
+    {
+        return execute_single(api, operation).await;
+    }
+    if let Err(message) = operation.validate(api.account()) {
+        return Outcome::NotSent(message);
+    }
+    if let Err(message) = api.capability(&operation.change).await {
+        return Outcome::NotSent(message);
+    }
+    // Both steps derive from the same consumed approval. Verify the category before accepting.
+    let mut categorized = operation.clone();
+    categorized.change = Change::Category(category.clone());
+    categorized.recommendation.manual_change = Some(categorized.change.clone());
+    let current = match execute_single(api, &categorized).await {
+        Outcome::Applied(current) => current,
+        Outcome::Review(message) => return Outcome::Review(format!(
+            "Category assignment could not be verified; meeting acceptance was not attempted.\n{message}")),
+        outcome => return outcome,
+    };
+    let mut acceptance = operation.clone();
+    acceptance.event = *current;
+    acceptance.recommendation.fingerprint = crate::scheduler::fingerprint(&acceptance.event);
+    match execute_single(api, &acceptance).await {
+        outcome @ Outcome::Applied(_) => outcome,
+        Outcome::NotSent(message) => Outcome::Review(format!(
+            "The category was assigned, but meeting acceptance was not submitted. Inspect Outlook; this approval will not be replayed automatically.\n{message}")),
+        Outcome::Review(message) => Outcome::Review(format!(
+            "The category was assigned, but meeting acceptance could not be verified. Inspect Outlook; this approval will not be replayed automatically.\n{message}")),
+        Outcome::Stale(_) | Outcome::Removed(_) => Outcome::Review(
+            "The category was assigned, but the meeting changed before acceptance could be verified. Inspect Outlook; this approval will not be replayed automatically.".into()),
+    }
+}
+
+async fn execute_single(api: &impl Api, operation: &Operation) -> Outcome {
     let check = async {
         operation.validate(api.account())?;
         api.capability(&operation.change).await?;
@@ -510,8 +549,13 @@ fn verified(event: &Event, operation: &Operation) -> bool {
                 && real_categories(event) == categories
                 && crate::scheduler::fingerprint(event) == crate::scheduler::fingerprint(&expected)
         }
-        Change::Respond { response, .. } => {
+        Change::Respond { response, category, .. } => {
             let mut expected = original;
+            if let Some(category) = category {
+                let categories = crate::recommendations::replacement_categories(&expected, Some(category));
+                expected.category = categories.join(", ");
+                expected.extra.insert("categories".into(), json!(categories));
+            }
             expected.status = event.status.clone();
             if let Some(show_as) = event.extra.get("showAs") {
                 expected.extra.insert("showAs".into(), show_as.clone());
@@ -547,15 +591,7 @@ fn verified(event: &Event, operation: &Operation) -> bool {
 }
 
 fn event_path(id: &str) -> Result<String, String> {
-    if id.is_empty()
-        || id.len() > 3000
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'='))
-    {
-        return Err("Calendar writes require one verified event identity".into());
-    }
-    Ok(format!("/me/events/{id}"))
+    super::event_path(id)
 }
 
 fn request(
@@ -604,6 +640,7 @@ fn request(
             response,
             comment,
             send_response,
+            ..
         } => {
             let body = if *response == MeetingResponse::Cancel {
                 json!({"comment":comment})
@@ -1394,6 +1431,7 @@ mod tests {
                     response,
                     comment: String::new(),
                     send_response: true,
+                    category: None,
                 };
                 let result = Api::capability(&connection, &change).await;
                 actions.push(json!({"action":response.action(),"compatible":result.is_ok(),"error":result.err()}));
@@ -1576,7 +1614,10 @@ mod tests {
         current: Event,
         written: Mutex<Option<Event>>,
         writes: AtomicUsize,
+        operations: Mutex<Vec<Operation>>,
         rejection: Option<SubmissionError>,
+        response_rejection: Option<SubmissionError>,
+        response_denied: bool,
         mismatch: bool,
         busy: bool,
         incomplete: bool,
@@ -1591,7 +1632,10 @@ mod tests {
                 current: operation.event.clone(),
                 written: Mutex::new(None),
                 writes: AtomicUsize::new(0),
+                operations: Mutex::new(Vec::new()),
                 rejection: None,
+                response_rejection: None,
+                response_denied: false,
                 mismatch: false,
                 busy: false,
                 incomplete: false,
@@ -1610,8 +1654,12 @@ mod tests {
         async fn schema(&self, _: bool) -> Result<(), String> {
             Ok(())
         }
-        async fn capability(&self, _: &Change) -> Result<(), String> {
-            Ok(())
+        async fn capability(&self, change: &Change) -> Result<(), String> {
+            if self.response_denied && matches!(change, Change::Respond { .. }) {
+                Err("Response capability denied".into())
+            } else {
+                Ok(())
+            }
         }
         async fn event(&self, _: &str) -> Result<Event, String> {
             if self.removed.load(Ordering::Relaxed) {
@@ -1656,7 +1704,12 @@ mod tests {
         }
         async fn submit(&self, operation: &Operation) -> Result<String, SubmissionError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
+            self.operations.lock().unwrap().push(operation.clone());
             if let Some(error) = self.rejection {
+                return Err(error);
+            }
+            if matches!(operation.change, Change::Respond { .. })
+                && let Some(error) = self.response_rejection {
                 return Err(error);
             }
             let mut event = operation.event.clone();
@@ -1866,6 +1919,32 @@ mod tests {
     }
 
     #[test]
+    fn ai_calendar_base64_event_ids_are_one_encoded_resource_for_reads_deletes_and_readback() {
+        for id in ["AAMkOld/Blocker+ID=", "base64-url_safe=="] {
+            let path = event_path(id).unwrap();
+            assert_eq!(path.split('/').count(), 4);
+            assert!(super::super::read_resource(&path).is_ok());
+            let mut operation = manual_operation(Change::Delete, true);
+            operation.event.id = id.into();
+            operation.recommendation.event_id = id.into();
+            let arguments = request(&operation, false).unwrap().arguments.unwrap();
+            assert_eq!(arguments["entityUrl"], path);
+        }
+        assert_eq!(event_path("AAMkOld/Blocker+ID=").unwrap(), "/me/events/AAMkOld%2FBlocker+ID=");
+        for invalid in ["../other", "id%2Fsend", "id?query=1", "id#fragment", "id\\other"] {
+            assert!(event_path(invalid).is_err());
+        }
+        for invalid in ["/me/events/id/send", "/me/events/id%252Fsend", "/me/events/id%3Faction",
+            "/me/events/id%5Cother", "/me/events/id%00"]
+        {
+            assert!(super::super::read_resource(invalid).is_err(), "{invalid}");
+        }
+        for valid in ["/me/events/AAMk%2Fid%2Babc%3D", "/me/messages/AAMk%2fid%2babc%3d"] {
+            assert!(super::super::read_resource(valid).is_ok());
+        }
+    }
+
+    #[test]
     fn published_wire_contract_accepts_live_nullable_and_unconstrained_metadata() {
         let create: Tool = serde_json::from_value(json!({"name":"create_entity", "inputSchema":{
             "type":"object","properties":{"parentUrl":{"type":"string"},"jsonBody":{}},
@@ -2062,6 +2141,115 @@ mod tests {
         }
     }
 
+    fn acceptance_operation() -> Operation {
+        let mut operation = manual_operation(Change::Respond {
+            response: MeetingResponse::Accept, comment: "Confirmed.".into(),
+            send_response: true, category: Some("Call".into()),
+        }, false);
+        operation.event.category = "Work, Follow".into();
+        operation.event.extra.insert("categories".into(), json!(["Work", "Follow"]));
+        operation.recommendation.fingerprint = crate::scheduler::fingerprint(&operation.event);
+        operation
+    }
+
+    #[tokio::test]
+    async fn acceptance_category_is_verified_before_one_exact_response_and_read_only_recovery() {
+        let operation = acceptance_operation();
+        let api = Fake::new(&operation);
+        let Outcome::Applied(event) = execute(&api, &operation).await else { panic!("Combined acceptance did not verify"); };
+        assert_eq!(event.status, "accepted");
+        assert_eq!(real_categories(&event), ["Call", "Follow"]);
+        let operations = api.operations.lock().unwrap().clone();
+        assert_eq!(operations.len(), 2);
+        assert_eq!(operations[0].change, Change::Category("Call".into()));
+        assert_eq!(operations[1].change, operation.change);
+        assert!(operations.iter().all(|part| part.recommendation.id == operation.recommendation.id));
+        let patch = request(&operations[0], false).unwrap();
+        assert_eq!(patch.name, "update_entity");
+        let patch: Value = serde_json::from_str(patch.arguments.unwrap()["jsonBody"].as_str().unwrap()).unwrap();
+        assert_eq!(patch, json!({"categories":["Call","Follow"]}));
+        let response = request(&operations[1], false).unwrap();
+        assert_eq!(response.name, "do_action");
+        assert_eq!(response.arguments.unwrap()["jsonBody"], json!({"comment":"Confirmed.","sendResponse":true}));
+        assert!(matches!(verify_only(&api, &operation).await, Outcome::Applied(_)));
+        assert_eq!(api.writes.load(Ordering::SeqCst), 2, "Recovery is read-only");
+    }
+
+    #[tokio::test]
+    async fn acceptance_category_never_hides_partial_results_or_accepts_an_unverified_category() {
+        let operation = acceptance_operation();
+        let mut denied = Fake::new(&operation);
+        denied.response_denied = true;
+        assert!(matches!(execute(&denied, &operation).await, Outcome::NotSent(_)));
+        assert_eq!(denied.writes.load(Ordering::SeqCst), 0);
+        for rejection in [SubmissionError::Rejected(403), SubmissionError::Unknown] {
+            let mut api = Fake::new(&operation);
+            api.rejection = Some(rejection);
+            assert!(matches!(execute(&api, &operation).await, Outcome::NotSent(_) | Outcome::Review(_)));
+            assert_eq!(api.writes.load(Ordering::SeqCst), 1, "A rejected/uncertain category never submits Accept");
+            let mut api = Fake::new(&operation);
+            api.response_rejection = Some(rejection);
+            let Outcome::Review(message) = execute(&api, &operation).await else { panic!("Partial result must not be retryable"); };
+            assert!(message.starts_with("The category was assigned"), "{message}");
+            assert!(message.contains("will not be replayed automatically"), "{message}");
+            assert_eq!(api.writes.load(Ordering::SeqCst), 2);
+            assert_eq!(real_categories(api.written.lock().unwrap().as_ref().unwrap()), ["Call", "Follow"]);
+            assert!(matches!(verify_only(&api, &operation).await, Outcome::Review(_)));
+            assert_eq!(api.writes.load(Ordering::SeqCst), 2, "Recovery never resubmits Accept");
+        }
+        let mut mismatch = Fake::new(&operation);
+        mismatch.mismatch = true;
+        let Outcome::Review(message) = execute(&mismatch, &operation).await else { panic!("Unverified category must stop acceptance"); };
+        assert!(message.contains("acceptance was not attempted"));
+        assert_eq!(mismatch.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn acceptance_category_skips_redundant_patches_and_guards_account_role_and_fingerprint() {
+        let mut operation = acceptance_operation();
+        for change in ["account", "role", "fingerprint"] {
+            let mut api = Fake::new(&operation);
+            match change {
+                "account" => api.account = "different-owner",
+                "role" => { api.current.extra.insert("isOrganizer".into(), json!(true)); }
+                _ => api.current.title.push_str(" changed"),
+            }
+            assert!(matches!(execute(&api, &operation).await, Outcome::NotSent(_) | Outcome::Stale(_)));
+            assert_eq!(api.writes.load(Ordering::SeqCst), 0, "{change}");
+        }
+        operation.event.category = "Call, Follow".into();
+        operation.event.extra.insert("categories".into(), json!(["Call", "Follow"]));
+        operation.recommendation.fingerprint = crate::scheduler::fingerprint(&operation.event);
+        let api = Fake::new(&operation);
+        assert!(matches!(execute(&api, &operation).await, Outcome::Applied(_)));
+        assert_eq!(api.writes.load(Ordering::SeqCst), 1);
+        assert!(matches!(api.operations.lock().unwrap()[0].change, Change::Respond { .. }));
+        operation.event.status = "accepted".into();
+        operation.event.extra.insert("categories".into(), json!(["Work", "Follow"]));
+        operation.event.category = "Work, Follow".into();
+        operation.recommendation.fingerprint = crate::scheduler::fingerprint(&operation.event);
+        let api = Fake::new(&operation);
+        assert!(matches!(execute(&api, &operation).await, Outcome::NotSent(_)));
+        assert_eq!(api.writes.load(Ordering::SeqCst), 0, "An accepted meeting does not cause a hidden category-only write");
+    }
+
+    #[tokio::test]
+    async fn acceptance_read_only_recovery_requires_both_the_response_and_the_approved_category() {
+        let operation = acceptance_operation();
+        let api = Fake::new(&operation);
+        for (status, category, expected) in [
+            ("accepted", "Work", false), ("notResponded", "Call", false), ("accepted", "Call", true),
+        ] {
+            let mut current = operation.event.clone();
+            current.status = status.into();
+            current.category = format!("{category}, Follow");
+            current.extra.insert("categories".into(), json!([category, "Follow"]));
+            *api.written.lock().unwrap() = Some(current);
+            assert_eq!(matches!(verify_only(&api, &operation).await, Outcome::Applied(_)), expected);
+        }
+        assert_eq!(api.writes.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn follow_is_one_verified_update_preserving_categories_response_and_free_time() {
         for enabled in [true, false] {
@@ -2107,6 +2295,7 @@ mod tests {
                     response,
                     comment: "Confirmed comment.".into(),
                     send_response: true,
+                    category: None,
                 },
                 response == MeetingResponse::Cancel,
             );
@@ -2153,6 +2342,7 @@ mod tests {
                 response: MeetingResponse::Decline,
                 comment: String::new(),
                 send_response: false,
+                category: None,
             },
             false,
         );
@@ -2174,6 +2364,7 @@ mod tests {
                         response,
                         comment: String::new(),
                         send_response,
+                        category: None,
                     },
                     false,
                 );
@@ -2198,6 +2389,7 @@ mod tests {
                 response: MeetingResponse::Decline,
                 comment: String::new(),
                 send_response: false,
+                category: None,
             },
             false,
         );
@@ -2290,6 +2482,7 @@ mod tests {
                 response: MeetingResponse::Accept,
                 comment: String::new(),
                 send_response: true,
+                category: None,
             },
             false,
         );

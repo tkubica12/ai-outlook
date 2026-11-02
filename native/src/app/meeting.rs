@@ -65,7 +65,7 @@ pub(super) struct MeetingActionDraft {
 }
 
 impl Tomlook {
-    pub(super) fn choose_meeting_action(&mut self, event: Event, change: tomlook::recommendations::Change) {
+    pub(super) fn choose_meeting_action(&mut self, event: Event, mut change: tomlook::recommendations::Change) {
         let Some(account) = self.calendar_owner.clone() else {
             self.error = Some("Connect WorkIQ before confirming a calendar change".into());
             return;
@@ -84,6 +84,12 @@ impl Tomlook {
                 change,
             });
             return;
+        }
+        if let tomlook::recommendations::Change::Respond {
+            response: tomlook::recommendations::MeetingResponse::Accept, category, ..
+        } = &mut change && category.is_none() {
+            *category = tomlook::recommendations::acceptance_category(&event,
+                &tomlook::recommendations::known_categories(&self.calendar));
         }
         self.meeting_action = Some(MeetingActionDraft {
             event,
@@ -117,6 +123,20 @@ impl Tomlook {
             }
             self.meeting_menu = None;
             ui.close();
+        }
+        ui.separator();
+        for (command, label, hint) in [
+            (ask::Command::Prepare, "Prepare for this meeting", "Run /prepare in Ask AI with this meeting as context"),
+            (ask::Command::Blocker, "Check BLOCKER", "Run /blocker in Ask AI with this meeting as context"),
+        ] {
+            if ui.add_enabled(self.ai_ready && self.ai.is_some(), egui::Button::new(language.text(label)))
+                .on_hover_text(language.text(hint))
+                .on_disabled_hover_text(language.text("Connect AI before asking."))
+                .clicked()
+            {
+                self.run_meeting_ask_command(event.clone(), command);
+                ui.close();
+            }
         }
         ui.separator();
         let ready = self.workiq_ready && self.ai.is_some() && self.calendar_owner.is_some();
@@ -213,6 +233,7 @@ impl Tomlook {
                 response,
                 comment: String::new(),
                 send_response: response != MeetingResponse::Decline,
+                category: None,
             };
             if validate_manual_change(event, &change).is_ok()
                 && ui
@@ -315,7 +336,32 @@ impl Tomlook {
                             "Removes Follow only. Availability stays unchanged; the organizer is not notified."
                         }));
                     }
-                    Change::Respond { response, comment, send_response } => {
+                    Change::Respond { response, comment, send_response, category } => {
+                        if *response == MeetingResponse::Accept {
+                            ui.label(language.text("Category"));
+                            let known = tomlook::recommendations::known_categories(&self.calendar);
+                            egui::ScrollArea::vertical().id_salt("acceptance-categories").max_height(100.0)
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        let current = tomlook::recommendations::real_categories(&draft.event);
+                                        let label = if current.iter().any(|category| !category.eq_ignore_ascii_case("follow")) {
+                                            "Keep current category"
+                                        } else { "No category" };
+                                        let button = self.category_button(ui, language.text(label).into_owned(), None, category.is_none());
+                                        if ui.add(button).clicked() {
+                                            *category = None;
+                                        }
+                                        for name in known.iter().filter(|name| !name.eq_ignore_ascii_case("follow")) {
+                                            let button = self.category_button(ui, name.clone(), Some(name), category.as_ref() == Some(name));
+                                            if ui.add(button).on_hover_text(name).clicked() {
+                                                *category = Some(name.clone());
+                                            }
+                                        }
+                                    });
+                                });
+                            ui.weak(language.text("A suggested category is only applied after you confirm."));
+                            ui.add_space(6.0);
+                        }
                         if *response == MeetingResponse::Cancel {
                             ui.label(language.text("Notifies all attendees."));
                             *send_response = true;

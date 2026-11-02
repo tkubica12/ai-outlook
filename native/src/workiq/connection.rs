@@ -749,6 +749,27 @@ fn partition_interval(
     Ok(())
 }
 
+fn item_id_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'=' | b'+' | b'/')
+}
+
+pub(super) fn event_path(id: &str) -> Result<String, String> {
+    if id.is_empty() || id.len() > 3000 || !id.bytes().all(item_id_byte) {
+        return Err("Calendar writes require one verified event identity".into());
+    }
+    let mut url = url::Url::parse("https://graph.microsoft.com/me/events")
+        .map_err(|_| "Invalid calendar event path")?;
+    url.path_segments_mut().map_err(|_| "Invalid calendar event path")?.push(id);
+    Ok(url.path().into())
+}
+
+fn item_segment(segment: &str) -> bool {
+    // Decode only the reserved Base64 characters, once; reject double encoding and other escapes.
+    let decoded = segment.to_ascii_uppercase()
+        .replace("%2F", "/").replace("%2B", "+").replace("%3D", "=");
+    !decoded.is_empty() && decoded.bytes().all(item_id_byte)
+}
+
 pub fn read_resource(resource: &str) -> Result<String, String> {
     if resource.len() > 4000
         || !resource.starts_with("/me/")
@@ -767,10 +788,7 @@ pub fn read_resource(resource: &str) -> Result<String, String> {
         || parts.len() > 4
         || (parts.len() == 4
             && (parts[2] == "calendarView"
-                || parts[3].is_empty()
-                || !parts[3].bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'=')
-                })))
+                || !item_segment(parts[3])))
     {
         return Err(
             "WorkIQ permits only your mail, events and calendar view; no actions or other hosts"

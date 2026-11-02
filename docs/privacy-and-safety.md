@@ -116,14 +116,24 @@ chat does nothing.
 | Write | Approved by |
 |---|---|
 | Set or clear a category; **Follow** / **Stop following** (category plus free availability, no response to the organizer) | The menu click itself |
-| Accept, tentatively accept or decline (optional comment, explicit "send response"; decline defaults to no response) | Confirmation dialog |
+| Accept (optionally with a category), tentatively accept or decline (optional comment, explicit "send response"; decline defaults to no response) | Confirmation dialog |
 | Cancel a meeting you organize (attendees are notified); delete your own appointment without attendees | Confirmation dialog |
 | Create an event, optionally private, with Teams and travel blocks | **Create event** |
 | Create an event with attendees (Outlook sends the invitations) | **Create and send invitations**, after the list of recipients |
 | Travel blocks around an existing meeting | Confirmation with both intervals |
-| Recommendations (category, preparation or travel block) and AI-proposed edits (Insights/notes sections, category, travel block, title or description of your own event) | **Approve change** in Messages |
+| Recommendations and AI-proposed existing-event changes (Insights/notes sections, category, travel, title/description, deletion, cancellation or decline) | **Approve change** in Messages; notification consequences are shown |
+| AI-proposed new events, including Teams and invitations | **Approve and create event** or **Create and send invitations** in Messages, after reviewing the exact event and recipients |
 | BLOCKER holds; deleting them | **Create N BLOCKERs**; **Delete N BLOCKERs** / **Release all BLOCKERs** |
 | A Teams chat and one message proposing times | **Create chat and send** |
+
+Acceptance category suggestions are deterministic and local; selecting or
+preselecting a chip is not approval. One confirmation binds the exact category
+and response. Because Graph requires separate calls, Tomlook assigns and verifies
+the category first, then accepts once and verifies both. If the category cannot
+be verified, acceptance is not attempted. Any failure or uncertain result after
+the category succeeds is explicitly reported as a partial result in **Messages**
+for review, never as "nothing changed" or an automatically replayable operation.
+Checking that result later only reads; it never repeats either write.
 
 Every write follows the same rules:
 

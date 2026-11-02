@@ -152,6 +152,20 @@ impl Tomlook {
         true
     }
 
+    pub(super) fn run_meeting_ask_command(&mut self, event: Event, command: ask::Command) {
+        self.assistant = true;
+        self.focus_assistant = true;
+        self.meeting_menu = None;
+        if !self.switch_assistant_context(Some(event)) {
+            return;
+        }
+        let draft = std::mem::replace(&mut self.question, command.name().into());
+        self.ask_question();
+        if !draft.is_empty() {
+            self.question = draft;
+        }
+    }
+
     pub(super) fn ask_question(&mut self) {
         if self.context_error.is_some() {
             self.ai_error = Some("Connect AI before asking.".into());
@@ -177,6 +191,9 @@ impl Tomlook {
                 return;
             }
         };
+        if ask::requires_thorough(&self.question) {
+            self.ask_mode = tomlook::chat::Mode::Deep;
+        }
         if matches!(submission, ask::Submission::Question(_))
             && self.chat.turns.iter().any(|turn| {
                 turn.running
@@ -592,10 +609,15 @@ impl Tomlook {
                 let now = chrono::Local::now().fixed_offset();
                 self.recommendation_selected = ids.iter().find(|id|
                     self.activity.recommendations.get(*id).is_some_and(|record|
-                        record.visible(&self.calendar, self.calendar_owner.as_deref(), now)))
+                        record.visible(&self.calendar, self.calendar_owner.as_deref(), now))
+                    || self.activity.event_creations.get(*id).is_some_and(|record|
+                        self.calendar_owner.as_deref() == Some(record.account.as_str())
+                        && record.state == tomlook::event_creation::State::Pending))
                     .cloned().or_else(|| ids.first().cloned());
                 self.messages_open = true;
-                self.recommendations_tab = true;
+                let creation = self.recommendation_selected.as_ref()
+                    .is_some_and(|id| self.activity.event_creations.contains_key(id));
+                self.recommendations_tab = !creation;
                 let local = self.recommendation_selected.as_ref().and_then(|id| self.activity.recommendations.get(id))
                     .is_some_and(|record| matches!(record.manual_change, Some(tomlook::recommendations::Change::Document(_))));
                 if !local && self.ai.is_some() { self.ai_command(ai::Command::RefreshCalendarAvailability); }

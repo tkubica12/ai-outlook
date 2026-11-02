@@ -173,6 +173,89 @@ impl EventDraft {
 }
 
 impl Tomlook {
+    pub(super) fn event_creation_record(&mut self, ui: &mut egui::Ui, record: &tomlook::event_creation::Record) {
+        use tomlook::event_creation::State;
+        let language = self.preferences.language;
+        ui.push_id(&record.id, |ui| {
+            ui.strong(format!("{}: {}", language.text(record.label()), record.draft.title));
+            ui.weak(language.text(&record.message));
+            match &record.hold {
+                Some(hold) => for slot in &hold.slots { ui.weak(slot.label(language)); },
+                None => {
+                    ui.weak(format!("{} - {}",
+                        record.draft.start.with_timezone(&Local).format("%d.%m.%Y %H:%M:%S%.f %:z"),
+                        record.draft.end.with_timezone(&Local).format("%d.%m.%Y %H:%M:%S%.f %:z")));
+                }
+            }
+            if !record.draft.attendees.is_empty() {
+                ui.weak(format!("{}: {}", language.text("Invited"), record.draft.attendees.iter()
+                    .map(|attendee| attendee.label()).collect::<Vec<_>>().join(", ")));
+            }
+            if record.state == State::Pending
+                || (record.state == State::NotSent && record.parent.is_none() && record.hold.is_none())
+            {
+                for attendee in &record.draft.attendees {
+                    ui.label(format!("{} <{}> ({})", attendee.label(), attendee.email, language.text(attendee.role.label())));
+                }
+                ui.weak(format!("{}: {}", language.text("Calendar"), record.account));
+                if !record.draft.description.is_empty() { ui.label(&record.draft.description); }
+                if let Some(category) = &record.draft.category {
+                    ui.weak(format!("{}: {category}", language.text("Category")));
+                }
+                ui.weak(language.text(if record.draft.private { "Private event" } else { "Not private" }));
+                if record.draft.teams { ui.label(language.text("Teams meeting")); }
+                let first = record.draft.start.with_timezone(&Local).date_naive();
+                let last = record.draft.end.with_timezone(&Local).date_naive();
+                if (0..=(last - first).num_days()).any(|offset|
+                    !self.calendar.coverage.contains(&(first + chrono::Duration::days(offset))))
+                {
+                    ui.weak(language.text("Not synced; availability has not been verified."));
+                }
+                let conflicts = self.calendar.events.iter().filter(|event|
+                    event.start < record.draft.end && event.end > record.draft.start
+                    && event.extra.get("showAs").and_then(serde_json::Value::as_str) != Some("free")
+                    && event.extra.get("isCancelled") != Some(&serde_json::json!(true)))
+                    .take(3).map(|event| event.title.as_str()).collect::<Vec<_>>();
+                if !conflicts.is_empty() {
+                    ui.colored_label(ui.visuals().warn_fg_color, format!("{}: {}",
+                        language.text("Overlaps saved events"), conflicts.join(", ")));
+                }
+                if !record.draft.attendees.is_empty() {
+                    ui.weak(language.text("Attendee availability has not been verified."));
+                    ui.colored_label(ui.visuals().warn_fg_color,
+                        RichText::new(attendees::invitation_notice(&record.draft.attendees, language)).strong());
+                    if let Some(reason) = self.invitation_blocked() {
+                        ui.colored_label(ui.visuals().error_fg_color, language.text(&reason));
+                    }
+                }
+                ui.weak(language.text(if record.state == State::Pending {
+                    "AI proposal awaiting your approval; nothing has been changed"
+                } else { "Previous attempt; no calendar change was sent." }));
+                let ready = self.calendar_owner.as_deref() == Some(record.account.as_str())
+                    && self.workiq_ready && self.ai.is_some() && !self.preview
+                    && (record.draft.attendees.is_empty() || self.invitation_blocked().is_none())
+                    && record.draft.start > Local::now().fixed_offset()
+                    && !self.activity.event_creations.values().any(|entry| entry.state == State::Creating);
+                if record.draft.start <= Local::now().fixed_offset() {
+                    ui.colored_label(ui.visuals().error_fg_color,
+                        language.text("The proposed event starts in the past; choose a future time"));
+                }
+                ui.horizontal_wrapped(|ui| {
+                    let label = if record.draft.attendees.is_empty() { "Approve and create event" } else { "Create and send invitations" };
+                    if ui.add_enabled(ready, egui::Button::new(language.text(label))).clicked() {
+                        self.command(Command::CreateEvents {
+                            account: record.account.clone(), draft: Box::new(record.draft.clone()), parent: None,
+                        });
+                    }
+                    if ui.button(language.text("Dismiss event proposal")).clicked() {
+                        self.command(Command::DismissEventCreation { id: record.id.clone(), account: record.account.clone() });
+                    }
+                });
+            }
+            ui.add_space(8.0);
+        });
+    }
+
     pub(super) fn open_event_draft(&mut self, day: NaiveDate, start: u16, end: u16) {
         self.event_draft = Some(EventDraft {
             parent: None,
@@ -770,10 +853,7 @@ impl Tomlook {
                     for (index, category) in std::iter::once(None).chain(categories.iter().map(Some)).enumerate() {
                         let label = category.map_or_else(|| language.text("None").into_owned(), Clone::clone);
                         let selected = draft.category.as_ref() == category;
-                        let fill = category.map(|category| category_color(category, self.preferences.dark).gamma_multiply(if self.preferences.dark { 0.3 } else { 0.15 }))
-                            .unwrap_or(ui.visuals().faint_bg_color);
-                        let button = egui::Button::new(label).fill(fill)
-                            .stroke(if selected { Stroke::new(2.0, self.accent()) } else { Stroke::NONE }).truncate();
+                        let button = self.category_button(ui, label, category.map(String::as_str), selected);
                         if ui.add_sized([142.0, 30.0], button).on_hover_text(category.map_or_else(|| language.text("None").into_owned(), Clone::clone)).clicked() {
                             draft.category = category.cloned();
                         }

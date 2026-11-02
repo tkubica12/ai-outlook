@@ -337,7 +337,9 @@ impl Recommendation {
             State::Review | State::Dispatching => true,
             State::Pending | State::NotSent => {
                 self.current(calendar, owner, now).is_some_and(|event| {
-                    if self.suggestion.kind == Kind::FollowUp {
+                    if self.suggestion.kind == Kind::Manual {
+                        true
+                    } else if self.suggestion.kind == Kind::FollowUp {
                         event.end <= now
                     } else {
                         event.start < now + Duration::days(14)
@@ -439,6 +441,8 @@ pub enum Change {
         response: MeetingResponse,
         comment: String,
         send_response: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
     },
     Delete,
     Buffer {
@@ -455,6 +459,28 @@ pub enum MeetingResponse {
     Tentative,
     Decline,
     Cancel,
+}
+
+/// Removing an owned meeting with invitees must send a cancellation, not silently delete it.
+pub fn removal_change(event: &Event) -> Result<Change, String> {
+    let change = match event.extra.get("isOrganizer").and_then(serde_json::Value::as_bool) {
+        Some(true) if event.attendee_count() == 0 => Change::Delete,
+        Some(true) => Change::Respond {
+            response: MeetingResponse::Cancel,
+            comment: String::new(),
+            send_response: true,
+            category: None,
+        },
+        Some(false) => Change::Respond {
+            response: MeetingResponse::Decline,
+            comment: String::new(),
+            send_response: false,
+            category: None,
+        },
+        None => return Err("Refresh the calendar first; removal needs verified organizer details".into()),
+    };
+    validate_manual_change(event, &change)?;
+    Ok(change)
 }
 
 impl MeetingResponse {
@@ -557,7 +583,14 @@ pub fn validate_manual_change(event: &Event, change: &Change) -> Result<(), Stri
             response,
             comment,
             send_response,
+            category,
         } => {
+            if let Some(category) = category {
+                if *response != MeetingResponse::Accept || category.eq_ignore_ascii_case("follow") {
+                    return Err("A category can only be combined with accepting an invitation".into());
+                }
+                validate_manual_change(event, &Change::Category(category.clone()))?;
+            }
             if comment.len() > 4096
                 || comment
                     .chars()
@@ -771,6 +804,62 @@ pub fn known_categories(calendar: &Calendar) -> Vec<String> {
         .into_iter()
         .take(64)
         .collect()
+}
+
+/// Conservative, local-only suggestions; missing categories or conflicting evidence mean no guess.
+pub fn acceptance_category(event: &Event, known: &[String]) -> Option<String> {
+    if real_categories(event).iter().any(|category| !category.eq_ignore_ascii_case("follow")) {
+        return None;
+    }
+    let title = crate::search::words(&event.title);
+    let location = crate::search::words(&event.location).join(" ");
+    let preview = event.extra.get("bodyPreview").and_then(serde_json::Value::as_str).unwrap_or_default();
+    let text = format!(" {} {} {} ", title.join(" "), location, crate::search::words(preview).join(" "));
+    let has = |phrases: &[&str]| phrases.iter().any(|phrase| text.contains(&format!(" {phrase} ")));
+    let category = |name| {
+        let mut matches = known.iter().filter(|category| crate::search::key(category) == name);
+        let first = matches.next()?;
+        matches.next().is_none().then(|| first.clone())
+    };
+    if title.iter().any(|word| word == "blocker") {
+        if has(&["not a blocker", "not blocker", "no blocker", "neni blocker", "nebude blocker",
+            "ne blocker", "nikoli blocker", "nikoliv blocker"]) {
+            return None;
+        }
+        return category("blocker").or_else(|| category("nejiste"));
+    }
+    if has(&["not", "no", "ne", "neni", "nikoli", "nikoliv", "nebude", "nebudeme", "nejsme",
+        "maybe", "possibly", "mozna", "tbd", "to be confirmed", "to be decided",
+        "unconfirmed", "nepotvrzeno", "nepotvrzeny"])
+    {
+        return None;
+    }
+    let office = matches!(location.as_str(), "office" | "kancelar" | "microsoft office" | "microsoft praha" | "microsoft prague")
+        || has(&["our office", "our offices", "v nasi kancelari", "v nasich kancelarich", "nase kancelar",
+            "u nas v office", "v microsoftu", "at microsoft", "microsoft hq"]);
+    let onsite = has(&["u zakaznika", "u klienta", "at customer", "at client", "at the customer", "at the client",
+        "customer on site", "client on site", "customer site",
+        "client site", "customer office", "customer s office", "client office", "client s office",
+        "customer premises", "client premises", "kancelar zakaznika"]);
+    let remote_only = has(&["online only", "remote only", "pouze online", "jen online", "vyhradne online"]);
+    if (office && onsite) || ((office || onsite) && remote_only) {
+        return None;
+    }
+    if onsite { return category("mimooffice"); }
+    if office { return category("office"); }
+    if has(&["onsite", "on site", "in person", "osobne", "adresa", "address", "location",
+        "misto", "room", "budova", "zasedacka", "zasedaci mistnost"])
+    {
+        return None;
+    }
+    let remote_location = matches!(location.as_str(), "" | "teams" | "microsoft teams" | "teams meeting"
+        | "microsoft teams meeting" | "online" | "remote" | "video call" | "conference call" | "telefon"
+        | "zoom" | "zoom meeting" | "webex" | "webex meeting" | "google meet" | "skype" | "skype for business");
+    let online = event.extra.get("isOnlineMeeting") == Some(&serde_json::Value::Bool(true))
+        || event.join_url().is_some()
+        || (!location.is_empty() && remote_location)
+        || remote_only;
+    if remote_location && online { category("call") } else { None }
 }
 
 pub fn category_meanings(categories: &[String]) -> serde_json::Value {
@@ -1311,6 +1400,81 @@ fn working_interval(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn acceptance_categories_use_only_clear_local_clues_and_existing_category_names() {
+        let known = ["Call", "Office", "Mimo office", "Nejisté"].map(str::to_owned);
+        for (title, location, preview, online, expected) in [
+            ("Planning", "", "", true, Some("Call")),
+            ("Planning", "Microsoft Teams Meeting", "", false, Some("Call")),
+            ("Planning", "", "Online only", false, Some("Call")),
+            ("Workshop", "Office", "", true, Some("Office")),
+            ("Workshop", "", "Sejdeme se v naší kanceláři.", true, Some("Office")),
+            ("Workshop", "", "Setkání u zákazníka onsite.", true, Some("Mimo office")),
+            ("Customer on-site workshop", "", "", true, Some("Mimo office")),
+            ("BLOCKER: Planning", "", "", true, Some("Nejisté")),
+            ("BLOCKER: Planning", "", "TBD; date is not confirmed.", true, Some("Nejisté")),
+            ("Microsoft Office 365 training", "", "", true, Some("Call")),
+            ("Planning", "", "", false, None),
+            ("Planning", "Contoso HQ", "", true, None),
+            ("Planning", "", "Meet in person at Blue Street 10", true, None),
+            ("Planning", "Conference Room 2", "", true, None),
+            ("Planning", "", "Our office or customer site", true, None),
+            ("Planning", "Office", "Online only", true, None),
+            ("Planning", "", "Maybe at our office", true, None),
+            ("Planning", "", "Not in our office", true, None),
+            ("Planning", "", "Not our office", true, None),
+            ("Planning", "", "Not customer premises", true, None),
+            ("Planning", "", "Schůzka nebude v naší kanceláři", true, None),
+            ("Planning", "Teams", "TBD", true, None),
+            ("Not a blocker", "Teams", "", true, None),
+        ] {
+            let mut event = crate::calendar::fixture(1).remove(0);
+            event.title = title.into();
+            event.location = location.into();
+            event.category.clear();
+            event.extra.insert("categories".into(), serde_json::json!([]));
+            event.extra.remove("onlineMeeting");
+            event.extra.insert("bodyPreview".into(), serde_json::json!(preview));
+            event.extra.insert("isOnlineMeeting".into(), serde_json::json!(online));
+            assert_eq!(acceptance_category(&event, &known).as_deref(), expected, "{title} / {location} / {preview}");
+            assert_eq!(acceptance_category(&event, &[]), None, "A rule never invents a category");
+        }
+        let mut event = crate::calendar::fixture(1).remove(0);
+        event.title = "BLOCKER: Planning".into();
+        event.category.clear();
+        event.extra.insert("categories".into(), serde_json::json!([]));
+        assert_eq!(acceptance_category(&event, &["Blocker".into(), "Nejisté".into()]).as_deref(), Some("Blocker"));
+        event.title = "Planning".into();
+        event.location = "Teams".into();
+        event.extra.insert("categories".into(), serde_json::json!(["Follow"]));
+        assert_eq!(acceptance_category(&event, &known).as_deref(), Some("Call"));
+        assert_eq!(acceptance_category(&event, &["Call".into(), "CALL".into()]), None, "Ambiguous category identities are not guessed");
+        event.extra.insert("categories".into(), serde_json::json!(["Office"]));
+        assert_eq!(acceptance_category(&event, &known), None, "An existing category is preserved");
+    }
+
+    #[test]
+    fn acceptance_category_is_bound_to_the_approval_and_old_responses_keep_their_serialized_identity() {
+        let legacy = serde_json::json!({"Respond":{"response":"Accept","comment":"","send_response":false}});
+        let mut response: Change = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&response).unwrap(), legacy);
+        let mut event = crate::calendar::fixture(1).remove(0);
+        event.extra.insert("type".into(), serde_json::json!("singleInstance"));
+        event.extra.insert("isOrganizer".into(), serde_json::json!(false));
+        event.organizer = "organizer@example.invalid".into();
+        let now = chrono::Local::now().fixed_offset();
+        let old = Recommendation::from_manual(&event, "owner", response.clone(), now).unwrap();
+        if let Change::Respond { category, .. } = &mut response { *category = Some("Call".into()); }
+        let categorized = Recommendation::from_manual(&event, "owner", response.clone(), now).unwrap();
+        assert_ne!(old.id, categorized.id);
+        for invalid in [MeetingResponse::Tentative, MeetingResponse::Decline, MeetingResponse::Cancel] {
+            let change = Change::Respond { response: invalid, comment: String::new(), send_response: true, category: Some("Call".into()) };
+            assert!(validate_manual_change(&event, &change).is_err());
+        }
+        if let Change::Respond { category, .. } = &mut response { *category = Some("Follow".into()); }
+        assert!(validate_manual_change(&event, &response).is_err());
+    }
+
     #[test]
     fn category_updates_replace_the_whole_list_and_never_invent_categories() {
         assert_eq!(

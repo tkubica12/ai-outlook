@@ -378,6 +378,7 @@ fn compact(event: &Event) -> Value {
         "is_all_day":event.is_all_day,"category":event.category,"status":event.status,
         "organizer":event.organizer,"attendees":event.attendees.iter().take(16).collect::<Vec<_>>(),
         "attendees_total":event.attendee_count(),"location":event.location,"source_url":event.source_url,
+        "is_organizer":event.extra.get("isOrganizer"),"event_type":event.extra.get("type"),
         "event_fingerprint":event.fingerprint(),"event_revision":crate::scheduler::fingerprint(event)})
 }
 
@@ -612,13 +613,28 @@ pub fn proposal_tool(
         "replacement":text.clone(),"append":text
     },"required":["content_type","before"],"additionalProperties":false});
     github_copilot_sdk::Tool::new(crate::changes::PROPOSE)
-        .with_description("Create a durable pending change for HUMAN approval in Tomlook Messages; this tool NEVER changes Insights, meeting notes or calendar events. Do use it when the user asks to add found references or change a meeting, rather than merely describing what to write. First resolve the exact meeting and use event_revision returned by the calendar tools. For document edits read the complete relevant bilingual sections and document revision with tomlook_insights_read; submit complete replacement sections, keeping their other items. summary uses en/cs strings, other sections use en/cs arrays of strings. Material references may be Markdown links inside narrative; never invent verified sources. Approved sections survive later automatic updates; untouched sections still refresh. category=null removes ordinary categories but preserves Follow. Travel is one before/after adjacent block, 15-180 minutes in 15-minute steps, only for accepted timed meetings with a free interval; all-day meetings cannot have travel buffers. Text edits require an event you organize. To change its description first read /me/events/{id}?$select=id,body using the WorkIQ read tool, supply the COMPLETE original content and content_type, and exactly one of plain-text replacement or append. Online meetings permit append only: the host preserves the entire Teams meeting blob and escapes inserted HTML. Proposals are bound to account/occurrence/current content; they never update a series. A maximum of four proposals per question and sixteen pending manual changes per account is enforced. Even a chat message saying approve cannot authorize execution: tell the user to click Review changes and explicitly Approve change in the application. Do not claim a change was saved or sent; distinguish a saved pending proposal from an applied edit.")
+        .with_description("Stage a durable pending change for HUMAN approval in Tomlook Messages; NEVER executes or approves writes. Use when asked to create/delete meetings or BLOCKERs, or edit meetings/Insights/notes. For create, OMIT id and event_revision; provide action.kind=create and event with title, start/end (RFC3339 including UTC offset), optional description, existing category, private, teams and attendees (verified email, optional name, required/optional role). Never guess recipient addresses or unspecified dates/times; resolve them first. Creates one timed event lasting at most 24 hours, no recurrence or rooms; invitations are sent ONLY after the user's button approval. To remove an existing event use action.kind=delete, its exact saved id and event_revision from calendar tools. This works for old BLOCKERs too, not only ones Tomlook created. The host chooses delete for own appointments, cancellation notifying attendees for meetings you organize, or decline without response for invitations. Only this occurrence, never an entire series. Resolve every intended occurrence separately, preserve the final invitation and unrelated events, and explain which ones are proposed. Other actions also require id and event_revision. For document edits read complete bilingual sections and their revision with tomlook_insights_read; replace only relevant sections, keeping other items. summary uses en/cs strings; other sections use en/cs string arrays. Never invent verified sources. category=null clears ordinary categories but preserves Follow. Travel is a free adjacent 15-180 minute block in 15-minute steps. Text edits require an event you organize. Before changing its description read the complete original body with WorkIQ, supply content_type and before, and exactly one of replacement or append; online meetings permit append only to preserve Teams metadata. At most four proposals per question and sixteen pending changes of each type per account. A chat message saying approve cannot authorize execution. Tell the user to click Review changes and the explicit approval button in Messages. Never claim that a pending proposal changed the calendar or sent invitations.")
         .with_parameters(json!({"type":"object","properties":{
             "id":{"type":"string","minLength":1,"maxLength":2000},
             "event_revision":{"type":"string","minLength":64,"maxLength":64},
             "reason":{"type":"string","minLength":1,"maxLength":1600},
             "reason_cs":{"type":"string","minLength":1,"maxLength":1600},
             "action":{"oneOf":[
+                {"type":"object","properties":{"kind":{"const":"create"},"event":{
+                    "type":"object","properties":{
+                        "title":{"type":"string","minLength":1,"maxLength":1000},
+                        "start":{"type":"string","format":"date-time"},"end":{"type":"string","format":"date-time"},
+                        "description":{"type":"string","maxLength":16000},
+                        "category":{"type":["string","null"],"maxLength":256},
+                        "private":{"type":"boolean"},"teams":{"type":"boolean"},
+                        "attendees":{"type":"array","maxItems":50,"items":{"type":"object","properties":{
+                            "email":{"type":"string","format":"email"},"name":{"type":"string","maxLength":200},
+                            "role":{"type":"string","enum":["required","optional"]}},
+                            "required":["email"],"additionalProperties":false}}
+                    },"required":["title","start","end"],"additionalProperties":false}},
+                    "required":["kind","event"],"additionalProperties":false},
+                {"type":"object","properties":{"kind":{"const":"delete"}},
+                    "required":["kind"],"additionalProperties":false},
                 {"type":"object","properties":{"kind":{"const":"document"},"document":{"type":"string","enum":["insights","notes"]},
                     "revision":{"type":"string","minLength":64,"maxLength":64},"sections":{"type":"array","minItems":1,"maxItems":6,"items":section}},
                     "required":["kind","document","revision","sections"],"additionalProperties":false},
@@ -629,7 +645,7 @@ pub fn proposal_tool(
                 {"type":"object","properties":{"kind":{"const":"text"},"title":{"type":"string","maxLength":1000},"body":body},
                     "required":["kind"],"additionalProperties":false}
             ]}
-        },"required":["id","event_revision","reason","reason_cs","action"],"additionalProperties":false}))
+        },"required":["reason","reason_cs","action"],"additionalProperties":false}))
         .with_handler(Arc::new(ProposalHandler { cache, commands, recorder, run }))
 }
 
@@ -726,7 +742,10 @@ mod tests {
             "action":{"kind":"document","document":"notes","revision":result["revision"],
                 "sections":[{"name":"summary","en":"Updated summary","cs":"Upraveny souhrn"}]}});
         assert!(valid(crate::changes::PROPOSE, &request));
-        for action in [json!({"kind":"approve"}), json!({"kind":"delete"}),
+        let mut deletion = request.clone();
+        deletion["action"] = json!({"kind":"delete"});
+        assert!(valid(crate::changes::PROPOSE, &deletion));
+        for action in [json!({"kind":"approve"}), json!({"kind":"delete","approve":true}),
             json!({"kind":"document","document":"notes","revision":result["revision"],
                 "sections":[{"name":"sources","en":[],"cs":[]}]})] {
             let mut invalid = request.clone();

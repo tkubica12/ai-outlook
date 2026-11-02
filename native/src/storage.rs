@@ -198,6 +198,22 @@ impl Store {
         Ok(records)
     }
 
+    pub fn propose_event_creation(&self, record: &crate::event_creation::Record) -> Result<()> {
+        record.validate()?;
+        if record.state != crate::event_creation::State::Pending
+            || record.parent.is_some() || record.hold.is_some()
+            || self.calendar_owner()?.as_deref() != Some(record.account.as_str())
+        {
+            return Err("Calendar account or event proposal changed".into());
+        }
+        let payload = serde_json::to_string(record).map_err(|_| "Encode event proposal failed")?;
+        if payload.len() > 64 * 1024 { return Err("Saved event creation exceeds its safety limit".into()); }
+        self.connection.execute("INSERT INTO settings(key,payload) VALUES(?1,?2)",
+            params![format!("event-creation-{}", record.id), payload])
+            .map_err(|_| "Event proposal already exists or could not be saved")?;
+        Ok(())
+    }
+
     pub fn approve_event_creation(&self, record: &crate::event_creation::Record) -> Result<()> {
         record.validate()?;
         if record.state != crate::event_creation::State::Creating
@@ -209,7 +225,7 @@ impl Store {
         self.connection.execute(
             "INSERT INTO settings(key,payload) VALUES(?1,?2)
              ON CONFLICT(key) DO UPDATE SET payload=excluded.payload
-             WHERE json_extract(settings.payload,'$.state')='NotSent'",
+             WHERE json_extract(settings.payload,'$.state') IN ('Pending','NotSent')",
             params![format!("event-creation-{}", record.id),payload])
             .and_then(|count| if count == 1 { Ok(()) } else { Err(rusqlite::Error::InvalidQuery) })
             .map_err(|_| "Event creation approval was already consumed or could not be saved")?;

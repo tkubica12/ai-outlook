@@ -30,7 +30,7 @@ mod setup;
 mod tasks;
 mod weekly;
 
-use connections::status_text;
+use connections::{status_text, version_label};
 use event_editor::EventDraft;
 use feedback::FeedbackUi;
 use meeting::MeetingActionDraft;
@@ -1133,6 +1133,14 @@ impl Tomlook {
         Color32::from_rgb(r, g, b)
     }
 
+    fn category_button(&self, ui: &egui::Ui, label: String, category: Option<&str>, selected: bool) -> egui::Button<'static> {
+        let fill = category.map(|category| category_color(category, self.preferences.dark)
+            .gamma_multiply(if self.preferences.dark { 0.3 } else { 0.15 }))
+            .unwrap_or(ui.visuals().faint_bg_color);
+        egui::Button::new(label).fill(fill)
+            .stroke(if selected { Stroke::new(2.0, self.accent()) } else { Stroke::NONE }).truncate()
+    }
+
     fn sync_brand(&mut self, context: &egui::Context) {
         let language = self.preferences.language;
         if self.brand_language != Some(language) {
@@ -1553,6 +1561,7 @@ impl eframe::App for Tomlook {
                     ))));
                 }
                 if self.loading { ui.spinner(); }
+                version_label(ui, language);
                 if !self.preview {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let completed = self.activity.index.len(ActivityFilter::Ready);
@@ -1567,7 +1576,10 @@ impl eframe::App for Tomlook {
                             || self.external_status.values().any(|status| !status.ready && !status.busy && !status.message.is_empty() && status.message != "Not connected");
                         let now = chrono::Local::now().fixed_offset();
                         let recommendations = self.activity.recommendation_view.iter().filter_map(|entry| self.activity.recommendations.get(&entry.id)).filter(|recommendation|
-                            recommendation.visible(&self.calendar, self.calendar_owner.as_deref(), now)).count();
+                            recommendation.visible(&self.calendar, self.calendar_owner.as_deref(), now)).count()
+                            + self.activity.event_creations.values().filter(|record|
+                                record.state == tomlook::event_creation::State::Pending
+                                && self.calendar_owner.as_deref() == Some(record.account.as_str())).count();
                         if (has_messages || recommendations > 0) && inbox_button(ui, language, has_messages, recommendations).clicked() {
                             self.messages_open = true;
                             if self.ai.is_some() { self.ai_command(ai::Command::RefreshCalendarAvailability); }

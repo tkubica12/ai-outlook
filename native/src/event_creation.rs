@@ -206,7 +206,7 @@ pub struct Part {
 impl Part {
     pub fn body(&self) -> Value {
         let utc = |time: DateTime<FixedOffset>| {
-            json!({"dateTime":time.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%S").to_string(),
+            json!({"dateTime":time.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%S%.f").to_string(),
                 "timeZone":"UTC"})
         };
         let attendees = self
@@ -318,6 +318,8 @@ impl Part {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum State {
+    Pending,
+    Dismissed,
     Creating,
     Created,
     NotSent,
@@ -327,6 +329,8 @@ pub enum State {
 impl State {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Pending => "Proposed event",
+            Self::Dismissed => "Event proposal dismissed",
             Self::Creating => "Creating event",
             Self::Created => "Event created",
             Self::NotSent => "Event not created",
@@ -485,6 +489,8 @@ impl Record {
     pub fn label(&self) -> &'static str {
         if self.hold.is_some() {
             return match self.state {
+                State::Pending => "Proposed event",
+                State::Dismissed => "Event proposal dismissed",
                 State::Creating => "Creating BLOCKERs",
                 State::Created => "BLOCKERs created",
                 State::NotSent => "BLOCKERs not created",
@@ -495,6 +501,8 @@ impl Record {
             return self.state.label();
         }
         match self.state {
+            State::Pending => "Proposed event",
+            State::Dismissed => "Event proposal dismissed",
             State::Creating => "Creating travel blocks",
             State::Created => "Travel blocks created",
             State::NotSent => "Travel blocks not created",

@@ -52,16 +52,19 @@ impl Tomlook {
                             response: MeetingResponse::Tentative,
                             comment: String::new(),
                             send_response: true,
+                            category: None,
                         },
                         Change::Respond {
                             response: MeetingResponse::Decline,
                             comment: String::new(),
                             send_response: false,
+                            category: None,
                         },
                         Change::Respond {
                             response: MeetingResponse::Cancel,
                             comment: String::new(),
                             send_response: true,
+                            category: None,
                         },
                         Change::Delete,
                     ] {
@@ -221,8 +224,25 @@ impl Tomlook {
                         }
                         Change::ClearCategory => { ui.strong(language.text("Remove category")); }
                         Change::Follow(enabled) => { ui.strong(language.text(if *enabled { "Follow" } else { "Stop following" })); }
-                        Change::Respond { response, .. } => { ui.strong(language.text(response.label())); }
-                        Change::Delete => { ui.strong(language.text("Delete own appointment")); }
+                        Change::Respond { response, send_response, category, .. } => {
+                            ui.strong(language.text(response.label()));
+                            if let Some(category) = category {
+                                ui.weak(format!("{}: {category}", language.text("Category")));
+                            }
+                            ui.weak(language.text("This occurrence only"));
+                            if *response == tomlook::recommendations::MeetingResponse::Cancel {
+                                ui.colored_label(ui.visuals().warn_fg_color, language.text("Notifies all attendees."));
+                            } else if *send_response {
+                                ui.weak(language.text("Send response to organizer"));
+                            } else {
+                                ui.weak(language.text("The organizer will not be notified."));
+                            }
+                        }
+                        Change::Delete => {
+                            ui.strong(language.text("Delete own appointment"));
+                            ui.weak(language.text("This occurrence only"));
+                            ui.weak(language.text("No attendees will be notified."));
+                        }
                     }
                 } else if recommendation.suggestion.kind.is_travel()
                     || recommendation.suggestion.kind.is_preparation() {

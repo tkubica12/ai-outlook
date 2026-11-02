@@ -642,25 +642,16 @@ impl Tomlook {
                 .show(context, |ui| {
                     let creations = self.activity.event_creations.clone();
                     let mut records = creations.values().filter(|record| self.calendar_owner.as_deref() == Some(record.account.as_str())).collect::<Vec<_>>();
-                    records.sort_by_key(|record| record.created_at);
+                    records.sort_by_key(|record| (
+                        record.state == tomlook::event_creation::State::Pending,
+                        self.recommendation_selected.as_deref() == Some(record.id.as_str()),
+                        record.created_at));
                     if !records.is_empty() {
                         egui::CollapsingHeader::new(language.text("Event creation"))
                             .default_open(true).show(ui, |ui| {
-                                egui::ScrollArea::vertical().id_salt("event-creation-results").max_height(160.0).show(ui, |ui| {
+                                egui::ScrollArea::vertical().id_salt(("event-creation-results", &self.recommendation_selected)).max_height(280.0).show(ui, |ui| {
                                     for record in records.iter().rev() {
-                                        ui.strong(format!("{}: {}", language.text(record.label()), record.draft.title));
-                                        ui.weak(language.text(&record.message));
-                                        match &record.hold {
-                                            Some(hold) => for slot in &hold.slots {
-                                                ui.weak(slot.label(language));
-                                            },
-                                            None => { ui.weak(format!("{} - {}", record.draft.start.with_timezone(&Local).format("%d.%m. %H:%M"),
-                                                record.draft.end.with_timezone(&Local).format("%d.%m. %H:%M"))); }
-                                        }
-                                        if !record.draft.attendees.is_empty() {
-                                            ui.weak(format!("{}: {}", language.text("Invited"), record.draft.attendees.iter()
-                                                .map(|attendee| attendee.label()).collect::<Vec<_>>().join(", ")));
-                                        }
+                                        self.event_creation_record(ui, record);
                                     }
                                 });
                             });

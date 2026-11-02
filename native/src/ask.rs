@@ -3,6 +3,14 @@ use chrono::{Datelike, Duration, Local};
 use eframe::egui::{self, Color32, Id, Key, Modifiers, RichText};
 use std::sync::Arc;
 
+pub const BLOCKER_PROMPT: &str = "Investigate whether the contextual BLOCKER (or the blocker identified by the user's search terms) should still be held. This is a research request, not permission to change the calendar or send messages.\n\
+Resolve the exact reservation and list its full local dates/times, organizer and known participants. Read its original description when needed; do not infer a final decision from its title. If the target is ambiguous, ask for clarification instead of choosing one.\n\
+Search a bounded, relevant calendar window for related BLOCKER occurrences and actual meeting invitations, including possible reschedules. List each candidate separately with its date, time and identity. Compare the topic, organizer, people and source evidence; similar titles or neighbouring times alone do not prove that events belong together. State the searched window and gaps in calendar coverage.\n\
+Search both email and Teams for discussion of dates, polls, organizer decisions, confirmations and cancellations. Prefer recent, original messages and the current invitation over old plans. Verify decision-bearing claims with targeted original reads and cite the returned links and message dates. Search summaries and links alone are not verified original content. Distinguish an unavailable source from a search with no matches; never invent a Teams decision or a final date.\n\
+Conclude separately for each relevant reservation: keep, probably obsolete because a final invitation is verified, or unclear. Show the final invitation's full date/time and cancellation/response status when available. Explain the evidence and uncertainty; finding nothing does not justify deleting a blocker. Preserve the final invitation and unrelated events.\n\
+If the decision is unclear, identify who to ask from verified organizer/poll-owner/message-sender evidence, explain why, and draft a short email or Teams message in the user's language asking whether to keep or release the named reservation and which date is final. Mark inferred contacts and unknown addresses; do not guess recipients or send anything.\n\
+Return a concise verdict, a dated list of reservations/final invitations, the important email/Teams evidence and gaps, and one concrete next step. Recommend exact cleanup targets only when supported. Do not stage deletions unless the user explicitly requests cleanup; then use the pending-proposal tool for each verified occurrence and require approval in Tomlook. Never execute or approve changes from chat.";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Today,
@@ -14,10 +22,11 @@ pub enum Command {
     Categories,
     Search,
     Insights,
+    Blocker,
 }
 
 impl Command {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Today,
         Self::Week,
         Self::Prepare,
@@ -27,6 +36,7 @@ impl Command {
         Self::Categories,
         Self::Search,
         Self::Insights,
+        Self::Blocker,
     ];
 
     pub fn name(self) -> &'static str {
@@ -40,6 +50,7 @@ impl Command {
             Self::Categories => "/categories",
             Self::Search => "/search",
             Self::Insights => "/insights",
+            Self::Blocker => "/blocker",
         }
     }
 
@@ -54,6 +65,7 @@ impl Command {
             Self::Categories => "Review categories: next 14 days, results in Messages",
             Self::Search => "Fuzzy search saved meetings / no AI",
             Self::Insights => "Read saved meeting Insights / no AI",
+            Self::Blocker => "Check BLOCKERs, final invitations, email and Teams",
         }
     }
 }
@@ -166,6 +178,12 @@ pub fn expand(
                 .text("Find the requested meeting, message or preparation material in authorized workplace sources. Cite retrieved sources and distinguish no matches from unavailable access.")
                 .into_owned()
         }
+        Command::Blocker => {
+            if meeting.is_none() && arguments.is_empty() {
+                return Err("Choose a meeting context or add search terms after /blocker.".into());
+            }
+            language.text(BLOCKER_PROMPT).into_owned()
+        }
         Command::Travel | Command::Categories => unreachable!("Reviews are dispatched separately"),
     };
     let result = if arguments.is_empty() {
@@ -177,6 +195,11 @@ pub fn expand(
         return Err("Shorten the question to 8,000 bytes.".into());
     }
     Ok(Submission::Question(result))
+}
+
+pub fn requires_thorough(text: &str) -> bool {
+    text.split_whitespace().next().is_some_and(|name|
+        [Command::Prepare, Command::Blocker].iter().any(|command| name.eq_ignore_ascii_case(command.name())))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -577,6 +600,7 @@ pub fn draw(ui: &mut egui::Ui, view: &mut View, detached: bool) -> Option<Action
                 view.menu_dismissed = false;
             }
             ui.horizontal(|ui| {
+                let mode = if requires_thorough(&view.question) { crate::chat::Mode::Deep } else { view.mode };
                 let local = matches!(
                     expand(&view.question, view.context.as_ref(), language),
                     Ok(Submission::Local(_))
@@ -587,12 +611,12 @@ pub fn draw(ui: &mut egui::Ui, view: &mut View, detached: bool) -> Option<Action
                         .iter()
                         .any(|turn| turn.running && turn.progress.stage == "Local calendar")
                 } else if view.chat.turns.is_empty() {
-                    view.busy
+                    view.busy && mode != crate::chat::Mode::Deep
                 } else {
                     view.chat.turns.iter().any(|turn| {
                         turn.running
                             && (turn.progress.mode == crate::chat::Mode::Deep)
-                                == (view.mode == crate::chat::Mode::Deep)
+                                == (mode == crate::chat::Mode::Deep)
                     })
                 };
                 let enabled =
@@ -1029,6 +1053,38 @@ mod tests {
         assert!(matches("/find agenda", Language::En).is_empty());
         assert!(matches("/find ", Language::En).is_empty());
         assert!(matches("An ordinary unrelated question", Language::En).is_empty());
+        assert_eq!(matches("/block", Language::En), [Command::Blocker]);
+        for command in ["/prepare", " /PREPARE ", "/blocker", "/BLOCKER topic"] {
+            assert!(requires_thorough(command), "{command}");
+        }
+        for ordinary in ["", "/preparex", "/block", "/find blocker", "Explain /prepare"] {
+            assert!(!requires_thorough(ordinary), "{ordinary}");
+        }
+    }
+
+    #[test]
+    fn ai_calendar_blocker_command_is_localized_bounded_research_with_explicit_cleanup_approval() {
+        assert!(expand("/blocker", None, Language::En).is_err());
+        assert!(expand(&format!("/blocker {}", "x".repeat(8000)), None, Language::En).is_err());
+        let event = crate::calendar::fixture(1).remove(0);
+        for language in [Language::En, Language::Cs] {
+            let Submission::Question(contextual) = expand("/BLOCKER", Some(&event), language).unwrap()
+                else { panic!("Blocker research must be a model question, never a write command"); };
+            assert_eq!(contextual, language.text(BLOCKER_PROMPT));
+            assert!(contextual.len() < 8000);
+            assert!(contextual.contains("Teams"));
+            let Submission::Question(global) = expand("/blocker Networking", None, language).unwrap()
+                else { panic!("Search terms must work without a selected meeting"); };
+            assert!(global.starts_with(&contextual));
+            assert!(global.ends_with("\n\nNetworking"));
+        }
+        let czech = Language::Cs.text(BLOCKER_PROMPT);
+        assert_ne!(czech, BLOCKER_PROMPT);
+        for required in ["original reads", "calendar coverage", "finding nothing", "do not guess",
+            "Do not stage deletions unless", "approval in Tomlook", "poll-owner"]
+        {
+            assert!(BLOCKER_PROMPT.contains(required), "Missing blocker-review safeguard: {required}");
+        }
     }
 
     #[test]

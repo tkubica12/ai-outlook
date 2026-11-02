@@ -323,6 +323,7 @@ fn manual_actions_are_exact_one_shot_and_never_available_to_ai_suggestions() {
         response: MeetingResponse::Decline,
         comment: "I cannot join.".into(),
         send_response: true,
+        category: None,
     };
     let mut record = Recommendation::from_manual(&event, "owner", change.clone(), now).unwrap();
     assert!(record.current(&calendar, Some("owner"), now).is_some());
@@ -365,6 +366,7 @@ fn manual_actions_are_exact_one_shot_and_never_available_to_ai_suggestions() {
         response: MeetingResponse::Accept,
         comment: String::new(),
         send_response: true,
+        category: None,
     };
     assert!(altered.validate("owner").is_err());
     altered = operation.clone();
@@ -407,6 +409,7 @@ fn manual_roles_comments_and_recurrence_are_checked_before_approval() {
         response,
         comment: comment.into(),
         send_response,
+        category: None,
     };
     assert!(validate_manual_change(&event, &Change::ClearCategory).is_err());
     event
