@@ -20,6 +20,7 @@ mod customers;
 mod event_editor;
 mod feedback;
 mod find_time;
+mod invitations;
 mod followup;
 mod meeting;
 mod myday;
@@ -30,7 +31,6 @@ mod setup;
 mod tasks;
 mod weekly;
 
-use connections::{status_text, version_label};
 use event_editor::EventDraft;
 use feedback::FeedbackUi;
 use meeting::MeetingActionDraft;
@@ -198,6 +198,7 @@ pub struct Tomlook {
     weekly: weekly::WeeklyUi,
     followup: followup::FollowUpUi,
     customers: customers::CustomersUi,
+    invitations: invitations::InvitationsUi,
     preview: bool,
     demo_screenshot: Option<std::path::PathBuf>,
     demo_scene: tomlook::showcase::Scene,
@@ -508,6 +509,7 @@ impl Tomlook {
             weekly: Default::default(),
             followup: Default::default(),
             customers: Default::default(),
+            invitations: Default::default(),
             preview: false,
             demo_screenshot: None,
             demo_scene: Default::default(),
@@ -706,6 +708,7 @@ impl Tomlook {
                     }
                     self.calendar = calendar;
                     if self.calendar_owner != calendar_owner {
+                        self.invitations = Default::default();
                         self.invalidate_connection_answers();
                         self.research_recoveries = Default::default();
                     }
@@ -744,6 +747,7 @@ impl Tomlook {
                     }
                     self.preferences = *preferences;
                     self.loading = false;
+                    self.receive_invitation_focus();
                     self.sync_reminders();
                     self.sync_msx();
                     if let Some(trace) = &mut self.startup
@@ -1365,7 +1369,6 @@ impl eframe::App for Tomlook {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        let language = self.preferences.language;
         let interaction_started = self
             .interaction_trace
             .as_ref()
@@ -1483,113 +1486,9 @@ impl eframe::App for Tomlook {
         self.sync_brand(&context);
         self.shortcuts(&context);
         egui::Panel::top("header").show(ui, |ui| self.header(ui));
-        egui::Panel::bottom("status").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if self.preview {
-                    ui.weak(language.text("Offline demo - fictional calendar"));
-                } else {
-                if status_text(ui, "status-ai", language.text(if self.ai_login_busy {
-                        "GitHub Copilot: signing in..."
-                    } else if self.ai_ready {
-                        "GitHub Copilot: connected"
-                    } else {
-                        "GitHub Copilot: disconnected"
-                    }))
-                    .on_hover_text(language.text(&self.connection))
-                    .clicked()
-                {
-                    self.open_ai_connection();
-                }
-                if status_text(ui, "status-auto", language.text(self.auto_status.label()))
-                    .on_hover_text(language.text(&self.auto_status.message)).clicked() {
-                    self.open_ai_connection();
-                }
-                let label = if self.hosted_workiq_busy {
-                    "WorkIQ: working..."
-                } else if self.workiq_ready {
-                    "WorkIQ: connected"
-                } else {
-                    "WorkIQ: disconnected"
-                };
-                if status_text(ui, "status-workiq", language.text(label))
-                    .on_hover_text(language.text(&self.hosted_workiq_status))
-                    .clicked()
-                {
-                    self.connection_panel = Some(ConnectionPanel::Workiq);
-                }
-                if self.preferences.msx_enabled
-                    && status_text(ui, "status-msx", language.text(self.msx_status.label()))
-                        .on_hover_text(language.text(&self.msx_status.message))
-                        .clicked()
-                {
-                    self.connection_panel = Some(ConnectionPanel::Msx);
-                }
-                for kind in [tomlook::connectors::Kind::Webiq, tomlook::connectors::Kind::Github] {
-                    let status = self.external_status.entry(kind).or_default();
-                    let state = if status.forgetting { "disconnecting..." } else if status.busy { "connecting..." } else if status.ready { "connected" } else { "disconnected" };
-                    if status_text(ui, kind.server(), language.text(&(format!("{}: {state}", kind.label())))).on_hover_text(language.text(&status.message)).clicked() {
-                        self.connection_panel = Some(ConnectionPanel::External(kind));
-                    }
-                }
-                if let Some(staged) = &self.update_status.staged
-                    && status_text(ui, "status-update", language.text(&format!("Update {} ready", staged.version)))
-                        .on_hover_text(language.text("A verified update is ready. Restart from Settings, or it is installed when you exit Tomlook."))
-                        .clicked()
-                {
-                    self.preferences_open = true;
-                    self.preferences_section = PreferencesSection::Updates;
-                }
-                self.setup_indicator(ui);
-                }
-                ui.weak(language.text(&(format!("{} cached meetings", self.calendar.events.len())))).on_hover_text(
-                    language.text(&(self.calendar_owner.as_deref().map(|owner| format!("Locally saved calendar owned by {owner}; retained when disconnected.")).unwrap_or_else(|| "Local calendar cache; no connected account assigned.".into())))
-                );
-                if self.activity.sync.total > 0 {
-                    let sync = &self.activity.sync;
-                    let label = if !self.workiq_ready {
-                        format!("Sync {}/{} · offline", sync.fresh, sync.total)
-                    } else if sync.error.is_some() {
-                        format!("Sync {}/{} · retrying", sync.fresh, sync.total)
-                    } else {
-                        format!("Sync {}/{}", sync.fresh, sync.total)
-                    };
-                    ui.weak(language.text(&(label))).on_hover_text(language.text(&(format!(
-                        "One month back, six months ahead through {}.\n{}{}",
-                        sync.through.map(|day| day.to_string()).unwrap_or_default(),
-                        sync.updated.map(|time| format!("Last saved refresh: {}.", time.with_timezone(&Local).format("%H:%M"))).unwrap_or_else(|| "No synchronized days yet.".into()),
-                        sync.error.as_ref().map(|error| format!("\n{error}")).unwrap_or_default()
-                    ))));
-                }
-                if self.loading { ui.spinner(); }
-                version_label(ui, language);
-                if !self.preview {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let completed = self.activity.index.len(ActivityFilter::Ready);
-                        let problems = self.activity.index.len(ActivityFilter::Problems);
-                        if status_text(ui, "status-activity", language.text(&(format!("{} ready | {} researching | {} waiting | {} to review", completed, self.activity.queue.flights.len(), self.activity.queued + self.activity.deferred, problems)))).on_hover_text(language.text("Show meetings, queue and local context")).clicked() { self.settings = true; }
-                        let has_messages = self.error.is_some() || self.activity.error.is_some() || self.activity.sync.error.is_some() || problems > 0
-                            || self.activity.event_creations.values().any(|record| self.calendar_owner.as_deref() == Some(record.account.as_str()))
-                            || self.activity.proposals.values().any(|proposal| proposal.in_flight() || proposal.needs_review())
-                            || self.activity.recommendations.values().any(|recommendation|
-                                recommendation.state == tomlook::recommendations::State::Review
-                                    && self.calendar_owner.as_deref() == Some(recommendation.account.as_str()))
-                            || self.external_status.values().any(|status| !status.ready && !status.busy && !status.message.is_empty() && status.message != "Not connected");
-                        let now = chrono::Local::now().fixed_offset();
-                        let recommendations = self.activity.recommendation_view.iter().filter_map(|entry| self.activity.recommendations.get(&entry.id)).filter(|recommendation|
-                            recommendation.visible(&self.calendar, self.calendar_owner.as_deref(), now)).count()
-                            + self.activity.event_creations.values().filter(|record|
-                                record.state == tomlook::event_creation::State::Pending
-                                && self.calendar_owner.as_deref() == Some(record.account.as_str())).count();
-                        if (has_messages || recommendations > 0) && inbox_button(ui, language, has_messages, recommendations).clicked() {
-                            self.messages_open = true;
-                            if self.ai.is_some() { self.ai_command(ai::Command::RefreshCalendarAvailability); }
-                        }
-                    });
-                }
-            });
-        });
+        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("navigation")
-            .exact_size(NAVIGATION_WIDTH)
+            .exact_size(if self.invitations.open { 300.0 } else { NAVIGATION_WIDTH })
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("navigation-scroll")
@@ -1612,6 +1511,7 @@ impl eframe::App for Tomlook {
                 });
         }
         egui::CentralPanel::default().show(ui, |ui| {
+            self.invitation_context_bar(ui);
             if self.preferences.view == View::Month
                 && self.date_selection.is_none()
                 && self.date_drag.is_none()

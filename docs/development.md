@@ -48,6 +48,7 @@ function Invoke-Cargo([string]$Arguments) {
 Invoke-Cargo 'test --locked --offline'                                   # all offline tests
 Invoke-Cargo 'test --locked --offline --lib weekly::'                    # one module
 Invoke-Cargo 'test --locked --offline --test scheduler'                  # one integration test file
+Invoke-Cargo 'test --locked --offline --test invitations'                # queue policy, cache and worker integration
 Invoke-Cargo 'clippy --locked --offline --all-targets -- -D warnings'
 Invoke-Cargo 'build --release --locked --offline --bin tomlook'          # native\target\release\tomlook.exe
 ```
@@ -96,6 +97,7 @@ normal exit; delete it manually after a forced stop.
 | `customer` | The Northstar customer timeline |
 | `setup` | Settings → Setup |
 | `welcome` | The first-run Welcome window |
+| `invitations` | The synthetic invitation queue with three-day calendar context and ordinary details |
 
 `docs\images\tomlook-demo-dark.png` is a `details` screenshot.
 
@@ -142,6 +144,7 @@ a private result file. Run one at a time, for example
 |---|---|---|
 | `insights_live` | One real read-only Insights request | `TOMLOOK_LIVE_INSIGHTS_ROOT`, `_MEETING`, `_OUTPUT` |
 | `calendar_live` | One calendar range read, not saved | `TOMLOOK_LIVE_INSIGHTS_ROOT`, `TOMLOOK_LIVE_WORK_ACCOUNT`, `TOMLOOK_LIVE_CALENDAR_FIRST`, `_LAST`, `_OUTPUT` |
+| `invitations_live` | Native saved connection: mail-header group discovery, complete selected memberships, six-month unanswered queue, independent full-calendar comparison | `TOMLOOK_LIVE_INSIGHTS_ROOT`, `TOMLOOK_LIVE_INVITATION_SELECTION` (private JSON with `queries` and `enabled_groups`), `_OUTPUT`; `_SAVE=1` explicitly saves only local invitation/team caches while Tomlook is closed |
 | `cloud_context_live` | OneDrive folder reads | `TOMLOOK_LIVE_CLOUD_*`, `TOMLOOK_LIVE_INSIGHTS_ROOT`, `TOMLOOK_LIVE_WORK_ACCOUNT` |
 | `chat_live` | Ask answers | `TOMLOOK_LIVE_CHAT_*` |
 | `decision_live` | Foundry routing accuracy and latency | `TOMLOOK_LIVE_CHAT_ROOT`, `TOMLOOK_LIVE_DECISION_OUTPUT` |

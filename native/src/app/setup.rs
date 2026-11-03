@@ -462,7 +462,7 @@ impl Tomlook {
         }
     }
 
-    /// "Setup 2/5" in the status bar while a required step is known to be incomplete.
+    /// Compact setup progress while a required step is known to be incomplete.
     pub(super) fn setup_indicator(&mut self, ui: &mut egui::Ui) {
         if !self.setup.eligible
             || self.preview
@@ -476,10 +476,11 @@ impl Tomlook {
         if !summary.show_hint(self.preferences.setup_hint_hidden) {
             return;
         }
-        let response = status_text(ui, "status-setup", language.text(&summary.badge()))
-            .on_hover_text(
-                language.text("Open the setup checklist. Right-click to hide this indicator."),
-            );
+        let hint = format!("{}\n{}", language.text(&summary.badge()),
+            language.text("Open the setup checklist. Right-click to hide this indicator."));
+        let response = connections::status_item(ui, "status-setup", connections::StatusIcon::Setup,
+            &format!("{}/{}", summary.required_done, summary.required),
+            connections::ConnectionState::Unknown, &hint);
         let mut hide = false;
         response.context_menu(|ui| {
             if ui.button(language.text("Don't show")).clicked() {

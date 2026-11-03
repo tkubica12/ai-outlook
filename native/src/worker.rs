@@ -17,6 +17,8 @@ use std::{
     time::Duration,
 };
 
+mod invitations;
+
 #[derive(Clone)]
 pub struct Options {
     pub state: PathBuf,
@@ -25,6 +27,12 @@ pub struct Options {
 }
 
 pub enum Command {
+    Invitation(crate::invitations::Command),
+    InvitationResult {
+        id: u64,
+        account: String,
+        result: Result<crate::invitations::ReadResult, String>,
+    },
     ProposeChange {
         account: String,
         request: Box<crate::changes::Request>,
@@ -418,6 +426,7 @@ pub struct Activity {
     pub blockers: Arc<std::collections::BTreeMap<String, String>>,
     /// Confirmed customers, meeting choices and cached customer data of `task_account`.
     pub customers: Arc<crate::customers::Book>,
+    pub invitations: Arc<crate::invitations::Snapshot>,
 }
 
 pub struct Shutdown {
@@ -1312,6 +1321,8 @@ impl Worker {
                 let mut task_account: Option<String> = None;
                 let mut task_views: TaskViews = Default::default();
                 let mut customer_book: Arc<crate::customers::Book> = Default::default();
+                let mut invitation_queue = invitations::Queue::default();
+                let mut published_invitation_revision = u64::MAX;
                 let mut tasks_revision = 0_u64;
                 let mut published_tasks_revision = u64::MAX;
                 let mut proposals = std::collections::BTreeMap::<String, crate::scheduling::Proposal>::new();
@@ -1407,6 +1418,9 @@ impl Worker {
                             }
                         };
                         tasks_revision += 1;
+                        if let Err(error) = invitation_queue.load(&store, task_account.as_deref(), &calendar, options.demo.is_some()) {
+                            notify(Notice::Error(error));
+                        }
                         customer_book = match task_account.as_deref()
                             .map(|account| load_customers(&store, account, &calendar, preferences.language, options.demo.is_some()))
                             .transpose() {
@@ -1448,6 +1462,11 @@ impl Worker {
                     let sync_window = crate::calendar_sync::Window::new(now.date_naive())?;
                     let sync_ready = !exiting && options.demo.is_none()
                         && sdk.as_ref().is_some_and(|sdk| sdk.workiq_ready.load(Ordering::Acquire) && !sdk.terminated.load(Ordering::Acquire));
+                    let invitation_connected = sync_ready && identity.as_deref()
+                        .is_some_and(|identity| identity.account == invitation_queue.book.account);
+                    if let Err(error) = invitation_queue.poll(sdk.as_ref(), invitation_connected, options.demo.is_some(), exiting) {
+                        notify(Notice::Error(error));
+                    }
                     if sync_flight.is_some_and(|(_, _, started)| started.elapsed() > Duration::from_secs(300)) {
                         sync_flight = None;
                         sync_error = Some("Calendar synchronization acknowledgement timed out; retrying in one minute".into());
@@ -1751,6 +1770,7 @@ impl Worker {
                                     recommendation.message = "Calendar change verified by read-back".into();
                                     if store.calendar_owner()?.as_deref() == Some(recommendation.account.as_str()) {
                                         calendar = Arc::new(store.save_calendar_event(&event, &recommendation.account)?);
+                                        if let Err(error) = invitation_queue.verified(&store, &event) { notify(Notice::Error(error)); }
                                         dirty = true;
                                         notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: Some(recommendation.account.clone()) });
                                     }
@@ -1766,6 +1786,7 @@ impl Worker {
                                     }
                                     if store.calendar_owner()?.as_deref() == Some(recommendation.account.as_str()) {
                                         calendar = Arc::new(store.remove_calendar_event(&id, &recommendation.account)?);
+                                        if let Err(error) = invitation_queue.removed(&store, &id) { notify(Notice::Error(error)); }
                                         dirty = true;
                                         notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: Some(recommendation.account.clone()) });
                                     }
@@ -1782,6 +1803,7 @@ impl Worker {
                                     recommendation.message = crate::workiq::connection::calendar_write::MEETING_CHANGED.into();
                                     if store.calendar_owner()?.as_deref() == Some(recommendation.account.as_str()) {
                                         calendar = Arc::new(store.save_calendar_event(&event, &recommendation.account)?);
+                                        if let Err(error) = invitation_queue.verified(&store, &event) { notify(Notice::Error(error)); }
                                         dirty = true;
                                         notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: Some(recommendation.account.clone()) });
                                     }
@@ -1927,7 +1949,7 @@ impl Worker {
                         published_owner = owner;
                         published_minute = Some(now.timestamp() / 60);
                     }
-                    if view_changed || queue_changed || previous.identity != identity || previous.enabled != preferences.prepare_enabled || previous.paused != preferences.paused || previous.error != failure || previous.sync != sync || inbox_revision != published_inbox_revision || recaps_revision != published_recaps_revision || tasks_revision != published_tasks_revision || proposals_revision != published_proposals_revision {
+                    if view_changed || queue_changed || previous.identity != identity || previous.enabled != preferences.prepare_enabled || previous.paused != preferences.paused || previous.error != failure || previous.sync != sync || inbox_revision != published_inbox_revision || recaps_revision != published_recaps_revision || tasks_revision != published_tasks_revision || proposals_revision != published_proposals_revision || invitation_queue.revision != published_invitation_revision {
                         if inbox_revision != published_inbox_revision { store.save_recommendations(&inbox)?; }
                         let index = if queue_changed {
                             Arc::new(ActivityIndex::new(&queue))
@@ -1939,9 +1961,15 @@ impl Worker {
                         let (proposal_snapshot, blocker_snapshot) = if proposals_revision != published_proposals_revision {
                             (Arc::new(proposals.clone()), Arc::new(blocker_index(&proposals)))
                         } else { (previous.proposals.clone(), previous.blockers.clone()) };
+                        let invitation_snapshot = if view_changed || tasks_revision != published_tasks_revision
+                            || invitation_queue.revision != published_invitation_revision {
+                            Arc::new(crate::invitations::snapshot(invitation_queue.book.clone(), &calendar, &customer_book,
+                                identity.as_deref(), &sync_days, invitation_queue.pending.progress.clone(),
+                                invitation_queue.teams.progress.clone(), chrono::Utc::now()))
+                        } else { previous.invitations.clone() };
                         let next = Activity { revision, queue: queue.clone(), index, enabled: preferences.prepare_enabled, paused: preferences.paused, error: failure.clone(), sync, recommendations: Arc::new(inbox.clone()), recommendation_view: recommendation_view.clone(), identity: identity.clone(), event_creations: Arc::new(event_creations.clone()), recaps: recap_snapshot,
                             task_account: task_account.clone(), tasks: task_views.0.clone(), followups: task_views.1.clone(), weekly_summaries: task_views.2.clone(),
-                            proposals: proposal_snapshot, blockers: blocker_snapshot, customers: customer_book.clone(),
+                            proposals: proposal_snapshot, blockers: blocker_snapshot, customers: customer_book.clone(), invitations: invitation_snapshot,
                             queued: queue.jobs.values().filter(|job| job.state == crate::scheduler::State::Queued).count(),
                             deferred: queue.jobs.values().filter(|job| job.state == crate::scheduler::State::Deferred).count() };
                         *state.lock().map_err(|_| "Preparation state is unavailable")? = Arc::new(next);
@@ -1949,6 +1977,7 @@ impl Worker {
                         published_recaps_revision = recaps_revision;
                         published_tasks_revision = tasks_revision;
                         published_proposals_revision = proposals_revision;
+                        published_invitation_revision = invitation_queue.revision;
                         context.request_repaint();
                     }
                     let command = loop {
@@ -2000,6 +2029,31 @@ impl Worker {
                     let recommendation_command = matches!(&command, Command::ProposeChange { .. } | Command::CreateEvents { .. } | Command::DismissEventCreation { .. } | Command::ConfirmRecommendation { .. } | Command::ConfirmMeetingAction { .. } | Command::RecheckCalendarResult(_) | Command::DismissRecommendation(_) | Command::ReviewRecommendations { .. }
                         | Command::HoldTimes { .. } | Command::ProposeChat { .. } | Command::ReleaseBlockers { .. } | Command::ScheduleProposal { .. });
                     let result = match command {
+                        Command::Invitation(command) => {
+                            let connected = sdk.as_ref().is_some_and(|sdk|
+                                sdk.workiq_ready.load(Ordering::Acquire) && !sdk.terminated.load(Ordering::Acquire))
+                                && identity.as_deref().is_some_and(|identity| identity.account == command.account());
+                            let outcome = task_owner(&store, options.demo.is_some(), command.account())
+                                .and_then(|()| invitation_queue.handle(command, &mut store, &calendar,
+                                    &sync_days, sdk.as_ref().filter(|_| connected && !exiting), options.demo.is_some()));
+                            match outcome {
+                                Ok(Some(next)) => {
+                                    calendar = Arc::new(next);
+                                    dirty = true;
+                                    notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: store.calendar_owner()? });
+                                }
+                                Ok(None) => {}
+                                Err(error) => { notify(Notice::Error(error)); }
+                            }
+                            Ok(())
+                        }
+                        Command::InvitationResult { id, account, result } => {
+                            if store.calendar_owner()?.as_deref() == Some(account.as_str())
+                                && let Err(error) = invitation_queue.result(&store, id, &account, result, &calendar, &sync_days) {
+                                notify(Notice::Error(error));
+                            }
+                            Ok(())
+                        }
                         Command::ProposeChange { account, request, run, reply } => {
                             let result = if exiting || options.demo.is_some() || run.cancelled.load(Ordering::Acquire) {
                                 Err("Question stopped or preview is active; no proposal was saved".into())
@@ -2475,6 +2529,9 @@ impl Worker {
                             store.save_workiq_identity(&next_identity)?;
                             let account = next_identity.account.clone();
                             identity = Some(Arc::new(next_identity));
+                            invitation_queue.pending = Default::default();
+                            invitation_queue.teams = Default::default();
+                            invitation_queue.revision += 1;
                             sync_days = if store.calendar_owner()?.as_deref() == Some(account.as_str()) {
                                 store.calendar_sync_days()?
                             } else { crate::calendar_sync::Freshness::new() };

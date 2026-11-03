@@ -150,6 +150,38 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn invitations(&self, account: &str) -> Result<crate::invitations::Book> {
+        use sha2::{Digest, Sha256};
+        let key = format!("invitation-inbox-v1:{:x}", Sha256::digest(account.as_bytes()));
+        let raw: Option<String> = self.connection.query_row(
+            "SELECT payload FROM settings WHERE key=?1", [key], |row| row.get(0))
+            .optional().map_err(|_| "Read invitation queue failed")?;
+        let book = match raw {
+            Some(raw) if raw.len() <= crate::invitations::PAYLOAD_LIMIT =>
+                serde_json::from_str::<crate::invitations::Book>(&raw)
+                    .map_err(|_| "Saved invitation queue is invalid")?,
+            Some(_) => return Err("Saved invitation queue exceeds its safety limit".into()),
+            None => crate::invitations::Book::new(account),
+        };
+        book.validate()?;
+        if book.account != account { return Err("Saved invitation queue belongs to a different account".into()); }
+        Ok(book)
+    }
+
+    pub fn save_invitations(&self, book: &crate::invitations::Book) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        book.validate()?;
+        let raw = serde_json::to_string(book).map_err(|_| "Encode invitation queue failed")?;
+        if raw.len() > crate::invitations::PAYLOAD_LIMIT {
+            return Err("Invitation queue exceeds its safety limit; previous queue preserved".into());
+        }
+        let key = format!("invitation-inbox-v1:{:x}", Sha256::digest(book.account.as_bytes()));
+        self.connection.execute(
+            "INSERT INTO settings VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+            params![key, raw]).map_err(|_| "Save invitation queue failed")?;
+        Ok(())
+    }
+
     pub fn recaps(&self) -> Result<crate::recaps::Ledger> {
         let raw: Option<String> = self.connection.query_row(
             "SELECT payload FROM settings WHERE key='meeting-recaps-v1'", [], |row| row.get(0))

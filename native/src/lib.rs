@@ -25,6 +25,7 @@ pub mod followup;
 mod html_text;
 pub mod i18n;
 pub mod instance;
+pub mod invitations;
 pub mod markdown;
 pub mod myday;
 pub mod msx;

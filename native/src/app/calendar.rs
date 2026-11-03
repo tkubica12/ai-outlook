@@ -234,8 +234,9 @@ impl Tomlook {
     }
 
     pub(super) fn matches_event(&self, index: usize, query: &tomlook::calendar::SearchQuery) -> bool {
-        self.calendar.matches_query(index, query, &self.category)
+        self.invitation_context() || (self.calendar.matches_query(index, query, &self.category)
             && !(self.preferences.hide_unconfirmed && self.calendar.events[index].unconfirmed())
+        )
     }
 
     pub(super) fn choose_dates(&mut self, start: NaiveDate, end: NaiveDate) {
@@ -412,6 +413,7 @@ impl Tomlook {
                 }
             }
             ui.add_space(16.0);
+            ui.add_enabled_ui(!self.invitation_context(), |ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.query)
                     .id(Id::new("calendar-search"))
@@ -434,10 +436,16 @@ impl Tomlook {
             {
                 self.save_preferences();
             }
+            });
         });
     }
 
     pub(super) fn sidebar(&mut self, ui: &mut egui::Ui) {
+        self.invitation_navigation(ui);
+        if self.invitations.open {
+            self.invitation_sidebar(ui);
+            return;
+        }
         let language = self.preferences.language;
         ui.add_space(8.0);
         let mut month = self.mini_anchor.unwrap_or(self.anchor);
@@ -642,7 +650,8 @@ impl Tomlook {
             .map(|_| std::time::Instant::now());
         let event = &self.calendar.events[index];
         let ghost = event.unconfirmed();
-        let rect = if ghost {
+        let invitation = self.invitation_highlighted(&event.id);
+        let rect = if ghost && !invitation {
             egui::Rect::from_min_size(rect.min, Vec2::new(rect.width(), rect.height().min(38.0)))
         } else {
             rect
@@ -683,12 +692,14 @@ impl Tomlook {
                         rect,
                         egui::Button::new(language.text(""))
                             .min_size(rect.size())
-                            .fill(if ghost {
+                            .fill(if invitation {
+                                self.accent().gamma_multiply(if self.preferences.dark { 0.24 } else { 0.12 })
+                            } else if ghost {
                                 if self.preferences.dark { Color32::from_gray(31) } else { Color32::from_gray(247) }
                             } else {
                                 ui.visuals().widgets.inactive.weak_bg_fill
                             })
-                            .stroke(if ghost {
+                            .stroke(if ghost || invitation {
                                 Stroke::NONE
                             } else {
                                 ui.visuals().widgets.inactive.bg_stroke
@@ -747,7 +758,7 @@ impl Tomlook {
             }
         }
         if ui.is_rect_visible(rect) {
-            if ghost {
+            if ghost && !invitation {
                 let painter = ui.painter().with_clip_rect(rect.shrink(1.0));
                 let color = if self.preferences.dark { Color32::from_gray(39) } else { Color32::from_gray(237) };
                 let mut x = rect.left() - rect.height();
@@ -767,6 +778,16 @@ impl Tomlook {
             }
             let content = rect.shrink2(Vec2::new(7.0_f32.min(rect.width() * 0.15), 4.0));
             let mut y = content.top();
+            if invitation && content.height() >= 42.0 && content.width() >= 110.0 {
+                ui.painter().with_clip_rect(content).text(
+                    egui::pos2(content.left(), y),
+                    egui::Align2::LEFT_TOP,
+                    language.text("Selected invitation"),
+                    egui::FontId::proportional(10.0),
+                    self.accent(),
+                );
+                y += 14.0;
+            }
             let wide_row = !ghost && content.width() >= 85.0 && content.height() < 31.0;
             let mut x = content.left();
             let mut width = (content.width() - if notes_ready || prepared { 15.0 } else { 0.0 }).max(1.0);
@@ -792,7 +813,7 @@ impl Tomlook {
                 );
                 x += space;
                 width -= space;
-            } else if content.height() >= 31.0 || ghost && content.height() >= 28.0 {
+            } else if content.bottom() - y >= 31.0 || ghost && content.bottom() - y >= 28.0 {
                 let label = if ghost {
                     format!(
                         "{} · {}",
@@ -817,7 +838,7 @@ impl Tomlook {
                 );
                 y += 14.0;
             }
-            let rows = if ghost {
+            let rows = if ghost && !invitation {
                 1
             } else {
                 (((content.bottom() - y) / 14.0).floor() as usize).clamp(1, 6)
@@ -902,7 +923,9 @@ impl Tomlook {
                     );
                 }
             }
-            if !ghost {
+            if invitation {
+                ui.painter().rect_stroke(rect.shrink(1.5), 4, Stroke::new(3.0, self.accent()), egui::StrokeKind::Inside);
+            } else if !ghost {
                 ui.painter().line_segment(
                     [rect.left_top(), rect.left_bottom()],
                     Stroke::new(

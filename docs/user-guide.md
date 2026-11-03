@@ -6,6 +6,7 @@ safeguards are in [privacy-and-safety.md](privacy-and-safety.md).
 
 - [Window layout](#window-layout)
 - [Calendar](#calendar)
+- [Invitation queue](#invitation-queue)
 - [Meeting details and actions](#meeting-details-and-actions)
 - [Creating events and inviting people](#creating-events-and-inviting-people)
 - [Find a time, BLOCKERs and proposals](#find-a-time-blockers-and-proposals)
@@ -30,12 +31,21 @@ safeguards are in [privacy-and-safety.md](privacy-and-safety.md).
 - **Header:** period navigation, view selection, search, **New event**, and
   icons for **Ask**, **Commands**, **My day** (sunrise), **Tasks** (with the
   open-task count) and **Settings** (gear).
-- **Sidebar:** mini-calendar and category filters.
+- **Sidebar:** **Calendar** / **Invitations** navigation, then the mini-calendar
+  and category filters or the invitation queue.
 - **Detail pane:** the selected meeting, or the docked Ask panel.
 - **Status bar:** connections (GitHub Copilot, Foundry, WorkIQ, MSX, WebIQ,
-  GitHub), the Insights activity count, the recommendation bell, and small
-  **Setup x/5** and **Update X.Y.Z ready** indicators when relevant. Each entry
-  opens its dialog. The footer also shows the running Tomlook version.
+  GitHub) use short names and status marks: check = connected, progress mark =
+  working/checking, cross = disconnected/unavailable, circle = not
+  checked/configured. Ordinary states use the same muted color as other
+  status text; only disconnections and problems use a subdued red.
+  Icons have a fixed gap before their labels. Narrow windows abbreviate the names
+  further; hover reveals the full name, status and details, also available to
+  screen readers. All indicators remain keyboard accessible.
+  Calendar/sync and Insights counts use icons and numbers instead of sentences;
+  zero working/waiting/problem counts are hidden. The recommendation bell,
+  setup-progress and update indicators retain their dialogs and tooltips.
+  Everything stays on one compact line, including the running Tomlook version.
 
 Closing or minimizing hides Tomlook to the tray; background work continues.
 Restore it from the tray icon (**Open Tomlook**) or by starting Tomlook again.
@@ -52,7 +62,8 @@ Restore it from the tray icon (**Open Tomlook**) or by starting Tomlook again.
   08:00.
 - **Filters:** search (Ctrl+F) matches titles, people, locations and
   categories; category keys filter by category; **Hide unconfirmed** removes
-  unanswered invitations from all views and keyboard navigation.
+  unanswered invitations from ordinary views and keyboard navigation. Invitation
+  review temporarily ignores these filters so the request and its context remain visible.
 - **Card styles:** unanswered meetings are shown on a faint hatch without a
   category stripe; accepted ones have full cards with category colors. A
   lined-document icon means Insights are ready, a checked document means notes
@@ -60,6 +71,61 @@ Restore it from the tray icon (**Open Tomlook**) or by starting Tomlook again.
 - **Coverage:** days that were never synchronized show **Not synced** and are
   never treated as free. All-day events keep their calendar dates; timed
   events use your local time zone.
+
+## Invitation queue
+
+**Invitations** in the sidebar (also in Commands) shows unanswered invitations
+for the next six months, independently of the displayed calendar period.
+The badge counts **Important** items; **Other** keeps lower-priority requests
+available without filling the important queue, and **Snoozed** keeps local postponements.
+Opening or reading an item does not accept it.
+
+Click an invitation to open its day and the neighboring days, retain the queue,
+and show the normal meeting details. **Whole week** expands this context.
+Search, category and **Hide unconfirmed** filters are temporarily ignored;
+the chosen invitation has a strong accent outline and tinted background in
+the calendar, uses its full timeslot height, and shows **Selected invitation**
+when there is room. It stays marked while inspecting another meeting for
+conflicts; choosing another queue item moves the marker.
+Returning to **Calendar** restores the previous dates and selection without
+changing those saved filters. Use the existing Accept / Tentative / Decline
+dialog, including colored category choices, conflict review and explicit
+confirmation. A recurring series has one row for its next pending occurrence;
+responses concern **that occurrence only**, not the entire series.
+
+Priority is deterministic, without AI:
+
+- Confirmed customer-domain matches, highlighted organizers and organizers
+  in your selected close-team groups or manual people list are important.
+- Unknown external organizers or participants are lower-ranked important
+  signals, **not** proof of a customer or another tenant. Room/resource
+  attendees do not count as external-person signals.
+- Large broadcasts (over 50 attendees), your optional attendee role and
+  explicit broadcast wording normally go to Other. Confirmed customer context
+  or your explicit organizer highlight wins; "training" alone is not suppressed.
+- Right-click a queue item to snooze it, highlight/quiet its organizer, or
+  quiet that invitation/series. Quiet choices override automatic relevance;
+  restore them from the same menu or **My team** organizer settings.
+
+**My team** can discover directory-group candidates from recipient headers
+in historical received mail (up to 25 messages per search). Enter relevant
+group-name words, one search per line, then select the correct groups.
+Discovery alone never enables a new group. Enabled groups refresh their
+transitive user membership daily; mail and sign-in aliases are both recognized.
+Add individual people or exclusions; exclusions win over group membership.
+This changes only Tomlook's local priority, not directory membership.
+Unsupported groups, incomplete membership and read failures show an error and
+keep the last good cache. Some directory groups represent only a subgroup;
+their presence does not establish membership of an entire organization.
+
+The queue refreshes about every three minutes while WorkIQ is connected,
+without requiring an AI connection. Offline items and refresh errors are
+explicitly marked. Snoozing changes only Tomlook; material invitation changes
+cancel the snooze. Accepted, declined, followed, canceled and expired items
+leave the queue; verified responses in Tomlook remove them immediately.
+Filtered queue reads never mark calendar days synchronized or prove free time.
+**No conflicts** appears only with complete calendar coverage refreshed within
+15 minutes; otherwise conflict status is unknown.
 
 ## Meeting details and actions
 

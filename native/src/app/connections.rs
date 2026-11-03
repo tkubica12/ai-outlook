@@ -1,6 +1,141 @@
 use super::*;
 
 impl Tomlook {
+    pub(super) fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let language = self.preferences.language;
+        let compact = ui.available_width() < 1120.0;
+        ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
+        ui.spacing_mut().button_padding = Vec2::new(2.0, 2.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                version_label(ui, language);
+                if !self.preview {
+                    let completed = self.activity.index.len(ActivityFilter::Ready);
+                    let problems = self.activity.index.len(ActivityFilter::Problems);
+                    let working = self.activity.queue.flights.len();
+                    let waiting = self.activity.queued + self.activity.deferred;
+                    let has_messages = self.error.is_some() || self.activity.error.is_some() || self.activity.sync.error.is_some() || problems > 0
+                        || self.activity.event_creations.values().any(|record| self.calendar_owner.as_deref() == Some(record.account.as_str()))
+                        || self.activity.proposals.values().any(|proposal| proposal.in_flight() || proposal.needs_review())
+                        || self.activity.recommendations.values().any(|recommendation|
+                            recommendation.state == tomlook::recommendations::State::Review
+                                && self.calendar_owner.as_deref() == Some(recommendation.account.as_str()))
+                        || self.external_status.values().any(|status| !status.ready && !status.busy && !status.message.is_empty() && status.message != "Not connected");
+                    let now = Local::now().fixed_offset();
+                    let recommendations = self.activity.recommendation_view.iter().filter_map(|entry| self.activity.recommendations.get(&entry.id)).filter(|recommendation|
+                        recommendation.visible(&self.calendar, self.calendar_owner.as_deref(), now)).count()
+                        + self.activity.event_creations.values().filter(|record|
+                            record.state == tomlook::event_creation::State::Pending
+                                && self.calendar_owner.as_deref() == Some(record.account.as_str())).count();
+                    if (has_messages || recommendations > 0) && inbox_button(ui, language, has_messages, recommendations).clicked() {
+                        self.messages_open = true;
+                        if self.ai.is_some() { self.ai_command(ai::Command::RefreshCalendarAvailability); }
+                    }
+                    let summary = language.text(&format!("{completed} ready | {working} researching | {waiting} waiting | {problems} to review")).into_owned();
+                    for (id, icon, count, label, state) in [
+                        ("status-activity-problems", StatusIcon::Alert, problems, "Problems", ConnectionState::Offline),
+                        ("status-activity-waiting", StatusIcon::Clock, waiting, "Waiting", ConnectionState::Unknown),
+                        ("status-activity-working", StatusIcon::Search, working, "Researching", ConnectionState::Busy),
+                        ("status-activity", StatusIcon::Check, completed, "Ready", ConnectionState::Ready),
+                    ] {
+                        if count == 0 && label != "Ready" { continue; }
+                        let hint = format!("{}: {count}\n{summary}\n{}", language.text(label),
+                            language.text("Show meetings, queue and local context"));
+                        if status_item(ui, id, icon, &short_count(count), state, &hint).clicked() { self.settings = true; }
+                    }
+                }
+                if self.activity.sync.total > 0 {
+                    let sync = &self.activity.sync;
+                    let label = if !self.workiq_ready {
+                        format!("Sync {}/{} · offline", sync.fresh, sync.total)
+                    } else if sync.error.is_some() {
+                        format!("Sync {}/{} · retrying", sync.fresh, sync.total)
+                    } else { format!("Sync {}/{}", sync.fresh, sync.total) };
+                    let hint = format!("{}\n{}", language.text(&label), language.text(&format!(
+                        "One month back, six months ahead through {}.\n{}{}",
+                        sync.through.map(|day| day.to_string()).unwrap_or_default(),
+                        sync.updated.map(|time| format!("Last saved refresh: {}.", time.with_timezone(&Local).format("%H:%M"))).unwrap_or_else(|| "No synchronized days yet.".into()),
+                        sync.error.as_ref().map(|error| format!("\n{error}")).unwrap_or_default()
+                    )));
+                    let state = if sync.error.is_some() { ConnectionState::Offline }
+                        else if !self.workiq_ready { ConnectionState::Unknown }
+                        else if sync.fresh < sync.total { ConnectionState::Busy } else { ConnectionState::Ready };
+                    if status_item(ui, "status-sync", StatusIcon::Sync, &format!("{}/{}", sync.fresh, sync.total), state, &hint).clicked() {
+                        self.connection_panel = Some(ConnectionPanel::Workiq);
+                    }
+                }
+                let cache = language.text(&format!("{} cached meetings", self.calendar.events.len())).into_owned();
+                let owner = self.calendar_owner.as_deref().map(|owner| format!("Locally saved calendar owned by {owner}; retained when disconnected."))
+                    .unwrap_or_else(|| "Local calendar cache; no connected account assigned.".into());
+                if status_item(ui, "status-cache", StatusIcon::Calendar, &short_count(self.calendar.events.len()),
+                    ConnectionState::Unknown, &format!("{cache}\n{}", language.text(&owner))).clicked() {
+                    self.connection_panel = Some(ConnectionPanel::Workiq);
+                }
+                if self.loading { ui.add(egui::Spinner::new().size(14.0)); }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if self.preview {
+                        ui.label(RichText::new(language.text("Offline demo - fictional calendar")).small().weak());
+                        return;
+                    }
+                    let state = ConnectionState::of(self.ai_ready, self.ai_login_busy);
+                    let label = if self.ai_login_busy { "GitHub Copilot: signing in..." }
+                        else if self.ai_ready { "GitHub Copilot: connected" } else { "GitHub Copilot: disconnected" };
+                    if connection_status(ui, "status-ai", if compact { "AI" } else { "Copilot" }, state,
+                        &format!("{}\n{}", language.text(label), language.text(&self.connection))).clicked() {
+                        self.open_ai_connection();
+                    }
+                    use tomlook::decision::Phase;
+                    let state = match self.auto_status.phase {
+                        Phase::SignedIn => ConnectionState::Ready,
+                        Phase::Checking | Phase::SigningIn => ConnectionState::Busy,
+                        Phase::Unknown | Phase::Unconfigured => ConnectionState::Unknown,
+                        Phase::SignInRequired | Phase::Failed => ConnectionState::Offline,
+                    };
+                    if connection_status(ui, "status-auto", if compact { "Fdy" } else { "Foundry" }, state,
+                        &format!("{}\n{}", language.text(self.auto_status.label()), language.text(&self.auto_status.message))).clicked() {
+                        self.open_ai_connection();
+                    }
+                    let label = if self.hosted_workiq_busy { "WorkIQ: working..." }
+                        else if self.workiq_ready { "WorkIQ: connected" } else { "WorkIQ: disconnected" };
+                    if connection_status(ui, "status-workiq", if compact { "WIQ" } else { "WorkIQ" },
+                        ConnectionState::of(self.workiq_ready, self.hosted_workiq_busy),
+                        &format!("{}\n{}", language.text(label), language.text(&self.hosted_workiq_status))).clicked() {
+                        self.connection_panel = Some(ConnectionPanel::Workiq);
+                    }
+                    if self.preferences.msx_enabled
+                        && connection_status(ui, "status-msx", "MSX",
+                            ConnectionState::of(self.msx_status.phase == tomlook::msx::Phase::Connected, self.msx_status.busy()),
+                            &format!("{}\n{}", language.text(self.msx_status.label()), language.text(&self.msx_status.message))).clicked() {
+                        self.connection_panel = Some(ConnectionPanel::Msx);
+                    }
+                    for kind in [tomlook::connectors::Kind::Webiq, tomlook::connectors::Kind::Github] {
+                        let status = self.external_status.entry(kind).or_default();
+                        let label = if status.forgetting { "disconnecting..." } else if status.busy { "connecting..." }
+                            else if status.ready { "connected" } else { "disconnected" };
+                        let name = match (kind, compact) {
+                            (tomlook::connectors::Kind::Webiq, true) => "Web",
+                            (tomlook::connectors::Kind::Github, true) => "GH",
+                            _ => kind.label(),
+                        };
+                        if connection_status(ui, kind.server(), name,
+                            ConnectionState::of(status.ready, status.busy || status.forgetting),
+                            &format!("{}\n{}", language.text(&format!("{}: {label}", kind.label())), language.text(&status.message))).clicked() {
+                            self.connection_panel = Some(ConnectionPanel::External(kind));
+                        }
+                    }
+                    if let Some(staged) = &self.update_status.staged
+                        && status_item(ui, "status-update", StatusIcon::Update, if compact { "" } else { &staged.version },
+                            ConnectionState::Ready, &format!("{}\n{}", language.text(&format!("Update {} ready", staged.version)),
+                            language.text("A verified update is ready. Restart from Settings, or it is installed when you exit Tomlook."))).clicked() {
+                        self.preferences_open = true;
+                        self.preferences_section = PreferencesSection::Updates;
+                    }
+                    self.setup_indicator(ui);
+                });
+            });
+        });
+    }
+
     pub(super) fn visible_workiq_range(&self) -> Result<tomlook::workiq::connection::Range, String> {
         let days = self.visible_days();
         tomlook::workiq::connection::Range::new(
@@ -406,22 +541,125 @@ impl Tomlook {
 }
 
 pub(super) fn version_label(ui: &mut egui::Ui, language: tomlook::i18n::Language) {
-    ui.weak(concat!("v", env!("CARGO_PKG_VERSION")))
+    ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).size(11.0).weak())
         .on_hover_text(language.text("Current version"));
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConnectionState { Ready, Busy, Offline, Unknown }
+
+impl ConnectionState {
+    fn of(ready: bool, busy: bool) -> Self {
+        if busy { Self::Busy } else if ready { Self::Ready } else { Self::Offline }
+    }
+
+    fn color(self, ui: &egui::Ui) -> Color32 {
+        match self {
+            Self::Offline => if ui.visuals().dark_mode {
+                Color32::from_rgb(194, 137, 132)
+            } else {
+                Color32::from_rgb(153, 78, 73)
+            },
+            Self::Ready | Self::Busy | Self::Unknown => ui.visuals().weak_text_color(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum StatusIcon { Check, Cross, Busy, Unknown, Calendar, Sync, Search, Clock, Alert, Update, Setup }
+
+fn short_count(count: usize) -> String {
+    if count >= 1_000_000 { format!("{:.1}m", count as f64 / 1_000_000.0) }
+    else if count >= 10_000 { format!("{}k", count / 1_000) }
+    else { count.to_string() }
+}
+
+fn connection_status(ui: &mut egui::Ui, id: &str, name: &str, state: ConnectionState, hint: &str) -> egui::Response {
+    let icon = match state {
+        ConnectionState::Ready => StatusIcon::Check,
+        ConnectionState::Busy => StatusIcon::Busy,
+        ConnectionState::Offline => StatusIcon::Cross,
+        ConnectionState::Unknown => StatusIcon::Unknown,
+    };
+    status_item(ui, id, icon, name, state, hint)
+}
+
+pub(super) fn status_item(ui: &mut egui::Ui, id: &str, icon: StatusIcon, value: &str,
+    state: ConnectionState, hint: &str,
+) -> egui::Response {
+    const ICON_SIZE: f32 = 10.0;
+    const ICON_GAP: f32 = 6.0;
+    const PADDING: f32 = 2.0;
+    let color = state.color(ui);
+    let galley = ui.painter().layout_no_wrap(value.to_owned(), egui::FontId::proportional(11.0), color);
+    let width = PADDING * 2.0 + ICON_SIZE + if value.is_empty() { 0.0 } else { ICON_GAP + galley.size().x };
+    let response = status_button(ui, id, egui::Button::new("").min_size(Vec2::new(width.max(18.0), 24.0)));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), hint));
+    let rect = egui::Rect::from_center_size(
+        egui::pos2(response.rect.left() + PADDING + ICON_SIZE / 2.0, response.rect.center().y),
+        Vec2::splat(ICON_SIZE),
+    );
+    let painter = ui.painter();
+    if !value.is_empty() {
+        painter.galley(
+            egui::pos2(rect.right() + ICON_GAP, response.rect.center().y - galley.size().y / 2.0),
+            galley,
+            color,
+        );
+    }
+    let point = |x, y| rect.min + Vec2::new(x * rect.width(), y * rect.height());
+    let stroke = Stroke::new(1.3, color);
+    let line = |a, b| { painter.line_segment([a, b], stroke); };
+    match icon {
+        StatusIcon::Check => { line(point(0.1, 0.5), point(0.4, 0.8)); line(point(0.4, 0.8), point(0.9, 0.2)); }
+        StatusIcon::Cross => { line(point(0.2, 0.2), point(0.8, 0.8)); line(point(0.2, 0.8), point(0.8, 0.2)); }
+        StatusIcon::Unknown => { painter.circle_stroke(rect.center(), 3.5, stroke); }
+        StatusIcon::Busy | StatusIcon::Sync => {
+            let points = (0..=12).map(|step| {
+                let angle = (step as f32 / 12.0 * 1.5 + 0.1) * std::f32::consts::PI;
+                rect.center() + Vec2::new(angle.cos(), angle.sin()) * 4.0
+            }).collect();
+            painter.add(egui::Shape::line(points, stroke));
+            line(point(0.55, 0.0), point(0.8, 0.1));
+            line(point(0.8, 0.1), point(0.7, 0.4));
+        }
+        StatusIcon::Calendar | StatusIcon::Setup => {
+            painter.rect_stroke(rect.shrink(0.5), 1, stroke, egui::StrokeKind::Inside);
+            line(point(0.2, 0.3), point(0.8, 0.3));
+            line(point(0.2, 0.55), point(0.8, 0.55));
+            if matches!(icon, StatusIcon::Setup) { line(point(0.2, 0.8), point(0.6, 0.8)); }
+        }
+        StatusIcon::Search => { painter.circle_stroke(point(0.4, 0.4), 3.0, stroke); line(point(0.65, 0.65), point(1.0, 1.0)); }
+        StatusIcon::Clock => {
+            painter.circle_stroke(rect.center(), 4.5, stroke);
+            line(point(0.5, 0.2), point(0.5, 0.5)); line(point(0.5, 0.5), point(0.75, 0.65));
+        }
+        StatusIcon::Alert => {
+            painter.add(egui::Shape::closed_line(vec![point(0.5, 0.0), point(1.0, 0.95), point(0.0, 0.95)], stroke));
+            line(point(0.5, 0.3), point(0.5, 0.6)); painter.circle_filled(point(0.5, 0.8), 0.7, color);
+        }
+        StatusIcon::Update => {
+            line(point(0.5, 0.1), point(0.5, 0.75));
+            line(point(0.2, 0.4), point(0.5, 0.1)); line(point(0.5, 0.1), point(0.8, 0.4));
+            line(point(0.1, 0.9), point(0.9, 0.9));
+        }
+    }
+    response.on_hover_text(hint)
+}
+
+#[cfg(test)]
 pub(super) fn status_text(
     ui: &mut egui::Ui,
     identity: &str,
     label: impl Into<egui::WidgetText>,
 ) -> egui::Response {
+    status_button(ui, identity, egui::Button::new(label).min_size(Vec2::new(18.0, 24.0)))
+}
+
+fn status_button(ui: &mut egui::Ui, identity: &str, button: egui::Button<'_>) -> egui::Response {
     let response = ui
         .push_id(identity, |ui| {
-            ui.add(
-                egui::Button::new(label)
-                    .frame(false)
-                    .min_size(Vec2::new(0.0, 24.0)),
-            )
+            ui.add(button.frame(false))
         })
         .inner;
     if response.has_focus() {

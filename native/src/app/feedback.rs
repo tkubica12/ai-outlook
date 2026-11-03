@@ -644,6 +644,11 @@ impl Tomlook {
         self.demo_frames = self.demo_frames.saturating_add(1);
         match self.demo_scene {
             Scene::Details => true,
+            Scene::Invitations => {
+                let ready = self.demo_invitation_queue_ready();
+                if !ready { self.demo_frames = 0; }
+                ready && self.demo_frames > 8
+            }
             Scene::Feedback => {
                 self.insights_expanded = true;
                 let Some(payload) = self.briefing.take() else {

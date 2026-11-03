@@ -627,6 +627,7 @@ impl Tomlook {
         self.myday_window(context);
         self.weekly_window(context);
         self.customers_window(context);
+        self.invitation_settings(context);
         if self.messages_open {
             let calendar = self.calendar.clone();
             let mut open = true;

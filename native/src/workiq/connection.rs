@@ -18,6 +18,8 @@ use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
 #[path = "calendar_write.rs"]
 pub mod calendar_write;
+#[path = "invitations.rs"]
+pub mod invitations;
 #[path = "chat_write.rs"]
 pub mod chat_write;
 #[path = "cloud.rs"]
@@ -27,7 +29,7 @@ mod meeting_notes;
 
 pub const SDK_TOOL: &str = "tomlook_workiq_fetch";
 pub const CONTEXT_TOOL: &str = "tomlook_workiq_context";
-const EVENT_FIELDS: &str = "id,iCalUId,subject,start,end,categories,attendees,organizer,location,responseStatus,showAs,isAllDay,isOrganizer,webLink,isCancelled,type,sensitivity,isOnlineMeeting,onlineMeetingProvider,onlineMeeting,bodyPreview";
+const EVENT_FIELDS: &str = "id,iCalUId,subject,start,end,categories,attendees,organizer,location,responseStatus,showAs,isAllDay,isOrganizer,webLink,isCancelled,type,seriesMasterId,sensitivity,isOnlineMeeting,onlineMeetingProvider,onlineMeeting,bodyPreview";
 /// Graph previews are at most 255 characters; anything longer is cut defensively before caching.
 const PREVIEW_CHARS: usize = 1000;
 pub(crate) const CONTEXT_TIMEOUT: &str = "WorkIQ context read timed out";
@@ -39,6 +41,7 @@ struct ReadSlots {
     research: Semaphore,
     /// Interactive editor lookups (people search, availability) never wait behind research.
     lookup: Semaphore,
+    invitations: Semaphore,
 }
 
 impl ReadSlots {
@@ -47,6 +50,7 @@ impl ReadSlots {
             calendar: Semaphore::new(1),
             research: Semaphore::new(1),
             lookup: Semaphore::new(1),
+            invitations: Semaphore::new(1),
         }
     }
 
@@ -61,6 +65,7 @@ impl ReadSlots {
         self.calendar.close();
         self.research.close();
         self.lookup.close();
+        self.invitations.close();
     }
 }
 
@@ -631,6 +636,14 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Result<Value, String>>,
 {
+    calendar_with_filter(range, fetch, false).await
+}
+
+async fn calendar_with_filter<F, Fut>(range: Range, fetch: F, pending_only: bool) -> Result<Calendar, String>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
     let range = Range::new(range.first, range.last)?;
     let (start, end) = range.instants()?;
     let mut intervals = vec![(start, end)];
@@ -651,6 +664,10 @@ where
             .append_pair("endDateTime", &last.to_rfc3339())
             .append_pair("$top", "100")
             .append_pair("$select", EVENT_FIELDS);
+        if pending_only {
+            url.query_pairs_mut().append_pair("$filter",
+                "(responseStatus/response eq 'notResponded' or responseStatus/response eq 'none')");
+        }
         let resource = format!(
             "{}?{}",
             url.path(),
@@ -717,9 +734,11 @@ where
             }
         }
     }
-    let coverage = (0..=(range.last - range.first).num_days())
-        .map(|day| range.first + Duration::days(day))
-        .collect();
+    // A filtered invitation read proves nothing about free time or calendar coverage.
+    let coverage = if pending_only { BTreeSet::new() } else {
+        (0..=(range.last - range.first).num_days())
+            .map(|day| range.first + Duration::days(day)).collect()
+    };
     Calendar::build(events.into_values().collect(), coverage, Vec::new())
 }
 
@@ -927,8 +946,10 @@ fn graph_time(value: GraphTime) -> Result<DateTime<FixedOffset>, String> {
 fn parse_event(value: Value) -> Result<Event, String> {
     let creation_metadata = [
         "sensitivity", "isOnlineMeeting", "onlineMeetingProvider", "onlineMeeting",
-        "transactionId", "body", "iCalUId",
-    ].into_iter().filter_map(|key| value.get(key).map(|value| (key.to_owned(), value.clone())))
+        "transactionId", "body", "iCalUId", "seriesMasterId",
+    ].into_iter().filter_map(|key| value.get(key)
+        .filter(|value| key != "seriesMasterId" || value.as_str().is_some_and(|id| !id.is_empty()))
+        .map(|value| (key.to_owned(), value.clone())))
         .collect::<BTreeMap<_, _>>();
     // Plain-text invitation preview for the local agenda check only; "" means no description.
     // A missing or non-text preview stays absent, so the agenda is reported as not checked.

@@ -13,7 +13,7 @@ file permissions; only the files marked DPAPI are additionally encrypted.
 
 | File or folder | Contents |
 |---|---|
-| `tomlook.db` | Calendar cache (bounded meeting metadata and the 255-character invitation preview), per-day sync state, Insights and notes with their sources, the preparation queue, recommendations, approvals and write outcomes, scheduling proposals, tasks, follow-up drafts, feedback, customers and cached MSX reads, weekly summaries, preferences and edited prompts |
+| `tomlook.db` | Calendar cache (bounded meeting metadata and the 255-character invitation preview), per-day sync state, invitation queue and local priority/team caches, Insights and notes with their sources, the preparation queue, recommendations, approvals and write outcomes, scheduling proposals, tasks, follow-up drafts, feedback, customers and cached MSX reads, weekly summaries, preferences and edited prompts |
 | `ask-research.db` | Checkpoints of interrupted Thorough research (findings and short source excerpts) |
 | `source-index.db` | Full-text index of the first 16,000 bytes of documents in folders you added |
 | `ai-usage.db` | Daily AI request counts and token usage |
@@ -53,7 +53,7 @@ previous executable is kept as `Tomlook.exe.old` until the next start.
 
 | Service | Endpoint | When |
 |---|---|---|
-| WorkIQ (Microsoft 365) | `workiq.svc.cloud.microsoft/mcp`, sign-in at `login.microsoftonline.com` | After sign-in: calendar sync, research reads, transcripts, free/busy, directory lookups, photos, and approved writes. Microsoft Graph operations are made through WorkIQ's tools. |
+| WorkIQ (Microsoft 365) | `workiq.svc.cloud.microsoft/mcp`, sign-in at `login.microsoftonline.com` | After sign-in: calendar and unanswered-invitation sync, selected team-group membership refresh, research reads, transcripts, free/busy, directory lookups, photos, and approved writes. Explicit team discovery reads bounded historical-mail recipient headers. Microsoft Graph operations are made through WorkIQ's tools. |
 | GitHub Copilot | Through the installed Copilot CLI runtime | AI requests and Copilot sign-in |
 | WebIQ | `api.microsoft.ai/v3/mcp` | Key verification and public web searches by the model |
 | GitHub connector | `api.githubcopilot.com/mcp/` (read-only), `github.com/login/device`, `github.com/login/oauth/access_token`, `api.github.com/user` | Sign-in, token renewal and repository reads |
@@ -68,6 +68,22 @@ Teams or mail app, not by Tomlook. The offline demo contacts no service.
 AI requests to Copilot contain the question or task, bounded meeting metadata
 and whatever the read tools returned (mail, Teams, document excerpts, MSX
 rows). Invitation previews are not sent to the AI.
+
+### Invitation priorities
+
+The invitation queue, snoozes, organizer/series rules, manual team people and
+exclusions, group IDs/names/mail addresses, transitive member mail/sign-in aliases,
+refresh timestamps and errors are stored only in this profile, separately per
+calendar account. They are not encrypted beyond the profile's file permissions.
+They are not sent to AI or used to infer unconfirmed MSX/customer associations.
+
+Historical-mail discovery is explicit and samples recipient names/addresses,
+not mail bodies, at up to 25 messages per search. It returns disabled group
+candidates; selecting a group enables read-only membership refresh. Incomplete
+or failed reads retain previous membership and expose an error. This never
+changes directory membership. Reading or snoozing an invitation, changing its
+priority or opening its calendar context sends no RSVP or message. Responding
+uses the same existing occurrence-only confirmation and verified write path.
 
 ## AI boundaries
 

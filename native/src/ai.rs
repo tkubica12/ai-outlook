@@ -65,6 +65,11 @@ struct Sources {
 }
 
 pub enum Command {
+    ReadInvitations {
+        id: u64,
+        account: String,
+        request: crate::invitations::ReadKind,
+    },
     Prompts(Box<crate::prompts::Prompts>),
     Recap(Box<crate::recaps::Request>),
     RefreshCalendarAvailability,
@@ -557,6 +562,12 @@ impl Notices {
 }
 
 enum Completion {
+    Invitations {
+        id: u64,
+        account: String,
+        generation: u64,
+        result: Result<crate::invitations::ReadResult, String>,
+    },
     Auto {
         generation: u64,
         status: crate::decision::Status,
@@ -1640,6 +1651,18 @@ impl Engine {
                                         notify(Notice::HostedWorkiq { busy: false, ready: false, message: "Sign in to WorkIQ before refreshing the calendar.".into() });
                                     }
                                 }
+                                Some(Command::ReadInvitations { id, account, request }) => {
+                                    let connection = workiq.as_ref().filter(|connection|
+                                        !demo && !stopping && connection.is_active() && connection.account == account).cloned();
+                                    let generation = workiq_generation;
+                                    tasks.spawn(async move {
+                                        let result = match connection {
+                                            Some(connection) => connection.read_invitations(request).await,
+                                            None => Err("Connect the invitation queue's WorkIQ account before refreshing".into()),
+                                        };
+                                        Completion::Invitations { id, account, generation, result }
+                                    });
+                                }
                                 Some(Command::SyncWorkiq { id, range }) => {
                                     if !demo && workiq.as_ref().is_some_and(|connection| connection.is_active()) {
                                         background_refresh = Some((id, range));
@@ -1977,6 +2000,16 @@ impl Engine {
                                     }
                                 }
                                 Some(Ok(Completion::MsxClosed)) => {}
+                                Some(Ok(Completion::Invitations { id, account, generation, result })) => {
+                                    let result = if generation == workiq_generation && !stopping {
+                                        result
+                                    } else { Err("WorkIQ connection changed during invitation read; cache preserved".into()) };
+                                    let delivered = wake.as_ref().ok_or("Invitation storage is unavailable")
+                                        .and_then(|sender| sender.try_send(crate::worker::Command::InvitationResult {
+                                            id, account, result,
+                                        }).map_err(|_| "Invitation refresh could not reach storage; cache preserved"));
+                                    if let Err(error) = delivered { notify(Notice::Diagnostic(error.into())); }
+                                }
                                 Some(Ok(Completion::CalendarDelivered { admitted, result })) => {
                                     if admitted { calendar_mutating = false; }
                                     if let Err(error) = result {

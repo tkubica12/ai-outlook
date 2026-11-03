@@ -1,3 +1,296 @@
+fn invitation_fixture(language: tomlook::i18n::Language) -> (
+    Tomlook, mpsc::Receiver<Command>, tokio::sync::mpsc::Receiver<ai::Command>, tomlook::invitations::Row,
+) {
+    let (mut app, _, ai) = assistant_fixture();
+    let (sender, receiver) = mpsc::sync_channel(16);
+    app.worker = Some(Worker { commands: sender, notices: Arc::new(Default::default()),
+        activity: Arc::new(Mutex::new(Arc::new(Default::default()))),
+        stop: Arc::new(Default::default()), done: None });
+    app.preferences.language = language;
+    app.preferences.hide_unconfirmed = true;
+    app.query = "unrelated search".into();
+    app.category = "Office".into();
+    app.calendar_owner = Some("owner@internal.example".into());
+    app.workiq_ready = true;
+    let mut event = tomlook::calendar::fixture(1).remove(0);
+    event.title = "Invitation fixture".into();
+    event.start = (chrono::Utc::now() + chrono::Duration::days(3)).fixed_offset();
+    event.end = event.start + chrono::Duration::hours(1);
+    event.status = "notResponded".into();
+    event.is_all_day = false;
+    event.organizer = "Organizer <organizer@customer.example>".into();
+    event.category.clear();
+    event.location = "Microsoft Teams Meeting".into();
+    event.extra = BTreeMap::from([
+        ("isOrganizer".into(), serde_json::json!(false)), ("type".into(), serde_json::json!("singleInstance")),
+        ("categories".into(), serde_json::json!([])),
+    ]);
+    let mut book = tomlook::invitations::Book::new("owner@internal.example");
+    book.discovery_queries = vec!["Region STU".into(), "Region ATU".into()];
+    book.replace(vec![event], chrono::Utc::now()).unwrap();
+    let snapshot = tomlook::invitations::snapshot(Arc::new(book), &app.calendar, &Default::default(), None,
+        &Default::default(), Default::default(), Default::default(), chrono::Utc::now());
+    let row = snapshot.rows[0].clone();
+    Arc::make_mut(&mut app.activity).invitations = Arc::new(snapshot);
+    (app, receiver, ai, row)
+}
+
+#[test]
+fn invitation_queue_focuses_uncached_requests_despite_filters_and_reuses_the_existing_category_approval() {
+    use tomlook::recommendations::{Change, MeetingResponse};
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, mut ai, row) = invitation_fixture(language);
+        let anchor = app.anchor;
+        let context = egui::Context::default();
+        let sidebar: Show = &|app, ui| { ui.set_width(300.0); app.sidebar(ui); };
+        settled(&context, &mut app, sidebar);
+        click_text(&context, &mut app, sidebar, &format!("{}  1", language.text("Invitations")));
+        assert!(app.invitations.open);
+        assert!(receiver.try_recv().is_err(), "Opening the queue does not run research or resolve requests");
+        click_text(&context, &mut app, sidebar, &row.event.title);
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Invitation(tomlook::invitations::Command::Open { key, .. }) if key == row.key));
+        assert!(app.selected.is_none(), "An uncached invitation is staged on the storage worker first");
+        assert_eq!(app.visible_days().len(), 3);
+        let mut catalog = row.event.clone();
+        catalog.id = "category-catalog".into();
+        catalog.status = "accepted".into();
+        catalog.extra.insert("categories".into(), serde_json::json!(["Call", "Office"]));
+        app.calendar = Arc::new(Calendar::build(vec![row.event.clone(), catalog], Default::default(), vec![]).unwrap());
+        app.receive_invitation_focus();
+        let index = app.calendar.event_index(&row.event.id).unwrap();
+        assert_eq!(app.selected, Some(index));
+        assert!(matches!(receiver.try_recv().unwrap(), Command::Detail { .. }));
+        let query = tomlook::calendar::SearchQuery::new(&app.query);
+        assert!(app.matches_event(index, &query), "Hidden-unconfirmed, search and category filters cannot hide review context");
+        let context_bar: Show = &|app, ui| app.invitation_context_bar(ui);
+        click_text(&context, &mut app, context_bar, language.text("Whole week").as_ref());
+        assert_eq!(app.visible_days().len(), 7);
+        click_text(&context, &mut app, context_bar, language.text("Day + neighbors").as_ref());
+        assert_eq!(app.visible_days().len(), 3);
+        app.choose_meeting_action(row.event.clone(), Change::Respond { response: MeetingResponse::Accept,
+            comment: String::new(), send_response: false, category: None });
+        assert!(matches!(&app.meeting_action.as_ref().unwrap().change,
+            Change::Respond { category: Some(category), .. } if category.eq_ignore_ascii_case("call")));
+        assert!(receiver.try_recv().is_err(), "Opening the normal acceptance/category preview is not confirmation");
+        app.meeting_action = None;
+        click_text(&context, &mut app, sidebar, language.text("Calendar").as_ref());
+        assert!(!app.invitations.open);
+        assert_eq!(app.anchor, anchor);
+        assert!(app.date_selection.is_none());
+        assert_eq!(app.query, "unrelated search");
+        assert_eq!(app.category, "Office");
+        assert!(app.preferences.hide_unconfirmed);
+        assert!(!app.matches_event(index, &query));
+        assert!(ai.try_recv().is_err(), "Invitation triage never requires an AI request");
+    }
+}
+
+#[test]
+fn queued_invitation_is_emphasized_at_full_height_and_stays_pinned_while_reviewing_conflicts() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        for dark in [false, true] {
+            let (mut app, receiver, mut ai, row) = invitation_fixture(language);
+            app.preferences.dark = dark;
+            app.loading = false;
+            let mut other = row.event.clone();
+            other.id = "competing-invitation".into();
+            other.title = "Competing fixture".into();
+            app.calendar = Arc::new(Calendar::build(vec![row.event.clone(), other.clone()], Default::default(), vec![]).unwrap());
+            let original = app.calendar.event_index(&row.event.id).unwrap();
+            let competing = app.calendar.event_index(&other.id).unwrap();
+            app.open_invitation(&row);
+            app.receive_invitation_focus();
+            assert!(app.invitation_highlighted(&row.event.id));
+            assert!(!app.invitation_highlighted(&other.id));
+            app.select(competing);
+            assert!(app.invitation_highlighted(&row.event.id), "Reviewing a conflict must not lose the queued invitation's marker");
+            let context = egui::Context::default();
+            app.style(&context);
+            for height in [23.0, 38.0, 100.0, 180.0] {
+                let rect = egui::Rect::from_min_size(egui::pos2(40.0, 40.0), Vec2::new(300.0, height));
+                let other_rect = rect.translate(Vec2::new(320.0, 0.0));
+                let mut output = context.run_ui(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 640.0))),
+                    ..Default::default()
+                }, |ui| {
+                    app.event_card(ui, original, rect);
+                    app.event_card(ui, competing, other_rect);
+                });
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Rect(shape) if shape.rect == rect.shrink(1.5)
+                        && shape.stroke == Stroke::new(3.0, app.accent()))), "The complete invitation timeslot must have the strong outline");
+                assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Rect(shape) if shape.rect.intersects(other_rect) && shape.stroke.width == 3.0)));
+                let text = output_text(&output);
+                assert!(text.contains(if height >= 100.0 { &row.event.title } else { "Invitation" }));
+                assert_eq!(text.contains(language.text("Selected invitation").as_ref()), height >= 100.0);
+                output.textures_delta.clear();
+            }
+            let mut book = (*app.activity.invitations.book).clone();
+            book.replace(vec![row.event.clone(), other.clone()], chrono::Utc::now()).unwrap();
+            let snapshot = tomlook::invitations::snapshot(Arc::new(book), &app.calendar, &Default::default(), None,
+                &Default::default(), Default::default(), Default::default(), chrono::Utc::now());
+            let second = snapshot.rows.iter().find(|row| row.event.id == other.id).unwrap().clone();
+            Arc::make_mut(&mut app.activity).invitations = Arc::new(snapshot);
+            app.open_invitation(&second);
+            assert!(!app.invitation_highlighted(&row.event.id));
+            assert!(app.invitation_highlighted(&other.id));
+            Arc::make_mut(&mut Arc::make_mut(&mut app.activity).invitations).rows.clear();
+            assert!(!app.invitation_highlighted(&other.id), "Resolved or removed requests cannot keep a stale highlight");
+            app.invitations.open = false;
+            assert!(!app.invitation_highlighted(&row.event.id));
+            assert_eq!(app.calendar.events[original].status, "notResponded");
+            assert!(receiver.try_iter().all(|command| matches!(command, Command::Invitation(_) | Command::Detail { .. })));
+            assert!(ai.try_recv().is_err(), "Emphasis cannot accept an invitation or trigger research");
+        }
+    }
+}
+
+#[test]
+#[ignore = "Creates a new synthetic profile for native visual checks; set TOMLOOK_UI_PREVIEW_STATE"]
+fn export_invitation_and_status_visual_profile() {
+    let root = std::path::PathBuf::from(std::env::var_os("TOMLOOK_UI_PREVIEW_STATE").expect("Set TOMLOOK_UI_PREVIEW_STATE"));
+    assert!(root.is_absolute() && !root.exists()
+        && root.file_name().unwrap().to_str().unwrap().starts_with("tomlook-ui-preview-"),
+        "Only a new, explicitly named preview profile may be written");
+    let (mut app, _, _, row) = invitation_fixture(tomlook::i18n::Language::Cs);
+    let day = (Local::now() + chrono::Duration::days(3)).date_naive();
+    let at = |hour, minute| day.and_hms_opt(hour, minute, 0).unwrap()
+        .and_local_timezone(Local).single().unwrap().fixed_offset();
+    let mut request = row.event;
+    request.title = "Northstar / Architecture review".into();
+    request.start = at(11, 0);
+    request.end = at(12, 0);
+    let mut events = vec![request.clone()];
+    for (id, title, start, end) in [
+        ("morning", "Internal planning", at(9, 0), at(10, 0)),
+        ("conflict", "Project check-in", at(10, 30), at(11, 30)),
+        ("afternoon", "Implementation workshop", at(13, 0), at(14, 0)),
+    ] {
+        let mut event = request.clone();
+        event.id = id.into(); event.title = title.into(); event.start = start; event.end = end;
+        event.status = "accepted".into();
+        events.push(event);
+    }
+    let coverage = (0..7).map(|offset| day + chrono::Duration::days(offset)).collect();
+    let calendar = Calendar::build(events, coverage, vec![]).unwrap();
+    let account = "owner@internal.example";
+    let mut book = tomlook::invitations::Book::new(account);
+    book.replace(vec![request], chrono::Utc::now()).unwrap();
+    let mut store = tomlook::storage::Store::open(&root).unwrap();
+    store.save_workiq_calendar(&calendar, account).unwrap();
+    store.save_workiq_identity(&tomlook::workiq::connection::Identity {
+        account: account.into(), mail: None, display_name: Some("Visual fixture".into()),
+    }).unwrap();
+    store.save_invitations(&book).unwrap();
+    app.preferences.paused = true;
+    app.preferences.prepare_enabled = false;
+    app.preferences.msx_enabled = false;
+    app.preferences.welcome_shown = true;
+    store.save_preferences(&app.preferences).unwrap();
+}
+
+#[test]
+fn invitation_team_settings_send_only_explicit_account_bound_reads_and_disable_after_account_changes() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, receiver, mut ai, _) = invitation_fixture(language);
+        let context = egui::Context::default();
+        app.open_invitations();
+        let sidebar: Show = &|app, ui| { ui.set_width(300.0); app.sidebar(ui); };
+        settled(&context, &mut app, sidebar);
+        click_text(&context, &mut app, sidebar, language.text("My team").as_ref());
+        let settings: Show = &|app, ui| app.invitation_settings(ui.ctx());
+        let text = settled(&context, &mut app, settings);
+        assert!(text.contains(language.text("Team groups").as_ref()), "{text}");
+        assert!(receiver.try_recv().is_err());
+        click_text(&context, &mut app, settings, language.text("Find groups in historical mail").as_ref());
+        let Command::Invitation(tomlook::invitations::Command::Discover { account, queries }) = receiver.try_recv().unwrap()
+            else { panic!("Only an explicit historical-mail discovery may be dispatched"); };
+        assert_eq!(account, "owner@internal.example");
+        assert_eq!(queries, ["Region STU", "Region ATU"]);
+        let snapshot = Arc::make_mut(&mut app.activity).invitations.clone();
+        let mut next = (*snapshot).clone();
+        next.book = Arc::new(tomlook::invitations::Book::new("other@internal.example"));
+        Arc::make_mut(&mut app.activity).invitations = Arc::new(next);
+        let text = settled(&context, &mut app, settings);
+        assert!(text.contains(language.text("Calendar account changed. Close and reopen these settings.").as_ref()));
+        assert!(!text.contains(language.text("Find groups in historical mail").as_ref()));
+        assert!(receiver.try_recv().is_err());
+        assert!(ai.try_recv().is_err());
+    }
+}
+
+#[test]
+fn invitation_queue_paints_only_a_bounded_page_even_with_hundreds_of_pending_requests() {
+    let (mut app, _, _, row) = invitation_fixture(tomlook::i18n::Language::En);
+    let events = (0..100).map(|index| {
+        let mut event = row.event.clone();
+        event.id = format!("request-{index:03}");
+        event.title = format!("Request {index:03}");
+        event.start += chrono::Duration::minutes(index);
+        event.end += chrono::Duration::minutes(index);
+        event
+    }).collect();
+    let mut book = tomlook::invitations::Book::new("owner@internal.example");
+    book.replace(events, chrono::Utc::now()).unwrap();
+    Arc::make_mut(&mut app.activity).invitations = Arc::new(tomlook::invitations::snapshot(
+        Arc::new(book), &Default::default(), &Default::default(), None, &Default::default(),
+        Default::default(), Default::default(), chrono::Utc::now()));
+    app.open_invitations();
+    let context = egui::Context::default();
+    app.style(&context);
+    let sidebar: Show = &|app, ui| { ui.set_width(300.0); app.sidebar(ui); };
+    let text = settled(&context, &mut app, sidebar);
+    assert!(text.contains("Request 000") && !text.contains("Request 040"), "{text}");
+    click_text(&context, &mut app, sidebar, ">");
+    let text = settled(&context, &mut app, sidebar);
+    assert!(text.contains("Request 040") && !text.contains("Request 000"), "{text}");
+}
+
+#[test]
+fn invitation_cards_wrap_long_titles_dates_and_organizers_within_the_real_sidebar_width() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, _, _, row) = invitation_fixture(language);
+        let mut event = row.event;
+        event.title = "An important customer discussion with a longer invitation title and several planning topics".into();
+        event.organizer = "An organizer with a longer display name <long.organizer.address@customer.example>".into();
+        let expected = [event.title.clone(), event.organizer.clone(), meeting_date_label(&event, language)];
+        let mut book = tomlook::invitations::Book::new("owner@internal.example");
+        book.replace(vec![event], chrono::Utc::now()).unwrap();
+        Arc::make_mut(&mut app.activity).invitations = Arc::new(tomlook::invitations::snapshot(
+            Arc::new(book), &Default::default(), &Default::default(), None, &Default::default(),
+            Default::default(), Default::default(), chrono::Utc::now()));
+        app.open_invitations();
+        let context = egui::Context::default();
+        let mut output = None;
+        let mut right = 0.0;
+        app.style(&context);
+        for _ in 0..3 {
+            let mut frame = context.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1200.0, 900.0))),
+                ..Default::default()
+            }, |ui| {
+                egui::Panel::left("invitation-layout-test").exact_size(300.0).show(ui, |ui| {
+                    right = ui.max_rect().right();
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| app.sidebar(ui));
+                });
+            });
+            frame.textures_delta.clear();
+            output = Some(frame);
+        }
+        let mut found = 0;
+        for shape in output.unwrap().shapes {
+            if let egui::epaint::Shape::Text(text) = shape.shape
+                && expected.contains(&text.galley.job.text) {
+                found += 1;
+                assert!(text.pos.x + text.galley.size().x <= right,
+                    "{language:?}: invitation text extends beyond the sidebar: {}", text.galley.job.text);
+            }
+        }
+        assert_eq!(found, 3, "All invitation card fields must actually be rendered");
+    }
+}
+
 #[test]
 fn settings_content_has_clear_padding_from_navigation_in_both_sections_and_themes() {
     for dark in [true, false] {
@@ -707,6 +1000,7 @@ fn event_editor_selects_personal_privacy_and_submits_one_exact_explicit_creation
 use super::*;
 use super::ask_panel::ASSISTANT_CONTEXT_LIMIT;
 use super::calendar::{MIN_EVENT_LANE_WIDTH, timeline_content_width};
+use super::connections::{status_text, version_label};
 use super::palette::{PaletteCommand, command_matches, command_matches_in};
 use super::recommendations::messages_button;
 use super::settings::{ACTIVITY_ROW_HEIGHT, activity_row};
@@ -2083,6 +2377,282 @@ fn status_text_has_no_idle_box_and_keeps_keyboard_activation_across_languages() 
     );
     output.textures_delta.clear();
     assert!(clicked);
+}
+
+fn status_bar_fixture() -> (Tomlook, tokio::sync::mpsc::Receiver<ai::Command>) {
+    let (mut app, _, commands) = assistant_fixture();
+    app.loading = false;
+    app.ai_ready = false;
+    app.workiq_ready = true;
+    app.preferences.msx_enabled = true;
+    app.auto_status = tomlook::decision::Status::new(tomlook::decision::Phase::Unknown, "Foundry fixture");
+    app.setup.eligible = true;
+    app.setup.probe = Some(setup_probe(true, true));
+    app.external_status.insert(tomlook::connectors::Kind::Webiq, ExternalStatus {
+        busy: true, message: "WebIQ fixture".into(), ..Default::default()
+    });
+    app.external_status.insert(tomlook::connectors::Kind::Github, ExternalStatus {
+        ready: true, message: "GitHub fixture".into(), ..Default::default()
+    });
+    app.update_status.staged = Some(tomlook::updater::Staged {
+        version: "9.9.9".into(),
+        notes_url: tomlook::updater::release_page("v9.9.9"),
+        directory: "C:\\fixture\\staging".into(),
+        target: "C:\\fixture\\Tomlook.exe".into(),
+        executable_sha256: "0".repeat(64),
+    });
+    let mut activity = (*app.activity).clone();
+    for (id, state) in [
+        ("ready-a", tomlook::scheduler::State::Completed),
+        ("ready-b", tomlook::scheduler::State::Completed),
+        ("problem", tomlook::scheduler::State::Failed),
+    ] {
+        activity.queue.jobs.insert(id.into(), activity_fixture_job(id, state));
+    }
+    activity.index = Arc::new(tomlook::worker::ActivityIndex::new(&activity.queue));
+    for id in 0..3 {
+        activity.queue.flights.insert(id, tomlook::scheduler::Flight {
+            event_id: format!("working-{id}"), fingerprint: "0".repeat(64),
+            foreground: false, translation_only: false,
+        });
+    }
+    activity.queued = 24_999;
+    activity.deferred = 1;
+    activity.sync = tomlook::calendar_sync::Progress {
+        fresh: 157, total: 213, through: Some(app.anchor), updated: Some(chrono::Utc::now()),
+        error: Some("Sync fixture diagnostic".into()), ..Default::default()
+    };
+    app.activity = Arc::new(activity);
+    (app, commands)
+}
+
+fn draw_status_bar(
+    context: &egui::Context, app: &mut Tomlook, width: f32, events: Vec<egui::Event>,
+) -> (egui::FullOutput, egui::Rect) {
+    let mut rect = egui::Rect::NOTHING;
+    let mut output = context.run_ui(egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 640.0))),
+        events, ..Default::default()
+    }, |ui| {
+        rect = egui::Panel::bottom("status").show(ui, |ui| app.status_bar(ui)).response.rect;
+    });
+    output.textures_delta.clear();
+    (output, rect)
+}
+
+fn status_control(output: &egui::FullOutput, label: &str) -> egui::Rect {
+    let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+    let bounds = tree.nodes.iter().find_map(|(_, node)| {
+        (node.role() == egui::accesskit::Role::Button
+            && node.label().is_some_and(|text| text.starts_with(label)))
+            .then(|| node.bounds()).flatten()
+    }).unwrap_or_else(|| panic!("Missing accessible status control: {label}"));
+    egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32), egui::pos2(bounds.x1 as f32, bounds.y1 as f32))
+}
+
+fn click_status_control(context: &egui::Context, app: &mut Tomlook, label: &str) {
+    for _ in 0..2 { draw_status_bar(context, app, 960.0, vec![]); }
+    let (output, _) = draw_status_bar(context, app, 960.0, vec![]);
+    let pos = status_control(&output, label).center();
+    for pressed in [true, false] {
+        draw_status_bar(context, app, 960.0, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+        }]);
+    }
+}
+
+#[test]
+fn status_bar_is_one_unclipped_nonoverlapping_line_at_supported_widths_and_themes() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        for dark in [false, true] {
+            for width in [960.0, 1024.0, 1119.0, 1120.0, 1366.0, 1920.0] {
+                let (mut app, mut commands) = status_bar_fixture();
+                app.preferences.language = language;
+                app.preferences.dark = dark;
+                let context = egui::Context::default();
+                context.enable_accesskit();
+                app.style(&context);
+                for _ in 0..3 { draw_status_bar(&context, &mut app, width, vec![]); }
+                let (output, panel) = draw_status_bar(&context, &mut app, width, vec![]);
+                assert!(panel.height() <= 38.0, "{language:?}, dark={dark}, width={width}: {panel:?}");
+                let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                let mut controls = tree.nodes.iter().filter_map(|(_, node)| {
+                    if node.role() != egui::accesskit::Role::Button { return None; }
+                    let label = node.label().unwrap();
+                    Some((label, status_control(&output, label)))
+                }).collect::<Vec<_>>();
+                assert_eq!(controls.len(), 15, "All six services, cache, sync, four activity counts, bell, update and setup must fit");
+                controls.sort_by(|a, b| a.1.left().total_cmp(&b.1.left()));
+                for (label, rect) in &controls {
+                    assert!(panel.expand(0.5).contains_rect(*rect), "{label}: {rect:?} outside {panel:?}");
+                    assert!(rect.width() >= 18.0 && rect.height() >= 24.0, "Control cannot shrink away: {label}: {rect:?}");
+                }
+                for pair in controls.windows(2) {
+                    assert!(pair[0].1.right() <= pair[1].1.left() + 0.5, "Overlapping controls at width {width}: {pair:?}");
+                }
+                for clipped in &output.shapes {
+                    if let egui::Shape::Text(text) = &clipped.shape {
+                        let rect = text.galley.rect.translate(text.pos.to_vec2());
+                        assert!(clipped.clip_rect.expand(0.5).contains_rect(rect), "Clipped text at width {width}: {}: {rect:?}, clip={:?}, panel={panel:?}", text.galley.text(), clipped.clip_rect);
+                        assert!(panel.expand(0.5).contains_rect(rect), "Text outside footer: {}", text.galley.text());
+                    }
+                }
+                let text = output_text(&output);
+                for label in ["2\n", "3\n", "25k\n", "1\n", "157/213\n", concat!("v", env!("CARGO_PKG_VERSION"))] {
+                    assert!(text.contains(label), "Missing {label:?}: {text}");
+                }
+                if width == 960.0 { assert!(text.contains("WIQ\n")); }
+                if width >= 1366.0 { assert!(text.contains("WorkIQ\n")); }
+                for label in ["GitHub Copilot: disconnected", "Foundry: not checked", "WorkIQ: connected",
+                    "WebIQ: connecting...", "GitHub: connected", "Sync 157/213 · retrying"] {
+                    status_control(&output, language.text(label).as_ref());
+                }
+                status_control(&output, &format!("{}: 25000", language.text("Waiting")));
+                assert!(commands.try_recv().is_err(), "Rendering must not issue AI/network commands");
+            }
+        }
+    }
+}
+
+#[test]
+fn status_bar_click_targets_and_zero_count_visibility_are_preserved() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, mut commands) = status_bar_fixture();
+        app.preferences.language = language;
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        app.style(&context);
+        for (label, target) in [
+            ("GitHub Copilot: disconnected", Some(ConnectionPanel::Ai)),
+            ("Foundry: not checked", Some(ConnectionPanel::Ai)),
+            ("WorkIQ: connected", Some(ConnectionPanel::Workiq)),
+            (app.msx_status.label(), Some(ConnectionPanel::Msx)),
+            ("WebIQ: connecting...", Some(ConnectionPanel::External(tomlook::connectors::Kind::Webiq))),
+            ("GitHub: connected", Some(ConnectionPanel::External(tomlook::connectors::Kind::Github))),
+            ("Sync 157/213 · retrying", Some(ConnectionPanel::Workiq)),
+        ] {
+            app.connection_panel = None;
+            // Opening the AI dialog checks Foundry; restore the fixture's passive status.
+            app.auto_status = tomlook::decision::Status::new(tomlook::decision::Phase::Unknown, "Foundry fixture");
+            click_status_control(&context, &mut app, language.text(label).as_ref());
+            assert!(app.connection_panel == target, "{label}");
+        }
+        let cache = language.text(&format!("{} cached meetings", app.calendar.events.len())).into_owned();
+        app.connection_panel = None;
+        click_status_control(&context, &mut app, &cache);
+        assert!(app.connection_panel == Some(ConnectionPanel::Workiq));
+        for label in ["Ready", "Researching", "Waiting", "Problems"] {
+            app.settings = false;
+            click_status_control(&context, &mut app, &format!("{}:", language.text(label)));
+            assert!(app.settings, "{label} must open Insights activity");
+        }
+        app.auto_status = tomlook::decision::Status::new(tomlook::decision::Phase::Unknown, "Foundry fixture");
+        let badge = tomlook::setup::summarize(&app.setup_items()).badge();
+        click_status_control(&context, &mut app, language.text(&badge).as_ref());
+        assert!(app.preferences_open && app.preferences_section == PreferencesSection::Setup);
+        app.preferences_open = false;
+        click_status_control(&context, &mut app, language.text("Update 9.9.9 ready").as_ref());
+        assert!(app.preferences_open && app.preferences_section == PreferencesSection::Updates);
+        click_status_control(&context, &mut app, language.text("Messages").as_ref());
+        assert!(app.messages_open);
+        let mut seen = Vec::new();
+        drain_ai(&mut commands, &mut seen);
+        assert_eq!(seen.iter().filter(|command| matches!(command, ai::Command::CheckAuto)).count(), 2);
+        assert_eq!(seen.iter().filter(|command| matches!(command, ai::Command::RefreshCalendarAvailability)).count(), 1);
+        assert_eq!(seen.len(), 3, "Only existing explicit-click actions may issue commands");
+        app.activity = Arc::new(Default::default());
+        app.preferences.msx_enabled = false;
+        app.setup.eligible = false;
+        app.update_status.staged = None;
+        let (output, _) = draw_status_bar(&context, &mut app, 960.0, vec![egui::Event::PointerGone]);
+        let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+        let labels = tree.nodes.iter().filter_map(|(_, node)| node.label()).collect::<Vec<_>>();
+        assert!(labels.iter().any(|label| label.starts_with(&format!("{}: 0", language.text("Ready")))));
+        for label in ["Researching", "Waiting", "Problems"] {
+            assert!(!labels.iter().any(|text| text.starts_with(&format!("{}:", language.text(label)))));
+        }
+        assert!(!labels.iter().any(|label| label.starts_with("MSX")));
+        assert!(commands.try_recv().is_err());
+    }
+}
+
+#[test]
+fn status_items_keep_full_hover_accessibility_and_stable_keyboard_activation() {
+    use super::connections::{ConnectionState, StatusIcon, status_item};
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        context.style_mut_of(theme, |style| style.interaction.tooltip_delay = 0.0);
+    }
+    let mut identity = None;
+    let mut rect = egui::Rect::NOTHING;
+    let mut clicked = false;
+    let mut draw = |language: tomlook::i18n::Language, events| {
+        let hint = format!("{}: 25000", language.text("Waiting"));
+        let mut output = context.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+            let response = status_item(ui, "status-counter-fixture", StatusIcon::Clock, "25k", ConnectionState::Unknown, &hint);
+            if let Some(id) = identity { assert_eq!(response.id, id); } else { identity = Some(response.id); }
+            rect = response.rect;
+            clicked |= response.clicked();
+        });
+        output.textures_delta.clear();
+        assert_eq!(status_control(&output, &hint), rect);
+        (output, identity.unwrap(), rect)
+    };
+    let (_, id, rect) = draw(tomlook::i18n::Language::En, vec![]);
+    for _ in 0..3 {
+        draw(tomlook::i18n::Language::En, vec![egui::Event::PointerMoved(rect.center())]);
+    }
+    let (output, _, _) = draw(tomlook::i18n::Language::En, vec![]);
+    assert!(output_text(&output).contains("Waiting: 25000"), "The exact, unabbreviated count remains available on hover");
+    context.memory_mut(|memory| memory.request_focus(id));
+    draw(tomlook::i18n::Language::Cs, vec![egui::Event::PointerGone, egui::Event::Key {
+        key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE,
+    }]);
+    assert!(clicked);
+}
+
+#[test]
+fn status_icon_and_text_have_real_spacing_and_only_problems_are_colored() {
+    use super::connections::{ConnectionState, StatusIcon, status_item};
+    for dark in [false, true] {
+        for layout in [egui::Layout::left_to_right(egui::Align::Center), egui::Layout::right_to_left(egui::Align::Center)] {
+            let (mut app, _, _) = assistant_fixture();
+            app.preferences.dark = dark;
+            let context = egui::Context::default();
+            app.style(&context);
+            let mut neutral = None;
+            for (state, icon) in [
+                (ConnectionState::Ready, StatusIcon::Check),
+                (ConnectionState::Busy, StatusIcon::Busy),
+                (ConnectionState::Unknown, StatusIcon::Calendar),
+                (ConnectionState::Offline, StatusIcon::Alert),
+            ] {
+                let mut response_rect = egui::Rect::NOTHING;
+                let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                    neutral = Some(ui.visuals().weak_text_color());
+                    ui.with_layout(layout, |ui| {
+                        response_rect = status_item(ui, "spacing-fixture", icon, "WorkIQ", state, "WorkIQ fixture").rect;
+                    });
+                });
+                let text = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "WorkIQ" => Some(text),
+                    _ => None,
+                }).unwrap();
+                let text_rect = text.galley.rect.translate(text.pos.to_vec2());
+                assert!(text_rect.left() - (response_rect.left() + 12.0) >= 5.9, "The icon needs a six-pixel gap, not spaces inside the label");
+                assert!(response_rect.expand(0.5).contains_rect(text_rect));
+                let color = text.fallback_color;
+                if state == ConnectionState::Offline {
+                    assert_ne!(color, neutral.unwrap());
+                    assert_eq!(color, if dark { Color32::from_rgb(194, 137, 132) } else { Color32::from_rgb(153, 78, 73) });
+                } else {
+                    assert_eq!(color, neutral.unwrap(), "Normal, unknown and busy states must not compete with the content");
+                }
+                output.textures_delta.clear();
+            }
+        }
+    }
 }
 
 #[test]
@@ -7899,12 +8469,12 @@ fn setup_indicator_shows_progress_opens_the_checklist_and_dont_show_persists() {
         let show: Show = &|app, ui| {
             ui.horizontal(|ui| app.setup_indicator(ui));
         };
-        let badge = language.text("Setup 0/5").into_owned();
-        assert!(settled(&context, &mut app, show).contains(&badge));
-        click_text(&context, &mut app, show, &badge);
+        let badge = "0/5";
+        assert!(settled(&context, &mut app, show).contains(badge));
+        click_text(&context, &mut app, show, badge);
         assert!(app.preferences_open && app.preferences_section == PreferencesSection::Setup);
         app.hosted_workiq_busy = true;
-        assert!(!settled(&context, &mut app, show).contains(&badge), "No indicator while a required step is still being checked");
+        assert!(!settled(&context, &mut app, show).contains(badge), "No indicator while a required step is still being checked");
         app.hosted_workiq_busy = false;
         let output = draw_with(&context, &mut app, vec![], show);
         let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
@@ -7919,10 +8489,10 @@ fn setup_indicator_shows_progress_opens_the_checklist_and_dont_show_persists() {
         click_text(&context, &mut app, show, language.text("Don't show").as_ref());
         assert!(app.preferences.setup_hint_hidden);
         assert!(matches!(receiver.try_recv(), Ok(Command::Preferences(preferences)) if preferences.setup_hint_hidden));
-        assert!(!settled(&context, &mut app, show).contains(&badge), "Dismissal persists");
+        assert!(!settled(&context, &mut app, show).contains(badge), "Dismissal persists");
         app.preferences.setup_hint_hidden = false;
         app.setup.eligible = false;
-        assert!(!settled(&context, &mut app, show).contains(&badge), "Diagnostic runs show no indicator");
+        assert!(!settled(&context, &mut app, show).contains(badge), "Diagnostic runs show no indicator");
         let mut seen = Vec::new();
         drain_ai(&mut ai_commands, &mut seen);
         assert!(seen.iter().all(|command| matches!(command, ai::Command::MsxSettings(_))));

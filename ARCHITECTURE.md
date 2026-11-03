@@ -83,11 +83,11 @@ flowchart LR
 | Area | Modules |
 |---|---|
 | Entry and lifecycle | `main.rs` (arguments, eframe, shutdown), `instance.rs`, `tray.rs`, `brand.rs` |
-| UI | `app\` (`calendar`, `meeting`, `event_editor`, `find_time`, `ask_panel`, `recommendations`, `settings`, `setup`, `myday`, `weekly`, `tasks`, `followup`, `feedback`, `customers`, `connections`, `palette`), `i18n.rs` (EN/CZ catalog), `markdown.rs`, `browser.rs` (safe URL and `mailto:` opener) |
-| Storage and scheduling | `worker.rs` (storage worker), `storage.rs` (schema, preferences, legacy import), `calendar.rs` (events, layout, filters), `calendar_sync.rs`, `scheduler.rs` (preparation queue, fingerprints), `search.rs` (fuzzy keyword index), `retry.rs`, `telemetry.rs`, `fixture_cache.rs`, `showcase.rs` (offline demo), `interaction_trace.rs` |
+| UI | `app\` (`calendar`, `meeting`, `event_editor`, `find_time`, `invitations`, `ask_panel`, `recommendations`, `settings`, `setup`, `myday`, `weekly`, `tasks`, `followup`, `feedback`, `customers`, `connections`, `palette`), `i18n.rs` (EN/CZ catalog), `markdown.rs`, `browser.rs` (safe URL and `mailto:` opener) |
+| Storage and scheduling | `worker.rs` (storage worker) + `worker\invitations.rs`, `storage.rs` (schema, preferences, legacy import), `calendar.rs` (events, layout, filters), `calendar_sync.rs`, `scheduler.rs` (preparation queue, fingerprints), `search.rs` (fuzzy keyword index), `retry.rs`, `telemetry.rs`, `fixture_cache.rs`, `showcase.rs` (offline demo), `interaction_trace.rs` |
 | AI | `ai.rs` (executor), `copilot.rs` (isolated SDK harness, sessions, tool registry), `chat.rs` (Ask modes, durable research), `chat_cache.rs` (calendar/Insights read tools), `ask.rs` (slash commands), `context.rs` and `source_index.rs` (local documents), `evidence.rs` (tool evidence, citation binding, redaction), `decision.rs` (Foundry router), `prompts.rs`, `changes.rs` and `proposals.rs` (AI-proposed edits), `recommendations.rs`, `recaps.rs` (post-meeting notes) |
-| Features | `myday.rs`, `weekly.rs`, `tasks.rs`, `followup.rs`, `feedback.rs`, `customers.rs` + `customers\`, `attendees.rs`, `availability.rs`, `scheduling.rs` (Find a time, BLOCKERs), `event_creation.rs`, `company.rs` (icons), `setup.rs`, `reminders.rs`, `updater.rs` |
-| Connectors | `workiq.rs` + `workiq\` (`hosted` sign-in, `connection` reads, `vault`, `calendar_write`, `chat_write`, `cloud`, `meeting_notes`), `connectors.rs` (WebIQ, GitHub), `credentials.rs` (DPAPI), `msx.rs` + `msx\` (`auth`, `mcp`, `dataverse`, `acr`, `tools`), `azure_cli.rs` |
+| Features | `invitations.rs` (account-owned queue, local priorities, team cache), `myday.rs`, `weekly.rs`, `tasks.rs`, `followup.rs`, `feedback.rs`, `customers.rs` + `customers\`, `attendees.rs`, `availability.rs`, `scheduling.rs` (Find a time, BLOCKERs), `event_creation.rs`, `company.rs` (icons), `setup.rs`, `reminders.rs`, `updater.rs` |
+| Connectors | `workiq.rs` + `workiq\` (`hosted` sign-in, `connection` reads, `vault`, `invitations`, `calendar_write`, `chat_write`, `cloud`, `meeting_notes`), `connectors.rs` (WebIQ, GitHub), `credentials.rs` (DPAPI), `msx.rs` + `msx\` (`auth`, `mcp`, `dataverse`, `acr`, `tools`), `azure_cli.rs` |
 | Tools | `bin\` probes and `release-sign` (see [development.md](docs/development.md#probes-and-diagnostics)) |
 
 ## Data model highlights
@@ -100,7 +100,7 @@ flowchart LR
 - **Calendar cache** is owned by one account (the calendar owner's e-mail).
   Each event keeps bounded Graph metadata (`id`, `iCalUId`, subject, times,
   categories, attendees up to 500 with the full count and a list fingerprint,
-  organizer, response, `showAs`, `type`, sensitivity, online meeting fields,
+  organizer, response, `showAs`, `type`, nonempty `seriesMasterId`, sensitivity, online meeting fields,
   `webLink`, `bodyPreview`). Coverage is stored per day with its last
   successful refresh; a day without coverage is "Not synced", never free.
 - **Insights** are versioned bilingual documents (English narrative plus a
@@ -129,6 +129,30 @@ inconsistent responses are refused and the previous cache is kept. Days within
 two weeks refresh every 15 minutes, others every six hours, with exponential
 backoff on failure. One WorkIQ read slot is reserved for the calendar so
 research cannot starve it.
+
+## Invitation reads and local priority
+
+The invitation worker independently schedules response-filtered `calendarView`
+reads over six months every 180 seconds, using the existing bounded
+time-partitioning reader and a separate WorkIQ read semaphore. These reads
+produce **no calendar coverage** and never use the full-calendar replacement
+path. Membership reads refresh enabled directory groups daily; explicit
+historical-mail discovery samples recipient headers and returns disabled
+candidates. Incomplete membership is refused, not mislabeled as complete.
+
+The executor does not require an AI model for these typed reads. Request IDs,
+account binding and connection generations guard results; deadlines and
+backoff retain the old cache on failure. Mutations use clone/validate/persist
+before publication in an account-hashed `invitation-inbox-v1` settings entry.
+Verified calendar responses/removals update the book immediately and invalidate
+older queue reads so they cannot restore resolved requests.
+
+Pure local classification reuses user-confirmed customer domains and explicit
+team/organizer/series choices. External-domain evidence remains unconfirmed.
+The UI focuses a staged cached occurrence and temporarily overrides display
+filters; it reuses the ordinary RSVP/category approval and writer without
+adding another approval surface. Series are collapsed for browsing, never
+promoted to whole-series write authority.
 
 ## Preparation scheduler and fingerprints
 
