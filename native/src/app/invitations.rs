@@ -1,5 +1,11 @@
 use super::*;
-use tomlook::invitations::{self, Conflicts, LocalAction, OrganizerRule, Tab};
+use tomlook::invitations::{self, BulkAction, Conflicts, LocalAction, OrganizerRule, Tab};
+
+pub(super) struct BulkDraft {
+    account: String,
+    events: Vec<Event>,
+    action: BulkAction,
+}
 
 struct ReturnToCalendar {
     anchor: NaiveDate,
@@ -11,6 +17,10 @@ struct ReturnToCalendar {
 pub(super) struct InvitationsUi {
     pub open: bool,
     pub selected: Option<String>,
+    pub(super) marked: BTreeSet<String>,
+    selection_anchor: Option<String>,
+    selection_account: String,
+    pub(super) bulk: Option<BulkDraft>,
     pending_focus: Option<String>,
     back: Option<ReturnToCalendar>,
     tab: Tab,
@@ -25,7 +35,8 @@ pub(super) struct InvitationsUi {
 
 impl Default for InvitationsUi {
     fn default() -> Self {
-        Self { open: false, selected: None, pending_focus: None, back: None, tab: Tab::Important,
+        Self { open: false, selected: None, marked: BTreeSet::new(), selection_anchor: None,
+            selection_account: String::new(), bulk: None, pending_focus: None, back: None, tab: Tab::Important,
             page: 0, week: false, settings: false, settings_account: String::new(), queries: String::new(),
             included: String::new(), excluded: String::new() }
     }
@@ -50,6 +61,9 @@ impl Tomlook {
         self.invitations.open = false;
         self.invitations.selected = None;
         self.invitations.pending_focus = None;
+        self.invitations.marked.clear();
+        self.invitations.selection_anchor = None;
+        self.invitations.bulk = None;
         if let Some(back) = self.invitations.back.take() {
             self.anchor = back.anchor;
             self.mini_anchor = back.mini_anchor;
@@ -162,6 +176,14 @@ impl Tomlook {
         let language = self.preferences.language;
         let snapshot = self.activity.invitations.clone();
         let account = &snapshot.book.account;
+        if self.invitations.selection_account != *account {
+            self.invitations.marked.clear();
+            self.invitations.selection_anchor = None;
+            self.invitations.selection_account = account.clone();
+        }
+        let visible_keys = snapshot.rows.iter().filter(|row| row.tab == self.invitations.tab)
+            .map(|row| &row.key).collect::<BTreeSet<_>>();
+        self.invitations.marked.retain(|key| visible_keys.contains(key));
         ui.horizontal_wrapped(|ui| {
             ui.heading(language.text("Invitations"));
             if ui.add_enabled(!snapshot.sync.busy && self.workiq_ready,
@@ -177,6 +199,8 @@ impl Tomlook {
                     format!("{} {count}", language.text(label))).clicked() {
                     self.invitations.tab = tab;
                     self.invitations.page = 0;
+                    self.invitations.marked.clear();
+                    self.invitations.selection_anchor = None;
                 }
             }
         });
@@ -201,38 +225,85 @@ impl Tomlook {
                     .on_hover_text(language.text("Next invitations")).clicked() { self.invitations.page += 1; }
             });
         }
+        ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(!rows.is_empty(), egui::Button::new(language.text("Select page"))).clicked() {
+                self.invitations.marked.extend(rows.iter().skip(self.invitations.page * 40).take(40).map(|row| row.key.clone()));
+            }
+            if ui.add_enabled(!self.invitations.marked.is_empty(), egui::Button::new(language.text("Clear selection"))).clicked() {
+                self.invitations.marked.clear();
+                self.invitations.selection_anchor = None;
+            }
+            ui.weak(format!("{}: {}", language.text("Selected invitations"), self.invitations.marked.len()));
+        });
+        if !self.invitations.marked.is_empty() {
+            ui.menu_button(language.text("Selected invitation actions"), |ui| self.invitation_bulk_menu(ui));
+        }
         for row in rows.iter().skip(self.invitations.page * 40).take(40) {
             let selected = self.invitations.selected.as_deref() == Some(row.key.as_str());
-            let response = egui::Frame::new().fill(if selected {
-                self.accent().gamma_multiply(if self.preferences.dark { 0.2 } else { 0.08 })
-            } else { ui.visuals().faint_bg_color })
-                .stroke(if selected { Stroke::new(1.0, self.accent()) } else { Stroke::NONE })
-                .corner_radius(6).inner_margin(8).show(ui, |ui| {
-                    ui.set_width((ui.available_width() - 2.0).max(0.0));
-                    ui.add(egui::Label::new(RichText::new(&row.event.title).strong()).wrap());
-                    ui.add(egui::Label::new(meeting_date_label(&row.event, language)).wrap());
-                    ui.add(egui::Label::new(RichText::new(&row.event.organizer).weak()).wrap());
-                    ui.add(egui::Label::new(RichText::new(language.text(row.reason.label())).small().color(self.accent())).wrap());
-                    if !row.detail.is_empty() {
-                        ui.add(egui::Label::new(RichText::new(&row.detail).weak()).wrap());
-                    }
-                    ui.add(egui::Label::new(RichText::new(match row.conflicts {
-                        Conflicts::Unknown => language.text("Conflicts not checked"),
-                        Conflicts::Clear => language.text("No conflicts in recently refreshed calendar"),
-                        Conflicts::Found(_) => language.text("Calendar conflict - review before responding"),
-                    }).weak()).wrap());
-                    if row.updated { ui.weak(language.text("Invitation changed")); }
-                    else if chrono::Utc::now() - row.first_seen < chrono::Duration::days(1) {
-                        ui.weak(language.text("Newly seen"));
-                    }
-                    if let Some(snooze) = snapshot.book.snoozed.get(&row.key)
-                        && row.tab == Tab::Snoozed {
-                        ui.weak(format!("{} {}", language.text("Snoozed until:"),
-                            snooze.until.with_timezone(&Local).format("%d.%m. %H:%M")));
-                    }
-                }).response.interact(egui::Sense::click());
+            let marked = self.invitations.marked.contains(&row.key);
+            let response = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+                ui.style_mut().interaction.selectable_labels = false;
+                egui::Frame::new().fill(if selected || marked {
+                    self.accent().gamma_multiply(if self.preferences.dark { 0.2 } else { 0.08 })
+                } else { ui.visuals().faint_bg_color })
+                    .stroke(if selected || marked { Stroke::new(1.0, self.accent()) } else { Stroke::NONE })
+                    .corner_radius(6).inner_margin(8).show(ui, |ui| {
+                        ui.set_width((ui.available_width() - 2.0).max(0.0));
+                        ui.horizontal_top(|ui| {
+                            let mut checked = marked;
+                            let checkbox = ui.checkbox(&mut checked, "").on_hover_text(language.text("Select invitation"));
+                            let title = ui.add(egui::Label::new(RichText::new(&row.event.title).strong()).wrap());
+                            if checkbox.labelled_by(title.id).changed() {
+                                if checked { self.invitations.marked.insert(row.key.clone()); }
+                                else { self.invitations.marked.remove(&row.key); }
+                                self.invitations.selection_anchor = Some(row.key.clone());
+                            }
+                        });
+                        ui.add(egui::Label::new(meeting_date_label(&row.event, language)).wrap());
+                        ui.add(egui::Label::new(RichText::new(&row.event.organizer).weak()).wrap());
+                        ui.add(egui::Label::new(RichText::new(language.text(row.reason.label())).small().color(self.accent())).wrap());
+                        if !row.detail.is_empty() {
+                            ui.add(egui::Label::new(RichText::new(&row.detail).weak()).wrap());
+                        }
+                        ui.add(egui::Label::new(RichText::new(match row.conflicts {
+                            Conflicts::Unknown => language.text("Conflicts not checked"),
+                            Conflicts::Clear => language.text("No conflicts in recently refreshed calendar"),
+                            Conflicts::Found(_) => language.text("Calendar conflict - review before responding"),
+                        }).weak()).wrap());
+                        if row.updated { ui.weak(language.text("Invitation changed")); }
+                        else if chrono::Utc::now() - row.first_seen < chrono::Duration::days(1) {
+                            ui.weak(language.text("Newly seen"));
+                        }
+                        if let Some(snooze) = snapshot.book.snoozed.get(&row.key)
+                            && row.tab == Tab::Snoozed {
+                            ui.weak(format!("{} {}", language.text("Snoozed until:"),
+                                snooze.until.with_timezone(&Local).format("%d.%m. %H:%M")));
+                        }
+                    });
+            }).response;
             response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &row.event.title));
-            if response.clicked() { self.open_invitation(row); }
+            if response.clicked() {
+                let modifiers = ui.input(|input| input.modifiers);
+                if modifiers.shift || modifiers.ctrl || modifiers.command {
+                    let anchor = self.invitations.selection_anchor.as_deref()
+                        .and_then(|key| rows.iter().position(|row| row.key == key));
+                    let clicked = rows.iter().position(|candidate| candidate.key == row.key).unwrap();
+                    if modifiers.shift && let Some(anchor) = anchor {
+                        self.invitations.marked.extend(rows[anchor.min(clicked)..=anchor.max(clicked)]
+                            .iter().map(|row| row.key.clone()));
+                    } else {
+                        if !self.invitations.marked.remove(&row.key) { self.invitations.marked.insert(row.key.clone()); }
+                        self.invitations.selection_anchor = Some(row.key.clone());
+                    }
+                } else {
+                    self.open_invitation(row);
+                }
+            }
+            if response.secondary_clicked() && !self.invitations.marked.contains(&row.key) {
+                self.invitations.marked.clear();
+                self.invitations.marked.insert(row.key.clone());
+                self.invitations.selection_anchor = Some(row.key.clone());
+            }
             response.context_menu(|ui| self.invitation_row_menu(ui, row));
             ui.add_space(6.0);
         }
@@ -251,6 +322,9 @@ impl Tomlook {
 
     fn invitation_row_menu(&mut self, ui: &mut egui::Ui, row: &invitations::Row) {
         let language = self.preferences.language;
+        self.invitation_bulk_menu(ui);
+        if self.invitations.marked.len() > 1 { return; }
+        ui.separator();
         if ui.button(language.text("Open in calendar")).clicked() { self.open_invitation(row); ui.close(); }
         ui.separator();
         if row.tab == Tab::Snoozed {
@@ -282,6 +356,92 @@ impl Tomlook {
         };
         if ui.button(language.text(label)).clicked() {
             self.invitation_local(LocalAction::QuietSeries { key: row.key.clone(), quiet }); ui.close();
+        }
+    }
+
+    fn invitation_bulk_menu(&mut self, ui: &mut egui::Ui) {
+        let language = self.preferences.language;
+        ui.strong(format!("{}: {}", language.text("Selected invitations"), self.invitations.marked.len()));
+        let ready = self.workiq_ready && self.ai.is_some()
+            && self.calendar_owner.as_deref() == Some(self.activity.invitations.book.account.as_str())
+            && !self.invitations.marked.is_empty();
+        for action in [BulkAction::Decline, BulkAction::Follow] {
+            if ui.add_enabled(ready, egui::Button::new(language.text(action.label())))
+                .on_disabled_hover_text(language.text("Connect WorkIQ before confirming a calendar change")).clicked() {
+                let events = self.activity.invitations.rows.iter()
+                    .filter(|row| self.invitations.marked.contains(&row.key)).map(|row| row.event.clone()).collect();
+                self.invitations.bulk = Some(BulkDraft {
+                    account: self.activity.invitations.book.account.clone(), events, action,
+                });
+                ui.close();
+            }
+        }
+    }
+
+    pub(super) fn invitation_bulk_dialog(&mut self, context: &egui::Context) {
+        let Some(draft) = self.invitations.bulk.take() else { return; };
+        let language = self.preferences.language;
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        let unchanged = self.calendar_owner.as_deref() == Some(draft.account.as_str())
+            && self.activity.invitations.book.account == draft.account
+            && !draft.events.is_empty()
+            && draft.events.iter().all(|event| self.activity.invitations.rows.iter().any(|row|
+                row.event.id == event.id && invitations::pending(&row.event, chrono::Utc::now())
+                    && tomlook::scheduler::fingerprint(&row.event) == tomlook::scheduler::fingerprint(event)));
+        let validation = draft.events.iter().try_for_each(|event|
+            tomlook::recommendations::validate_manual_change(event, &draft.action.change()));
+        egui::Window::new(language.text(draft.action.label())).id(Id::new("invitation-bulk-confirm"))
+            .open(&mut open).default_width(480.0).resizable(true).collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(context, |ui| {
+                ui.strong(format!("{}: {}", language.text("Selected invitations"), draft.events.len()));
+                ui.label(language.text(match draft.action {
+                    BulkAction::Decline => "Declines every listed invitation without notifying the organizer.",
+                    BulkAction::Follow => "Adds Follow, keeps other categories and marks this occurrence as free. Your invitation response is unchanged; the organizer is not notified.",
+                }));
+                ui.weak(language.text("Recurring invitation: responses apply only to this occurrence."));
+                egui::ScrollArea::vertical().id_salt("invitation-bulk-events").max_height(280.0).show(ui, |ui| {
+                    for event in &draft.events {
+                        ui.strong(&event.title);
+                        ui.weak(meeting_date_label(event, language));
+                        ui.weak(&event.organizer);
+                        ui.separator();
+                    }
+                });
+                ui.weak(language.text("Review individual progress and outcomes in Messages. Failed or uncertain changes are not retried automatically."));
+                if !unchanged {
+                    ui.colored_label(Color32::LIGHT_RED, language.text("Selected invitations changed; close this dialog and select them again"));
+                }
+                if let Err(error) = &validation { ui.colored_label(Color32::LIGHT_RED, language.text(error)); }
+                ui.horizontal(|ui| {
+                    confirm = ui.add_enabled(unchanged && validation.is_ok() && self.workiq_ready && self.ai.is_some(),
+                        egui::Button::new(language.text("Confirm for all selected invitations"))).clicked();
+                    cancel = ui.button(language.text("Back")).clicked();
+                });
+            });
+        if confirm {
+            let command = Command::ConfirmInvitationActions {
+                account: draft.account.clone(), events: draft.events.clone(), action: draft.action,
+            };
+            let result = self.worker.as_ref().ok_or("The storage worker is unavailable. Restart Tomlook.")
+                .and_then(|worker| worker.commands.try_send(command).map_err(|error| match error {
+                    mpsc::TrySendError::Full(_) => "Local queue is full. Nothing was submitted; try again.",
+                    mpsc::TrySendError::Disconnected(_) => "The storage worker is unavailable. Restart Tomlook.",
+                }));
+            match result {
+                Ok(()) => {
+                    self.invitations.marked.clear();
+                    self.invitations.selection_anchor = None;
+                    self.messages_open = true;
+                }
+                Err(error) => {
+                    self.error = Some(error.into());
+                    self.invitations.bulk = Some(draft);
+                }
+            }
+        } else if open && !cancel {
+            self.invitations.bulk = Some(draft);
         }
     }
 

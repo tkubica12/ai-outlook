@@ -1226,16 +1226,21 @@ mod tests {
     #[tokio::test]
     async fn existing_meeting_creates_only_two_private_travel_blocks_without_copying_or_updating_parent() {
         use crate::event_creation::{Record, State, tests::parent};
-        let record = Record::travel("owner".into(), parent(), 45, crate::i18n::Language::En).unwrap();
-        let mut fake = creation_fake();
-        fake.parent = record.parent.clone();
-        let result = create_events(&fake, &record).await;
-        assert_eq!(result.state, State::Created);
-        assert_eq!(result.events.len(), 2);
-        assert_eq!(fake.writes.load(Ordering::Relaxed), 2);
-        let bodies = fake.bodies.lock().unwrap();
-        assert!(bodies.iter().all(|body| body["subject"] != record.draft.title
-            && body["sensitivity"] == "private" && body["isOnlineMeeting"] == false));
+        for organizer in [true, false] {
+            let mut parent = parent();
+            parent.extra.insert("isOrganizer".into(), json!(organizer));
+            parent.status = if organizer { "organizer" } else { "accepted" }.into();
+            let record = Record::travel("owner".into(), parent, 45, crate::i18n::Language::En).unwrap();
+            let mut fake = creation_fake();
+            fake.parent = record.parent.clone();
+            let result = create_events(&fake, &record).await;
+            assert_eq!(result.state, State::Created);
+            assert_eq!(result.events.len(), 2);
+            assert_eq!(fake.writes.load(Ordering::Relaxed), 2);
+            let bodies = fake.bodies.lock().unwrap();
+            assert!(bodies.iter().all(|body| body["subject"] != record.draft.title
+                && body["sensitivity"] == "private" && body["isOnlineMeeting"] == false && body["attendees"] == json!([])));
+        }
     }
 
     #[tokio::test]

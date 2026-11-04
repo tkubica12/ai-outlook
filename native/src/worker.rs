@@ -91,6 +91,11 @@ pub enum Command {
         account: String,
         change: crate::recommendations::Change,
     },
+    ConfirmInvitationActions {
+        account: String,
+        events: Vec<calendar::Event>,
+        action: crate::invitations::BulkAction,
+    },
     DismissRecommendation(String),
     ConfirmRecommendation {
         id: String,
@@ -841,15 +846,37 @@ fn propose_change(
         "note":"Only a pending proposal was saved. No Insights, notes or calendar event were changed. The user must review and approve this exact change in Tomlook Messages. You cannot approve it, including when a user says approve in chat."}))
 }
 
-fn dispatch_calendar_change(
+fn manual_calendar_operation(
+    store: &mut Store,
+    inbox: &mut std::collections::BTreeMap<String, crate::recommendations::Recommendation>,
+    event: calendar::Event,
+    account: &str,
+    change: crate::recommendations::Change,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> Result<crate::recommendations::Operation, String> {
+    if inbox.values().any(|record| record.account == account && record.event_id == event.id
+        && matches!(record.state, crate::recommendations::State::Dispatching | crate::recommendations::State::Review)) {
+        return Err("Review the previous calendar operation before confirming another change".into());
+    }
+    let recommendation = crate::recommendations::Recommendation::from_manual(&event, account, change.clone(), now)?;
+    let id = recommendation.id.clone();
+    if inbox.get(&id).is_some_and(|record| !matches!(record.state,
+        crate::recommendations::State::Pending | crate::recommendations::State::NotSent)) {
+        return Err("Calendar approval was already consumed; inspect the previous outcome".into());
+    }
+    let mut next = inbox.clone();
+    next.insert(id, recommendation.clone());
+    store.save_recommendations(&next)?;
+    *inbox = next;
+    Ok(crate::recommendations::Operation { recommendation, event, change })
+}
+
+fn approve_calendar_change(
     store: &mut Store,
     inbox: &mut std::collections::BTreeMap<String, crate::recommendations::Recommendation>,
     revision: &mut u64,
-    sdk: &Sdk,
     mut operation: crate::recommendations::Operation,
-    reply: &tokio::sync::mpsc::Sender<crate::ai::CalendarResult>,
-    wake: &SyncSender<Command>,
-) -> Result<(), String> {
+) -> Result<crate::recommendations::Operation, String> {
     use crate::recommendations::State;
     if inbox.values().any(|record| {
         record.account == operation.recommendation.account
@@ -864,8 +891,22 @@ fn dispatch_calendar_change(
     operation.recommendation.state = State::Dispatching;
     operation.recommendation.message = "Confirmed calendar change is running".into();
     store.approve_recommendation(&operation)?;
-    inbox.insert(id.clone(), operation.recommendation.clone());
+    inbox.insert(id, operation.recommendation.clone());
     *revision += 1;
+    Ok(operation)
+}
+
+fn dispatch_calendar_change(
+    store: &mut Store,
+    inbox: &mut std::collections::BTreeMap<String, crate::recommendations::Recommendation>,
+    revision: &mut u64,
+    sdk: &Sdk,
+    operation: crate::recommendations::Operation,
+    reply: &tokio::sync::mpsc::Sender<crate::ai::CalendarResult>,
+    wake: &SyncSender<Command>,
+) -> Result<(), String> {
+    let operation = approve_calendar_change(store, inbox, revision, operation)?;
+    let id = operation.recommendation.id.clone();
     if sdk
         .commands
         .try_send(ai::Command::CalendarChange {
@@ -879,9 +920,32 @@ fn dispatch_calendar_change(
         let record = inbox
             .get_mut(&id)
             .ok_or("Confirmed calendar approval disappeared")?;
-        record.state = State::NotSent;
+        record.state = crate::recommendations::State::NotSent;
         record.message = "Calendar change was not queued; nothing was submitted".into();
         store.save_recommendations(inbox)?;
+    }
+    Ok(())
+}
+
+fn dispatch_calendar_changes(
+    store: &Store,
+    inbox: &mut std::collections::BTreeMap<String, crate::recommendations::Recommendation>,
+    sdk: &Sdk,
+    operations: Vec<crate::recommendations::Operation>,
+    reply: &tokio::sync::mpsc::Sender<crate::ai::CalendarResult>,
+    wake: &SyncSender<Command>,
+) -> Result<(), String> {
+    let ids = operations.iter().map(|operation| operation.recommendation.id.clone()).collect::<Vec<_>>();
+    if sdk.commands.try_send(ai::Command::CalendarChanges {
+        operations, reply: reply.clone(), wake: wake.clone(),
+    }).is_err() {
+        for id in ids {
+            let record = inbox.get_mut(&id).ok_or("Confirmed calendar approval disappeared")?;
+            record.state = crate::recommendations::State::NotSent;
+            record.message = "Calendar change was not queued; nothing was submitted".into();
+        }
+        store.save_recommendations(inbox)?;
+        return Err("Invitation actions could not be queued; nothing was submitted".into());
     }
     Ok(())
 }
@@ -2026,7 +2090,7 @@ impl Worker {
                             break Command::Wake;
                         }
                     };
-                    let recommendation_command = matches!(&command, Command::ProposeChange { .. } | Command::CreateEvents { .. } | Command::DismissEventCreation { .. } | Command::ConfirmRecommendation { .. } | Command::ConfirmMeetingAction { .. } | Command::RecheckCalendarResult(_) | Command::DismissRecommendation(_) | Command::ReviewRecommendations { .. }
+                    let recommendation_command = matches!(&command, Command::ProposeChange { .. } | Command::CreateEvents { .. } | Command::DismissEventCreation { .. } | Command::ConfirmRecommendation { .. } | Command::ConfirmMeetingAction { .. } | Command::ConfirmInvitationActions { .. } | Command::RecheckCalendarResult(_) | Command::DismissRecommendation(_) | Command::ReviewRecommendations { .. }
                         | Command::HoldTimes { .. } | Command::ProposeChat { .. } | Command::ReleaseBlockers { .. } | Command::ScheduleProposal { .. });
                     let result = match command {
                         Command::Invitation(command) => {
@@ -2320,27 +2384,47 @@ impl Worker {
                             if crate::scheduler::fingerprint(current) != crate::scheduler::fingerprint(&event) {
                                 return Err("Meeting changed after the recommendation; no calendar write was submitted".into());
                             }
-                            if inbox.values().any(|record| record.account == account && record.event_id == event.id
-                                && matches!(record.state, crate::recommendations::State::Dispatching | crate::recommendations::State::Review)) {
-                                return Err("Review the previous calendar operation before confirming another change".into());
-                            }
                             if let crate::recommendations::Change::Category(category)
                                 | crate::recommendations::Change::Respond { category: Some(category), .. } = &change {
                                 crate::recommendations::category_replacement(category, &known_categories(&calendar))?;
                             }
                             let sdk = sdk.as_ref().filter(|sdk| !sdk.terminated.load(Ordering::Acquire))
                                 .ok_or("Connect WorkIQ before confirming a calendar change")?;
-                            let recommendation = crate::recommendations::Recommendation::from_manual(&event, &account, change.clone(), now)?;
-                            let id = recommendation.id.clone();
-                            if inbox.get(&id).is_some_and(|record| !matches!(record.state,
-                                crate::recommendations::State::Pending | crate::recommendations::State::NotSent)) {
-                                return Err("Calendar approval was already consumed; inspect the previous outcome".into());
-                            }
-                            inbox.insert(id.clone(), recommendation.clone());
-                            store.save_recommendations(&inbox)?;
-                            let operation = crate::recommendations::Operation { recommendation, event: *event, change };
+                            let operation = manual_calendar_operation(&mut store, &mut inbox, *event, &account, change, now)?;
                             dispatch_calendar_change(&mut store, &mut inbox, &mut inbox_revision, sdk,
                                 operation, &calendar_result_sender, &wake)
+                        })(),
+                        Command::ConfirmInvitationActions { account, events, action } => (|| {
+                            if exiting { return Err("Tomlook is stopping; no calendar write was submitted".into()); }
+                            if options.demo.is_some() { return Err("Preview never changes a live calendar".into()); }
+                            if store.calendar_owner()?.as_deref() != Some(account.as_str()) {
+                                return Err("Calendar account changed before confirmation".into());
+                            }
+                            let sdk = sdk.as_ref().filter(|sdk| sdk.workiq_ready.load(Ordering::Acquire)
+                                && !sdk.terminated.load(Ordering::Acquire))
+                                .ok_or("Connect WorkIQ before confirming a calendar change")?;
+                            invitation_queue.bulk_events(&account, &events, action, &calendar, &sync_days)?;
+                            let mut failures = Vec::new();
+                            let mut operations = Vec::new();
+                            for event in events {
+                                let outcome = store.save_calendar_event(&event, &account).and_then(|next| {
+                                    calendar = Arc::new(next);
+                                    dirty = true;
+                                    let operation = manual_calendar_operation(&mut store, &mut inbox, event.clone(), &account, action.change(), now)?;
+                                    operations.push(approve_calendar_change(&mut store, &mut inbox, &mut inbox_revision, operation)?);
+                                    Ok(())
+                                });
+                                if let Err(error) = outcome { failures.push(format!("{}: {error}", event.title)); }
+                            }
+                            notify(Notice::Loaded { calendar: calendar.clone(), preferences: Box::new(preferences.clone()), calendar_owner: store.calendar_owner()? });
+                            if !operations.is_empty() {
+                                dispatch_calendar_changes(&store, &mut inbox, sdk, operations, &calendar_result_sender, &wake)?;
+                            }
+                            if !failures.is_empty() {
+                                return Err(format!("{} invitation actions could not be started. {}. Review individual outcomes in Messages.",
+                                    failures.len(), failures[0]));
+                            }
+                            Ok(())
                         })(),
                         Command::DismissRecommendation(id) => (|| {
                             let mut keys = std::collections::BTreeSet::new();
@@ -3218,6 +3302,61 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn invitation_bulk_dispatch_persists_each_approval_and_uses_one_executor_slot_for_the_whole_batch() {
+        use crate::recommendations::State;
+        for full in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut store = Store::open(root.path()).unwrap();
+            store.save_workiq_calendar(&Calendar::build(vec![], [chrono::Local::now().date_naive()].into(), vec![]).unwrap(), "owner").unwrap();
+            let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+            let sdk = Sdk {
+                commands, ready: Arc::new(AtomicBool::new(true)), occupied: Arc::new(AtomicUsize::new(0)),
+                terminated: Arc::new(AtomicBool::new(false)), analysis_revision: Arc::new(Default::default()),
+                workiq_ready: Arc::new(AtomicBool::new(true)),
+            };
+            if full { sdk.commands.try_send(ai::Command::RefreshCalendarAvailability).unwrap(); }
+            let (reply, _) = tokio::sync::mpsc::channel(1);
+            let (wake, _) = std::sync::mpsc::sync_channel(1);
+            let mut inbox = Default::default();
+            let mut revision = 0;
+            let mut operations = Vec::new();
+            for index in 0..80 {
+                let mut event = crate::calendar::fixture(1).remove(0);
+                event.id = format!("bulk-invitation-{index}");
+                event.status = "notResponded".into();
+                event.extra.insert("isOrganizer".into(), serde_json::json!(false));
+                event.extra.insert("type".into(), serde_json::json!("singleInstance"));
+                let action = if index % 2 == 0 { crate::invitations::BulkAction::Decline } else { crate::invitations::BulkAction::Follow };
+                let operation = manual_calendar_operation(&mut store, &mut inbox, event, "owner",
+                    action.change(), chrono::Local::now().fixed_offset()).unwrap();
+                operations.push(approve_calendar_change(&mut store, &mut inbox, &mut revision, operation).unwrap());
+            }
+            assert_eq!(revision, 80);
+            for operation in &operations {
+                assert_eq!(store.calendar_approval(&operation.recommendation.id).unwrap().change, operation.change);
+                assert_eq!(inbox[&operation.recommendation.id].state, State::Dispatching);
+            }
+            let result = dispatch_calendar_changes(&store, &mut inbox, &sdk, operations, &reply, &wake);
+            if full {
+                assert!(result.is_err());
+                assert!(inbox.values().all(|record| record.state == State::NotSent));
+                assert!(store.recommendations().unwrap().values().all(|record| record.state == State::NotSent));
+                assert!(matches!(receiver.try_recv().unwrap(), ai::Command::RefreshCalendarAvailability));
+            } else {
+                result.unwrap();
+                let ai::Command::CalendarChanges { operations, .. } = receiver.try_recv().unwrap()
+                    else { panic!("All invitations must use a single serialized executor command"); };
+                assert_eq!(operations.len(), 80);
+                assert!(operations.iter().all(|operation| operation.validate("owner").is_ok()));
+                let event = operations[0].event.clone();
+                assert!(manual_calendar_operation(&mut store, &mut inbox, event, "owner",
+                    operations[0].change.clone(), chrono::Local::now().fixed_offset()).is_err());
+            }
+            assert!(receiver.try_recv().is_err());
+        }
     }
 
     #[test]

@@ -253,6 +253,28 @@ pub enum LocalAction {
     RemoveGroup(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BulkAction { Decline, Follow }
+
+impl BulkAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Decline => "Decline without sending",
+            Self::Follow => "Follow selected invitations",
+        }
+    }
+
+    pub fn change(self) -> crate::recommendations::Change {
+        match self {
+            Self::Decline => crate::recommendations::Change::Respond {
+                response: crate::recommendations::MeetingResponse::Decline,
+                comment: String::new(), send_response: false, category: None,
+            },
+            Self::Follow => crate::recommendations::Change::Follow(true),
+        }
+    }
+}
+
 pub enum Command {
     Local { account: String, action: LocalAction },
     Open { account: String, key: String },

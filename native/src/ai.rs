@@ -84,6 +84,11 @@ pub enum Command {
         reply: async_mpsc::Sender<CalendarResult>,
         wake: std::sync::mpsc::SyncSender<crate::worker::Command>,
     },
+    CalendarChanges {
+        operations: Vec<crate::recommendations::Operation>,
+        reply: async_mpsc::Sender<CalendarResult>,
+        wake: std::sync::mpsc::SyncSender<crate::worker::Command>,
+    },
     ConnectExternal {
         kind: crate::connectors::Kind,
         input: crate::connectors::Input,
@@ -761,6 +766,53 @@ async fn connect_ai(root: &std::path::Path) -> Result<Arc<Harness>, String> {
     }
 }
 
+async fn run_calendar_changes(
+    api: Option<&impl crate::workiq::connection::calendar_write::Api>,
+    operations: Vec<crate::recommendations::Operation>,
+    verify_only: bool,
+    telemetry: &crate::telemetry::Service,
+    reply: &async_mpsc::Sender<CalendarResult>,
+    wake: &std::sync::mpsc::SyncSender<crate::worker::Command>,
+) -> Result<(), String> {
+    use crate::workiq::connection::calendar_write::{self, Outcome};
+    if operations.is_empty() { return Err("No confirmed calendar changes were supplied".into()); }
+    for operation in operations {
+        let id = operation.recommendation.id.clone();
+        let outcome = match api {
+            Some(api) => {
+                telemetry.record("calendar", if verify_only { "readback_check_started" } else { "confirmed_write_started" }, None, 0);
+                let run = async {
+                    if verify_only { calendar_write::verify_only(api, &operation).await }
+                    else { calendar_write::execute(api, &operation).await }
+                };
+                match tokio::time::timeout(Duration::from_secs(180), run).await {
+                    Ok(outcome) => outcome,
+                    Err(_) if verify_only => Outcome::Review("Calendar verification timed out; no write was repeated".into()),
+                    Err(_) => Outcome::Review(calendar_write::UNCERTAIN.into()),
+                }
+            }
+            None if verify_only => Outcome::Review("Calendar verification is unavailable or busy; no write was repeated".into()),
+            None => Outcome::NotSent("Calendar writes are unavailable or busy; nothing was submitted".into()),
+        };
+        telemetry.record("calendar", match &outcome {
+            Outcome::Applied(_) | Outcome::Removed(_) => "write_readback_verified",
+            Outcome::NotSent(_) => "write_not_submitted_or_rejected",
+            Outcome::Stale(_) => "write_not_submitted_meeting_changed",
+            Outcome::Review(_) => "write_outcome_requires_review",
+        }, None, 0);
+        if let Outcome::NotSent(message) = &outcome
+            && message.starts_with("Calendar provider rejected the write with HTTP ") {
+            telemetry.failure("calendar", message, None);
+        }
+        let result = tokio::time::timeout(Duration::from_secs(10), reply.send(CalendarResult { id, outcome })).await
+            .map_err(|_| "Confirmed calendar outcome delivery timed out".to_owned())
+            .and_then(|result| result.map_err(|_| "Confirmed calendar outcome could not reach storage".to_owned()));
+        let _ = wake.try_send(crate::worker::Command::Wake);
+        result?;
+    }
+    Ok(())
+}
+
 impl Engine {
     pub fn start(root: PathBuf, demo: bool, context: egui::Context) -> Result<Self, String> {
         let (commands, mut input) = async_mpsc::channel(64);
@@ -1262,48 +1314,22 @@ impl Engine {
                                         Completion::CalendarDelivered { admitted, result }
                                     });
                                 }
-                                Some(Command::CalendarChange { operation, verify_only, reply, wake }) => {
+                                Some(command @ (Command::CalendarChange { .. } | Command::CalendarChanges { .. })) => {
+                                    let (operations, verify_only, reply, wake) = match command {
+                                        Command::CalendarChange { operation, verify_only, reply, wake } =>
+                                            (vec![*operation], verify_only, reply, wake),
+                                        Command::CalendarChanges { operations, reply, wake } => (operations, false, reply, wake),
+                                        _ => unreachable!(),
+                                    };
                                     let connection = workiq.clone().filter(|connection| !demo && !calendar_mutating
-                                        && connection.is_active() && connection.account == operation.recommendation.account);
+                                        && connection.is_active() && operations.first()
+                                            .is_some_and(|operation| connection.account == operation.recommendation.account));
                                     let admitted = connection.is_some();
                                     if admitted { calendar_mutating = true; }
                                     let telemetry = telemetry.clone();
                                     tasks.spawn(async move {
-                                        let id = operation.recommendation.id.clone();
-                                        let outcome = match connection {
-                                            Some(connection) => {
-                                                telemetry.record("calendar", if verify_only { "readback_check_started" } else { "confirmed_write_started" }, None, 0);
-                                                let run = async {
-                                                    if verify_only {
-                                                        crate::workiq::connection::calendar_write::verify_only(connection.as_ref(), &operation).await
-                                                    } else {
-                                                        crate::workiq::connection::calendar_write::execute(connection.as_ref(), &operation).await
-                                                    }
-                                                };
-                                                match tokio::time::timeout(Duration::from_secs(180), run).await {
-                                                    Ok(outcome) => outcome,
-                                                    Err(_) if verify_only => crate::workiq::connection::calendar_write::Outcome::Review("Calendar verification timed out; no write was repeated".into()),
-                                                    Err(_) => crate::workiq::connection::calendar_write::Outcome::Review(crate::workiq::connection::calendar_write::UNCERTAIN.into()),
-                                                }
-                                            }
-                                            None if verify_only => crate::workiq::connection::calendar_write::Outcome::Review("Calendar verification is unavailable or busy; no write was repeated".into()),
-                                            None => crate::workiq::connection::calendar_write::Outcome::NotSent("Calendar writes are unavailable or busy; nothing was submitted".into()),
-                                        };
-                                        telemetry.record("calendar", match &outcome {
-                                            crate::workiq::connection::calendar_write::Outcome::Applied(_) |
-                                            crate::workiq::connection::calendar_write::Outcome::Removed(_) => "write_readback_verified",
-                                            crate::workiq::connection::calendar_write::Outcome::NotSent(_) => "write_not_submitted_or_rejected",
-                                            crate::workiq::connection::calendar_write::Outcome::Stale(_) => "write_not_submitted_meeting_changed",
-                                            crate::workiq::connection::calendar_write::Outcome::Review(_) => "write_outcome_requires_review",
-                                        }, None, 0);
-                                        if let crate::workiq::connection::calendar_write::Outcome::NotSent(message) = &outcome
-                                            && message.starts_with("Calendar provider rejected the write with HTTP ") {
-                                            telemetry.failure("calendar", message, None);
-                                        }
-                                        let result = tokio::time::timeout(Duration::from_secs(10), reply.send(CalendarResult { id, outcome })).await
-                                            .map_err(|_| "Confirmed calendar outcome delivery timed out".to_owned())
-                                            .and_then(|result| result.map_err(|_| "Confirmed calendar outcome could not reach storage".to_owned()));
-                                        let _ = wake.try_send(crate::worker::Command::Wake);
+                                        let result = run_calendar_changes(connection.as_deref(), operations, verify_only,
+                                            &telemetry, &reply, &wake).await;
                                         Completion::CalendarDelivered { admitted, result }
                                     });
                                 }
@@ -4239,6 +4265,123 @@ mod live_source_tests {
 #[cfg(test)]
 mod prompt_tests {
     use super::*;
+
+    struct BulkCalendarApi {
+        events: Mutex<BTreeMap<String, Event>>,
+        submitted: Mutex<Vec<String>>,
+        active: AtomicUsize,
+        uncertain: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::workiq::connection::calendar_write::Api for BulkCalendarApi {
+        fn account(&self) -> &str { "owner" }
+        async fn schema(&self, _: bool) -> Result<(), String> { Ok(()) }
+        async fn capability(&self, _: &crate::recommendations::Change) -> Result<(), String> { Ok(()) }
+        async fn event(&self, id: &str) -> Result<Event, String> {
+            self.events.lock().unwrap().get(id).cloned().ok_or("Removed".into())
+        }
+        async fn calendar(&self, _: crate::workiq::connection::Range) -> Result<crate::calendar::Calendar, String> {
+            panic!("Follow and decline must not require a full calendar read")
+        }
+        async fn removed(&self, id: &str) -> Result<bool, String> {
+            Ok(!self.events.lock().unwrap().contains_key(id))
+        }
+        async fn submit(&self, operation: &crate::recommendations::Operation)
+            -> Result<String, crate::workiq::connection::calendar_write::SubmissionError> {
+            use crate::recommendations::{Change, MeetingResponse};
+            assert_eq!(self.active.fetch_add(1, Ordering::SeqCst), 0, "Bulk writes must run sequentially");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            self.submitted.lock().unwrap().push(operation.event.id.clone());
+            let result = if self.uncertain && operation.event.id == "bulk-1" {
+                Err(crate::workiq::connection::calendar_write::SubmissionError::Unknown)
+            } else {
+                let mut events = self.events.lock().unwrap();
+                match &operation.change {
+                    Change::Follow(true) => {
+                        let event = events.get_mut(&operation.event.id).unwrap();
+                        let categories = crate::recommendations::follow_categories(event, true);
+                        event.category = categories.join(", ");
+                        event.extra.insert("categories".into(), serde_json::json!(categories));
+                        event.extra.insert("showAs".into(), serde_json::json!("free"));
+                    }
+                    Change::Respond { response: MeetingResponse::Decline, send_response: false, comment, category: None } => {
+                        assert!(comment.is_empty());
+                        events.remove(&operation.event.id);
+                    }
+                    _ => panic!("Only the two explicitly approved bulk actions may be submitted"),
+                }
+                Ok(operation.event.id.clone())
+            };
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+    }
+
+    fn bulk_calendar_operations() -> Vec<crate::recommendations::Operation> {
+        (0..4).map(|index| {
+            let mut event = crate::calendar::fixture(1).remove(0);
+            event.id = format!("bulk-{index}");
+            event.status = "notResponded".into();
+            event.extra.insert("type".into(), serde_json::json!("occurrence"));
+            event.extra.insert("isOrganizer".into(), serde_json::json!(false));
+            let action = if index % 2 == 0 { crate::invitations::BulkAction::Decline } else { crate::invitations::BulkAction::Follow };
+            let change = action.change();
+            let mut recommendation = crate::recommendations::Recommendation::from_manual(
+                &event, "owner", change.clone(), Local::now().fixed_offset()).unwrap();
+            recommendation.state = crate::recommendations::State::Dispatching;
+            crate::recommendations::Operation { event, change, recommendation }
+        }).collect()
+    }
+
+    #[tokio::test]
+    async fn invitation_bulk_executor_serializes_all_writes_and_delivers_each_verified_or_uncertain_outcome_once() {
+        use crate::workiq::connection::calendar_write::Outcome;
+        for uncertain in [false, true] {
+            let operations = bulk_calendar_operations();
+            let api = BulkCalendarApi {
+                events: Mutex::new(operations.iter().map(|operation| (operation.event.id.clone(), operation.event.clone())).collect()),
+                submitted: Default::default(), active: AtomicUsize::new(0), uncertain,
+            };
+            let root = tempfile::tempdir().unwrap();
+            let telemetry = crate::telemetry::Service::open(root.path()).unwrap();
+            let (reply, mut results) = async_mpsc::channel(4);
+            let (wake, _) = mpsc::sync_channel(1);
+            run_calendar_changes(Some(&api), operations.clone(), false, &telemetry, &reply, &wake).await.unwrap();
+            assert_eq!(*api.submitted.lock().unwrap(), ["bulk-0", "bulk-1", "bulk-2", "bulk-3"]);
+            for (index, operation) in operations.iter().enumerate() {
+                let result = results.try_recv().unwrap();
+                assert_eq!(result.id, operation.recommendation.id);
+                match result.outcome {
+                    Outcome::Removed(id) => assert_eq!(id, operation.event.id),
+                    Outcome::Applied(event) => {
+                        assert!(event.following());
+                        assert_eq!(event.status, "notResponded");
+                        assert_eq!(event.extra["showAs"], "free");
+                    }
+                    Outcome::Review(_) => assert!(uncertain && index == 1),
+                    outcome => panic!("Every selected invitation must be executed, not rejected as busy: {outcome:?}"),
+                }
+            }
+            assert!(results.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn invitation_bulk_executor_stops_before_more_writes_if_outcomes_cannot_reach_storage() {
+        let operations = bulk_calendar_operations();
+        let api = BulkCalendarApi {
+            events: Mutex::new(operations.iter().map(|operation| (operation.event.id.clone(), operation.event.clone())).collect()),
+            submitted: Default::default(), active: AtomicUsize::new(0), uncertain: false,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let telemetry = crate::telemetry::Service::open(root.path()).unwrap();
+        let (reply, results) = async_mpsc::channel(1);
+        drop(results);
+        let (wake, _) = mpsc::sync_channel(1);
+        assert!(run_calendar_changes(Some(&api), operations, false, &telemetry, &reply, &wake).await.is_err());
+        assert_eq!(*api.submitted.lock().unwrap(), ["bulk-0"]);
+    }
 
     #[test]
     fn hidden_chat_retains_every_bounded_turn_completion() {

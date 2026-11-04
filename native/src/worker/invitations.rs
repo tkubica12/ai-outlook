@@ -225,6 +225,33 @@ impl Queue {
         Ok(None)
     }
 
+    pub fn bulk_events(&self, account: &str, events: &[Event], action: model::BulkAction,
+        calendar: &Calendar, freshness: &crate::calendar_sync::Freshness,
+    ) -> Result<(), String> {
+        if self.blocked || self.book.account != account {
+            return Err("Invitation queue belongs to a different calendar account".into());
+        }
+        if events.is_empty() || events.len() > model::RECORD_LIMIT {
+            return Err("Select between 1 and 2,000 invitations".into());
+        }
+        let now = Utc::now();
+        let mut keys = std::collections::BTreeSet::new();
+        for event in events {
+            let key = model::key(event);
+            if !keys.insert(key.clone()) { return Err("An invitation was selected more than once".into()); }
+            let record = self.book.records.get(&key).ok_or("Invitation is no longer pending")?;
+            let current = if let Some(since) = self.book.refreshed_at {
+                model::current(&record.event, calendar, freshness, since, now)
+                    .ok_or("Invitation is no longer pending")?
+            } else { &record.event };
+            if !model::pending(current, now) || crate::scheduler::fingerprint(current) != crate::scheduler::fingerprint(event) {
+                return Err("Selected invitations changed; close this dialog and select them again".into());
+            }
+            crate::recommendations::validate_manual_change(event, &action.change())?;
+        }
+        Ok(())
+    }
+
     pub fn verified(&mut self, store: &Store, event: &Event) -> Result<(), String> {
         // Even a newly seen invitation can have been included in a read that is still in flight.
         self.pending = Default::default();
@@ -282,6 +309,39 @@ mod tests {
         let mut queue = Queue::default();
         queue.load(store, Some(ACCOUNT), &Calendar::default(), false).unwrap();
         queue
+    }
+
+    #[test]
+    fn bulk_preflight_rejects_stale_duplicate_resolved_or_cross_account_selections() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::open(root.path()).unwrap();
+        let event = event();
+        let queue = loaded(&store, &event);
+        for action in [model::BulkAction::Decline, model::BulkAction::Follow] {
+            queue.bulk_events(ACCOUNT, std::slice::from_ref(&event), action, &Calendar::default(), &Default::default()).unwrap();
+            assert!(queue.bulk_events(ACCOUNT, &[], action, &Calendar::default(), &Default::default()).is_err());
+            assert!(queue.bulk_events("different@internal.example", std::slice::from_ref(&event), action, &Calendar::default(), &Default::default()).is_err());
+            assert!(queue.bulk_events(ACCOUNT, &[event.clone(), event.clone()], action, &Calendar::default(), &Default::default()).is_err());
+            let mut changed = event.clone();
+            changed.title = "Changed after selection".into();
+            assert!(queue.bulk_events(ACCOUNT, &[changed], action, &Calendar::default(), &Default::default()).is_err());
+            let mut accepted = event.clone();
+            accepted.status = "accepted".into();
+            let day = accepted.calendar_dates().0;
+            let calendar = Calendar::build(vec![accepted], [day].into(), vec![]).unwrap();
+            let freshness = std::collections::BTreeMap::from([(day, Utc::now())]);
+            assert!(queue.bulk_events(ACCOUNT, std::slice::from_ref(&event), action, &calendar, &freshness).is_err());
+        }
+        let coverage = std::collections::BTreeSet::from([event.calendar_dates().0 - chrono::Duration::days(30)]);
+        store.save_workiq_calendar(&Calendar::build(vec![], coverage.clone(), vec![]).unwrap(), ACCOUNT).unwrap();
+        let staged = store.save_calendar_event(&event, ACCOUNT).unwrap();
+        assert_eq!(staged.coverage, coverage, "Filtered invitation metadata must not establish full-calendar coverage");
+        assert_eq!(queue.book.records.len(), 1, "Preflight never resolves an invitation");
+        assert_eq!(model::BulkAction::Decline.change(), crate::recommendations::Change::Respond {
+            response: crate::recommendations::MeetingResponse::Decline, comment: String::new(),
+            send_response: false, category: None,
+        });
+        assert_eq!(model::BulkAction::Follow.change(), crate::recommendations::Change::Follow(true));
     }
 
     #[test]

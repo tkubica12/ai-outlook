@@ -177,8 +177,10 @@ pub fn validate_travel_parent(event: &Event) -> Result<(), String> {
         event,
         &crate::recommendations::Change::ClearCategory,
     )?;
-    if event.is_all_day || event.extra.get("isOrganizer").and_then(Value::as_bool) != Some(true) {
-        return Err("Travel blocks require your own timed meeting".into());
+    let organizer = event.extra.get("isOrganizer").and_then(Value::as_bool);
+    if event.is_all_day || !matches!(organizer, Some(true) | Some(false))
+        || (organizer == Some(false) && (!event.accepted() || event.organizer.is_empty())) {
+        return Err("Travel blocks require your own timed meeting or an accepted invitation".into());
     }
     if !matches!(
         event.extra.get("sensitivity").and_then(Value::as_str),
@@ -696,7 +698,7 @@ pub(crate) mod tests {
                 .id
         );
         for (field, value) in [
-            ("isOrganizer", json!(false)),
+            ("isOrganizer", Value::Null),
             ("type", json!("seriesMaster")),
             ("sensitivity", Value::Null),
             ("isCancelled", json!(true)),
@@ -705,6 +707,7 @@ pub(crate) mod tests {
             invalid.extra.insert(field.into(), value);
             assert!(Record::travel("owner".into(), invalid, 30, Language::En).is_err());
         }
+
         let mut all_day = event;
         all_day.is_all_day = true;
         assert!(Record::travel("owner".into(), all_day, 30, Language::En).is_err());
@@ -722,6 +725,26 @@ pub(crate) mod tests {
                     .all(|part| part.private == (sensitivity != "normal"))
             );
         }
+    }
+
+    #[test]
+    fn accepted_invitation_travel_is_personal_and_requires_a_verified_timed_parent() {
+        let mut event = parent();
+        event.status = "accepted".into();
+        event.organizer = "Organizer <organizer@example.com>".into();
+        event.extra.insert("isOrganizer".into(), json!(false));
+        event.extra.insert("type".into(), json!("occurrence"));
+        let record = Record::travel("owner".into(), event.clone(), 30, Language::En).unwrap();
+        record.validate().unwrap();
+        assert_eq!(record.parts().len(), 2);
+        assert!(record.parts().iter().all(|part| part.attendees.is_empty() && part.private && !part.teams));
+        for status in ["notResponded", "tentativelyAccepted", "declined"] {
+            let mut invalid = event.clone();
+            invalid.status = status.into();
+            assert!(Record::travel("owner".into(), invalid, 30, Language::En).is_err());
+        }
+        event.is_all_day = true;
+        assert!(Record::travel("owner".into(), event, 30, Language::En).is_err());
     }
 
     #[test]

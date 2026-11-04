@@ -147,6 +147,13 @@ before publication in an account-hashed `invitation-inbox-v1` settings entry.
 Verified calendar responses/removals update the book immediately and invalidate
 older queue reads so they cannot restore resolved requests.
 
+Bulk invitation actions bind the selected occurrence snapshots and account in
+one confirmation. The worker revalidates the entire selection, stages event
+metadata without extending coverage and persists each ordinary calendar-write
+approval. One executor command runs the approved writes sequentially under the
+calendar mutation guard, with a separate verified outcome per occurrence.
+Queue failures remain NotSent; uncertain writes are never replayed.
+
 Pure local classification reuses user-confirmed customer domains and explicit
 team/organizer/series choices. External-domain evidence remains unconfirmed.
 The UI focuses a staged cached occurrence and temporarily overrides display

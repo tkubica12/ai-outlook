@@ -84,6 +84,7 @@ impl Tomlook {
             });
         if !slash_menu && consume(Modifiers::NONE, Key::Escape) {
             if self.event_draft.take().is_some()
+                || self.invitations.bulk.take().is_some()
                 || self.blocker_release.take().is_some()
                 || self.find_time.take().is_some()
                 || self.time_drag.take().is_some()
@@ -154,6 +155,7 @@ impl Tomlook {
             || self.customers.confirm.is_some()
             || self.meeting_action.is_some()
             || self.event_draft.is_some()
+            || self.invitations.bulk.is_some()
             || self.find_time.is_some()
             || self.blocker_release.is_some()
             || self.meeting_menu.is_some()

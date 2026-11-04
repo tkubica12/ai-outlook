@@ -809,7 +809,7 @@ impl Tomlook {
             self.poll_editor_lookups(context, &mut draft);
         }
         let body_height = (context.content_rect().height() - 230.0).max(260.0);
-        egui::Window::new(language.text(if travel_only { "Add travel blocks before and after" } else { "New event" }))
+        egui::Window::new(language.text(if travel_only { "Add travel blocks" } else { "New event" }))
             .id(Id::new("create-calendar-event")).open(&mut open)
             .default_width(500.0).resizable(false).collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
@@ -1007,6 +1007,7 @@ impl Tomlook {
 
     pub(super) fn select_event_time(&mut self, ui: &mut egui::Ui, day: NaiveDate, rect: egui::Rect, cards: &[egui::Rect]) {
         if self.event_draft.is_some() || self.meeting_action.is_some() || self.meeting_menu.is_some()
+            || self.invitations.bulk.is_some()
             || self.find_time.is_some() || self.blocker_release.is_some()
             || self.messages_open || self.settings || self.preferences_open || self.connection_panel.is_some() || self.palette {
             return;

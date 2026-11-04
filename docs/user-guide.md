@@ -93,6 +93,19 @@ dialog, including colored category choices, conflict review and explicit
 confirmation. A recurring series has one row for its next pending occurrence;
 responses concern **that occurrence only**, not the entire series.
 
+Use the checkboxes to select several invitations in **Important**, **Other**,
+or **Snoozed** without opening them. Ctrl+click toggles a row; Shift+click
+extends the selection from the last marked row. **Select page** marks the
+current page, and the selection is retained across pages of the same tab.
+Changing tabs or returning to Calendar clears it. Right-click a selected row
+(or use **Selected invitation actions**) to **Decline without sending** or
+**Follow selected invitations**. Right-clicking an unselected row targets only
+that row. Both bulk actions show the exact list and require one confirmation;
+neither notifies organizers. Follow preserves other categories and the existing
+invitation response, and marks each listed occurrence as free. Each result uses
+the normal verified calendar-write path and appears separately in **Messages**;
+failed or uncertain changes are not retried automatically.
+
 Priority is deterministic, without AI:
 
 - Confirmed customer-domain matches, highlighted organizers and organizers
@@ -147,7 +160,7 @@ Right-click a meeting, press **Shift+F10**, or use **Meeting actions**:
 | Accept / Tentative / Decline | Confirmation with optional comment and a "send response" choice; Accept also offers category chips. Decline defaults to not notifying the organizer. |
 | Cancel meeting | Organizer only; notifies attendees after confirmation. |
 | Delete | Only your own appointments without attendees, after confirmation. |
-| **Add travel blocks before and after** | Your own timed meetings: two adjacent busy blocks (15–180 minutes, default 30) after confirmation. |
+| **Add travel blocks** | Your own timed meetings or accepted invitations: a simple dialog with one duration slider (15–180 minutes, default 30) creates two adjacent busy blocks after confirmation. The meeting stays unchanged and nobody is notified. |
 | **Find another time with these people** | Opens Find a time with the meeting's people, title and duration. |
 
 Only single events, occurrences and exceptions can be changed; series masters

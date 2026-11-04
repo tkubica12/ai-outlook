@@ -200,17 +200,15 @@ impl Tomlook {
                 ui.close();
             }
         });
-        if event.extra.get("isOrganizer").and_then(serde_json::Value::as_bool) == Some(true) {
-            let validation = tomlook::event_creation::validate_travel_parent(event);
-            let response = ui.add_enabled(ready && validation.is_ok(),
-                egui::Button::new(language.text("Add travel blocks before and after")));
-            if response.clicked() {
-                self.open_travel_draft(event.clone());
-                self.meeting_menu = None;
-                ui.close();
-            } else if let Err(error) = validation {
-                response.on_hover_text(language.text(&error));
-            }
+        let travel_validation = tomlook::event_creation::validate_travel_parent(event);
+        let travel_response = ui.add_enabled(ready && travel_validation.is_ok(),
+            egui::Button::new(language.text("Add travel blocks")));
+        if travel_response.clicked() {
+            self.open_travel_draft(event.clone());
+            self.meeting_menu = None;
+            ui.close();
+        } else if let Err(error) = travel_validation {
+            travel_response.on_disabled_hover_text(language.text(&error));
         }
         if self.has_other_people(event)
             && ui.button(language.text("Find another time with these people"))

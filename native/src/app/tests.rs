@@ -35,6 +35,149 @@ fn invitation_fixture(language: tomlook::i18n::Language) -> (
     (app, receiver, ai, row)
 }
 
+fn bulk_invitation_fixture(language: tomlook::i18n::Language, other: bool) -> (
+    Tomlook, mpsc::Receiver<Command>, tokio::sync::mpsc::Receiver<ai::Command>,
+) {
+    let (mut app, receiver, ai, row) = invitation_fixture(language);
+    let mut second = row.event.clone();
+    second.id = "second-invitation".into();
+    second.title = "Second invitation".into();
+    second.extra.insert("type".into(), serde_json::json!("occurrence"));
+    let mut book = (*app.activity.invitations.book).clone();
+    book.replace(vec![row.event, second], chrono::Utc::now()).unwrap();
+    if other {
+        book.organizers.insert("organizer@customer.example".into(), tomlook::invitations::OrganizerRule::Quiet);
+    }
+    Arc::make_mut(&mut app.activity).invitations = Arc::new(tomlook::invitations::snapshot(
+        Arc::new(book), &Default::default(), &Default::default(), None, &Default::default(),
+        Default::default(), Default::default(), chrono::Utc::now()));
+    app.open_invitations();
+    (app, receiver, ai)
+}
+
+fn invitation_list_and_bulk_dialog(app: &mut Tomlook, ui: &mut egui::Ui) {
+    ui.set_width(300.0);
+    app.invitation_sidebar(ui);
+    app.invitation_bulk_dialog(ui.ctx());
+}
+
+fn invitation_pointer_click(context: &egui::Context, app: &mut Tomlook, label: &str,
+    button: egui::PointerButton, modifiers: Modifiers, checkbox: bool,
+) {
+    let output = draw_with(context, app, vec![], &invitation_list_and_bulk_dialog);
+    let point = output.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text == label => Some(if checkbox {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if (8.0..=24.0).contains(&rect.rect.width())
+                    && rect.rect.right() < text.pos.x && rect.rect.center().y >= text.pos.y
+                    && rect.rect.center().y <= text.pos.y + 24.0 => Some(rect.rect.center()),
+                _ => None,
+            }).unwrap_or_else(|| panic!("Missing checkbox for {label}"))
+        } else { text.pos + text.galley.size() * 0.5 }),
+        _ => None,
+    }).unwrap_or_else(|| panic!("Missing invitation: {label}"));
+    for pressed in [true, false] {
+        let mut output = context.run_ui(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 2400.0))),
+            events: vec![egui::Event::ModifiersChanged(modifiers), egui::Event::PointerMoved(point),
+                egui::Event::PointerButton { pos: point, button, pressed, modifiers }],
+            ..Default::default()
+        }, |ui| invitation_list_and_bulk_dialog(app, ui));
+        output.textures_delta.clear();
+    }
+}
+
+#[test]
+fn invitation_bulk_actions_confirm_exact_pending_occurrences_in_important_and_other_without_ai() {
+    use tomlook::invitations::BulkAction;
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        for other in [false, true] {
+            for action in [BulkAction::Decline, BulkAction::Follow] {
+                let (mut app, receiver, mut ai) = bulk_invitation_fixture(language, other);
+                let context = egui::Context::default();
+                let show: Show = &invitation_list_and_bulk_dialog;
+                settled(&context, &mut app, show);
+                if other {
+                    click_text(&context, &mut app, show, &format!("{} 2", language.text("Other")));
+                }
+                click_text(&context, &mut app, show, language.text("Select page").as_ref());
+                assert_eq!(app.invitations.marked.len(), 2);
+                assert!(app.invitations.selected.is_none(), "Bulk selection must not open/stage a meeting");
+                invitation_pointer_click(&context, &mut app, "Invitation fixture", egui::PointerButton::Secondary, Modifiers::NONE, false);
+                assert_eq!(app.invitations.marked.len(), 2, "Right-click a marked row preserves the complete selection");
+                click_text(&context, &mut app, show, language.text(action.label()).as_ref());
+                let text = settled(&context, &mut app, show);
+                assert!(text.contains("Invitation fixture") && text.contains("Second invitation"));
+                assert!(receiver.try_recv().is_err(), "Previewing is not approval");
+                click_text(&context, &mut app, show, language.text("Confirm for all selected invitations").as_ref());
+                let Command::ConfirmInvitationActions { account, events, action: submitted } = receiver.try_recv().unwrap()
+                    else { panic!("One explicitly confirmed batch is required"); };
+                assert_eq!(account, "owner@internal.example");
+                assert_eq!(submitted, action);
+                assert_eq!(events.len(), 2);
+                assert!(events.iter().any(|event| event.extra["type"] == "occurrence"));
+                assert!(events.iter().all(|event| event.status == "notResponded"));
+                assert!(app.invitations.marked.is_empty() && app.invitations.bulk.is_none());
+                assert!(app.messages_open);
+                assert!(receiver.try_recv().is_err());
+                assert!(ai.try_recv().is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn invitation_bulk_selection_checkboxes_modifiers_and_unselected_context_target_the_correct_rows() {
+    let (mut app, receiver, mut ai) = bulk_invitation_fixture(tomlook::i18n::Language::En, false);
+    let context = egui::Context::default();
+    let show: Show = &invitation_list_and_bulk_dialog;
+    settled(&context, &mut app, show);
+    invitation_pointer_click(&context, &mut app, "Invitation fixture", egui::PointerButton::Primary, Modifiers::NONE, true);
+    assert_eq!(app.invitations.marked.len(), 1, "Checkbox selection failed; opened row: {:?}", app.invitations.selected);
+    assert!(app.invitations.selected.is_none(), "Checkboxes must not also open the row");
+    invitation_pointer_click(&context, &mut app, "Second invitation", egui::PointerButton::Primary, Modifiers::SHIFT, false);
+    assert_eq!(app.invitations.marked.len(), 2);
+    invitation_pointer_click(&context, &mut app, "Second invitation", egui::PointerButton::Primary, Modifiers::CTRL, false);
+    assert_eq!(app.invitations.marked.len(), 1);
+    invitation_pointer_click(&context, &mut app, "Second invitation", egui::PointerButton::Secondary, Modifiers::NONE, false);
+    assert_eq!(app.invitations.marked, BTreeSet::from([tomlook::invitations::key(
+        &app.activity.invitations.rows.iter().find(|row| row.event.title == "Second invitation").unwrap().event)]));
+    assert!(app.invitations.selected.is_none());
+    assert!(receiver.try_recv().is_err());
+    assert!(ai.try_recv().is_err());
+}
+
+#[test]
+fn invitation_bulk_confirmation_blocks_changed_account_or_event_and_preserves_a_full_local_queue() {
+    for case in 0..4 {
+        let (mut app, receiver, _) = bulk_invitation_fixture(tomlook::i18n::Language::En, false);
+        let context = egui::Context::default();
+        let show: Show = &invitation_list_and_bulk_dialog;
+        settled(&context, &mut app, show);
+        click_text(&context, &mut app, show, "Select page");
+        click_text(&context, &mut app, show, "Selected invitation actions");
+        click_text(&context, &mut app, show, "Decline without sending");
+        settled(&context, &mut app, show);
+        match case {
+            0 => app.calendar_owner = Some("different@internal.example".into()),
+            1 => Arc::make_mut(&mut Arc::make_mut(&mut app.activity).invitations).rows[0].event.title = "Changed".into(),
+            2 => app.workiq_ready = false,
+            _ => {
+                for _ in 0..16 { app.worker.as_ref().unwrap().commands.try_send(Command::Wake).unwrap(); }
+            }
+        }
+        click_text(&context, &mut app, show, "Confirm for all selected invitations");
+        assert!(app.invitations.bulk.is_some(), "An unsubmitted approval must remain reviewable");
+        assert!(receiver.try_iter().all(|command| matches!(command, Command::Wake)));
+        assert!(!app.messages_open);
+        if case == 3 { assert!(app.error.as_ref().unwrap().contains("Local queue is full")); }
+        draw_with(&context, &mut app, vec![egui::Event::Key {
+            key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE,
+        }], &|app, ui| app.shortcuts(ui.ctx()));
+        assert!(app.invitations.bulk.is_none());
+    }
+}
+
 #[test]
 fn invitation_queue_focuses_uncached_requests_despite_filters_and_reuses_the_existing_category_approval() {
     use tomlook::recommendations::{Change, MeetingResponse};
@@ -242,9 +385,16 @@ fn invitation_queue_paints_only_a_bounded_page_even_with_hundreds_of_pending_req
     let sidebar: Show = &|app, ui| { ui.set_width(300.0); app.sidebar(ui); };
     let text = settled(&context, &mut app, sidebar);
     assert!(text.contains("Request 000") && !text.contains("Request 040"), "{text}");
+    click_text(&context, &mut app, sidebar, "Select page");
+    assert_eq!(app.invitations.marked.len(), 40);
     click_text(&context, &mut app, sidebar, ">");
     let text = settled(&context, &mut app, sidebar);
     assert!(text.contains("Request 040") && !text.contains("Request 000"), "{text}");
+    assert_eq!(app.invitations.marked.len(), 40);
+    click_text(&context, &mut app, sidebar, "Select page");
+    assert_eq!(app.invitations.marked.len(), 80);
+    click_text(&context, &mut app, sidebar, "Other 0");
+    assert!(app.invitations.marked.is_empty(), "Changing tabs must not leave invisible bulk targets");
 }
 
 #[test]
@@ -725,8 +875,11 @@ fn tentative_hatching_is_neutral_in_both_themes_and_notes_show_personal_evidence
 }
 
 #[test]
-fn right_click_owned_meeting_opens_paired_travel_confirmation_and_never_recreates_the_meeting() {
-    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+fn right_click_meeting_opens_paired_travel_confirmation_and_never_recreates_the_meeting() {
+    for (language, organizer) in [
+        (tomlook::i18n::Language::En, true), (tomlook::i18n::Language::Cs, true),
+        (tomlook::i18n::Language::En, false), (tomlook::i18n::Language::Cs, false),
+    ] {
         let (mut app, _, mut ai_commands) = assistant_fixture();
         let (sender, receiver) = mpsc::sync_channel(16);
         app.worker = Some(Worker {
@@ -739,7 +892,8 @@ fn right_click_owned_meeting_opens_paired_travel_confirmation_and_never_recreate
         event.title = "Existing owned meeting".into();
         event.is_all_day = false;
         event.extra.insert("type".into(), serde_json::json!("singleInstance"));
-        event.extra.insert("isOrganizer".into(), serde_json::json!(true));
+        event.extra.insert("isOrganizer".into(), serde_json::json!(organizer));
+        event.status = if organizer { "organizer" } else { "accepted" }.into();
         event.extra.insert("sensitivity".into(), serde_json::json!("private"));
         app.calendar = Arc::new(Calendar::build(vec![event.clone()], Default::default(), Vec::new()).unwrap());
         app.calendar_owner = Some("owner".into());
@@ -773,7 +927,7 @@ fn right_click_owned_meeting_opens_paired_travel_confirmation_and_never_recreate
                 egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
                 egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }]);
         };
-        click(&mut app, language.text("Add travel blocks before and after").as_ref());
+        click(&mut app, language.text("Add travel blocks").as_ref());
         let draft = app.event_draft.as_mut().unwrap();
         assert_eq!(draft.parent.as_ref().unwrap().id, event.id);
         assert_eq!(draft.travel_minutes, 30);
@@ -800,21 +954,22 @@ fn right_click_owned_meeting_opens_paired_travel_confirmation_and_never_recreate
 }
 
 #[test]
-fn travel_context_action_is_not_offered_for_attendee_meetings_and_escape_never_confirms() {
+fn travel_context_action_supports_accepted_invitations_and_escape_never_confirms() {
     let (mut app, _, mut commands) = assistant_fixture();
     let mut event = tomlook::calendar::fixture(1).remove(0);
     event.is_all_day = false;
     event.extra.insert("type".into(), serde_json::json!("singleInstance"));
     event.extra.insert("isOrganizer".into(), serde_json::json!(false));
     event.extra.insert("sensitivity".into(), serde_json::json!("normal"));
+    event.status = "accepted".into();
     app.calendar = Arc::new(Calendar::build(vec![event.clone()], Default::default(), Vec::new()).unwrap());
     let context = egui::Context::default();
     let mut output = context.run_ui(egui::RawInput::default(), |ui| app.meeting_actions(ui, 0));
     let mut text = String::new();
     for shape in &output.shapes { append_shape_text(&shape.shape, &mut text); }
     output.textures_delta.clear();
-    assert!(!text.contains("Add travel blocks before and after"));
-    event.extra.insert("isOrganizer".into(), serde_json::json!(true));
+    assert!(text.contains("Add travel blocks"));
+    assert!(tomlook::event_creation::validate_travel_parent(&event).is_ok());
     app.open_travel_draft(event);
     let mut output = context.run_ui(egui::RawInput {
         events: vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }],
