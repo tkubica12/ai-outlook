@@ -1795,8 +1795,8 @@ Vrať stručný závěr, datovaný seznam rezervací a finálních pozvánek, d�
         "AI je už připojená nebo se připojuje.",
     ),
     (
-        "Starting isolated SDK browser sign-in; no terminal or model request...",
-        "Spouštím přihlášení izolovaného SDK v prohlížeči. Bez terminálu a dotazu na AI…",
+        "Starting Copilot device sign-in; credentials stay encrypted in Tomlook...",
+        "Spouštím přihlášení k Copilotu pomocí kódu. Přihlašovací údaje budou v Tomlooku šifrované…",
     ),
     (
         "WorkIQ is connected or busy; disconnect before changing accounts.",
@@ -1837,8 +1837,8 @@ Vrať stručný závěr, datovaný seznam rezervací a finálních pozvánek, d�
         "WorkIQ je odpojené. Uložený kalendář zůstává dostupný a přihlašovací údaje byly uvolněny.",
     ),
     (
-        "AI sign-in finished; see the connection status.",
-        "Přihlašování k AI skončilo. Zkontrolujte stav připojení.",
+        "AI sign-in completed.",
+        "Přihlášení k AI proběhlo úspěšně.",
     ),
     ("Stopping...", "Ukončuji…"),
     (
@@ -2096,7 +2096,7 @@ Vrať stručný závěr, datovaný seznam rezervací a finálních pozvánek, d�
         "Aktualizace kalendáře čeká ve frontě…",
     ),
     (
-        "AI browser sign-in queued...",
+        "AI device sign-in queued...",
         "Přihlášení k AI čeká ve frontě…",
     ),
     ("Removing saved sign-in...", "Mažu uložené přihlášení…"),
@@ -3886,6 +3886,8 @@ Vrať stručný závěr, datovaný seznam rezervací a finálních pozvánek, d�
 ];
 
 const PATTERNS: &[(&str, &str)] = &[
+    ("Enter {} at github.com/login/device", "Zadejte kód {0} na github.com/login/device"),
+    ("AI sign-in failed: {}", "Přihlášení k AI selhalo: {0}"),
     (
         "Prompt suggestion exceeded its {}-second limit; retry explicitly",
         "Návrh promptu překročil limit {0} s; zkuste to znovu ručně.",
@@ -4306,6 +4308,15 @@ mod tests {
 
     #[test]
     fn recovery_connector_and_source_statuses_are_localized_without_changing_codes() {
+        assert_eq!(
+            Language::Cs.text("Enter ABCD-EFGH at github.com/login/device"),
+            "Zadejte kód ABCD-EFGH na github.com/login/device"
+        );
+        assert_eq!(
+            Language::Cs.text("AI sign-in failed: provider unavailable"),
+            "Přihlášení k AI selhalo: provider unavailable"
+        );
+        assert_eq!(Language::Cs.text("AI sign-in completed."), "Přihlášení k AI proběhlo úspěšně.");
         assert_eq!(
             Language::Cs
                 .text("WorkIQ connection interrupted.\nAutomatic reconnect in about 60 seconds."),

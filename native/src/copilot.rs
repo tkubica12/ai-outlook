@@ -311,8 +311,8 @@ pub struct Config {
     pub model: String,
     #[serde(default)]
     pub copilot_credential_env: Option<String>,
-    /// Use the login saved by `copilot login` inside Tomlook's own Copilot home.
-    /// Accepted only when the runtime reports a stored-user identity, never `gh`/env fallback.
+    /// Use Tomlook's own DPAPI-encrypted Copilot device-code sign-in.
+    /// Injected explicitly into the SDK, never resolved from shared `gh`/Copilot credentials.
     #[serde(default)]
     pub use_stored_login: bool,
     #[serde(default)]
@@ -543,9 +543,9 @@ fn accepted_identity(
         return Err("Tomlook's isolated profile is not signed in".into());
     }
     let kind = auth.auth_type.as_deref().unwrap_or("unknown");
-    if config.use_stored_login && kind != "user" {
+    if config.use_stored_login && kind != "token" {
         return Err(format!(
-            "Rejected '{kind}' identity; only Tomlook's own stored login is allowed"
+            "Rejected '{kind}' identity; only Tomlook's explicit encrypted sign-in is allowed"
         ));
     }
     if !config.use_stored_login && config.copilot_credential_env.is_none() {
@@ -591,11 +591,8 @@ fn authenticated_options(
     root: &Path,
     runtime: &Path,
     token: Option<String>,
-    stored_login: bool,
 ) -> ClientOptions {
     let mut options = isolated_options(root, runtime);
-    // Ambient token variables stay stripped; health() rejects any non-stored identity.
-    options.use_logged_in_user = Some(stored_login && token.is_none());
     if let Some(token) = token {
         // The SDK injects its explicit token before applying env_remove.
         options
@@ -1282,6 +1279,13 @@ impl Harness {
             }
             Ok(token)
         }).transpose()?;
+        let token = if config.use_stored_login {
+            Some(crate::copilot_auth::load(root).await?
+                .ok_or("No saved encrypted Copilot sign-in; sign in from Tomlook")?
+                .into_token())
+        } else {
+            token
+        };
         let analysis_revision = config.analysis_revision(&servers, token.as_deref())?;
         let mut secrets = token.iter().cloned().collect::<Vec<_>>();
         for server in servers.values() {
@@ -1299,8 +1303,7 @@ impl Harness {
             .map_err(|e| format!("Create isolated workspace: {e}"))?;
         std::fs::create_dir_all(root.join("copilot"))
             .map_err(|e| format!("Create isolated Copilot home: {e}"))?;
-        let mut options =
-            authenticated_options(root, &config.runtime, token, config.use_stored_login);
+        let mut options = authenticated_options(root, &config.runtime, token);
         if let Some(env) = &config.copilot_credential_env {
             options.env_remove.push(env.into());
         }
@@ -1769,118 +1772,17 @@ impl Harness {
     }
 
     pub async fn github_login(
-        &self,
-        mut cancelled: tokio::sync::watch::Receiver<bool>,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
-        progress: impl Fn(&str),
+        root: &Path,
+        config: &Config,
+        cancelled: tokio::sync::watch::Receiver<bool>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        progress: impl Fn(String),
     ) -> Result<(), String> {
-        use github_copilot_sdk::rpc::{
-            AuthLoginAdvanceRequest, AuthLoginBeginRequest, AuthLoginCancelRequest,
-            AuthLoginResultStatus, AuthLoginStep, LoginProviderKind,
-        };
-        if !self.config.use_stored_login || self.config.copilot_credential_env.is_some() {
-            return Err("Browser AI sign-in requires use_stored_login=true without copilot_credential_env in Tomlook connections.json".into());
+        config.validate()?;
+        if !config.use_stored_login || config.copilot_credential_env.is_some() {
+            return Err("AI device sign-in requires use_stored_login=true without copilot_credential_env in Tomlook connections.json".into());
         }
-        let mut config = SessionConfig::default().approve_permissions_if(|_| false);
-        config.model = Some(self.config.model.clone());
-        config.client_name = Some("Tomlook".into());
-        config.available_tools = Some(Vec::new());
-        config.enable_config_discovery = Some(false);
-        config.mcp_servers = Some(IndexMap::new());
-        let session =
-            tokio::time::timeout(Duration::from_secs(30), self.client.create_session(config))
-                .await
-                .map_err(|_| "Create AI sign-in session timed out")?
-                .map_err(|_| "Create isolated AI sign-in session failed")?;
-        let mut flow = None;
-        let already_cancelled = *cancelled.borrow() || *shutdown.borrow();
-        let operation = async {
-            if already_cancelled {
-                return Err("AI sign-in cancelled before authentication".into());
-            }
-            let begun = tokio::time::timeout(Duration::from_secs(30), session.rpc().accounts().login().begin(
-                AuthLoginBeginRequest { kind: LoginProviderKind::GitHubDotCom },
-            )).await.map_err(|_| "AI browser sign-in did not start within 30 seconds")?
-                .map_err(|_| "This Copilot runtime could not start the SDK browser sign-in API; no interactive CLI was launched")?;
-            flow = Some(begun.flow_id.clone());
-            let mut step = begun.step;
-            loop {
-                match step {
-                    AuthLoginStep::OpenUrl(request) => {
-                        let url = url::Url::parse(&request.url).map_err(|_| "Invalid AI authorization URL")?;
-                        if url.scheme() != "https" || url.host_str() != Some("github.com")
-                            || !url.username().is_empty() || url.password().is_some() {
-                                return Err("AI sign-in returned an unapproved authorization host".into());
-                            }
-                        let address = request.url;
-                        tokio::task::spawn_blocking(move || crate::browser::open(&address)).await
-                            .map_err(|_| "AI browser opener failed")??;
-                        progress("Complete GitHub sign-in in the browser. Tomlook is waiting; no model request was sent.");
-                    }
-                    AuthLoginStep::Awaiting(_) => {}
-                    AuthLoginStep::Completed(completed) if completed.result.status == AuthLoginResultStatus::Completed => return Ok(()),
-                    AuthLoginStep::Completed(completed) if completed.result.status == AuthLoginResultStatus::NeedsPlaintextConsent => {
-                        return Err("The runtime requested plaintext GitHub credential storage. Tomlook did not approve it; configure secure runtime storage before retrying.".into());
-                    }
-                    AuthLoginStep::Completed(_) => return Err("AI login requires an unsupported account-selection or consent step; no decision was made automatically".into()),
-                    AuthLoginStep::InputRequired(_) | AuthLoginStep::NeedsInteraction(_) => return Err("AI login requested an unexpected provider interaction; no credentials or decisions were supplied".into()),
-                    AuthLoginStep::Error(_) => return Err("GitHub browser sign-in failed; provider details withheld".into()),
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                step = tokio::time::timeout(
-                    Duration::from_secs(30),
-                    session
-                        .rpc()
-                        .accounts()
-                        .login()
-                        .advance(AuthLoginAdvanceRequest {
-                            flow_id: begun.flow_id.clone(),
-                            input: None,
-                        }),
-                )
-                .await
-                .map_err(|_| "Advance AI sign-in timed out")?
-                .map_err(|_| "Advance AI browser sign-in failed")?;
-            }
-        };
-        let result = tokio::select! {
-            biased;
-            _ = cancelled.changed() => Err("AI browser sign-in cancelled".into()),
-            _ = shutdown.changed() => Err("AI browser sign-in stopped during shutdown".into()),
-            result = tokio::time::timeout(Duration::from_secs(600), operation) => result.map_err(|_| "AI browser sign-in exceeded ten minutes".to_string()).and_then(|result| result),
-        };
-        let mut errors = Vec::new();
-        if result.is_err()
-            && let Some(flow_id) = flow
-            && !matches!(
-                tokio::time::timeout(
-                    Duration::from_secs(5),
-                    session
-                        .rpc()
-                        .accounts()
-                        .login()
-                        .cancel(AuthLoginCancelRequest { flow_id }),
-                )
-                .await,
-                Ok(Ok(()))
-            )
-        {
-            errors.push("AI login cancellation could not be verified");
-        }
-        if !matches!(
-            tokio::time::timeout(Duration::from_secs(5), session.disconnect()).await,
-            Ok(Ok(()))
-        ) {
-            errors.push("AI sign-in session detach could not be verified");
-        }
-        if !errors.is_empty() {
-            return Err(format!(
-                "{}; {}",
-                result.err().unwrap_or_else(|| "AI login completed".into()),
-                errors.join("; ")
-            ));
-        }
-        result
+        crate::copilot_auth::sign_in(root, cancelled, shutdown, progress).await
     }
 
     /// Starts runtime-managed loopback OAuth. Returns the URL to open, or None when cached
@@ -2779,17 +2681,17 @@ mod tests {
     }
 
     #[test]
-    fn stored_login_accepts_only_the_profile_user_identity() {
+    fn stored_login_accepts_only_the_explicit_encrypted_token_identity() {
         let root = tempfile::tempdir().unwrap();
         let runtime = std::env::current_exe().unwrap();
-        let stored = authenticated_options(root.path(), &runtime, None, true);
-        assert_eq!(stored.use_logged_in_user, Some(true));
-        assert!(stored.github_token.is_none());
+        let stored = authenticated_options(root.path(), &runtime, Some("fixture-saved-token".into()));
+        assert_eq!(stored.use_logged_in_user, Some(false));
+        assert_eq!(stored.github_token.as_deref(), Some("fixture-saved-token"));
         assert!(stored.env_remove.iter().any(|name| name == "GH_TOKEN"));
         assert_eq!(stored.mode, ClientMode::Empty);
         assert_eq!(stored.base_directory, Some(root.path().join("copilot")));
         assert_eq!(
-            authenticated_options(root.path(), &runtime, None, false).use_logged_in_user,
+            authenticated_options(root.path(), &runtime, None).use_logged_in_user,
             Some(false)
         );
         let mut config = Config {
@@ -2805,11 +2707,11 @@ mod tests {
             )
             .unwrap()
         };
-        assert!(accepted_identity(&config, &status(true, "user")).is_ok());
-        for fallback in ["gh-cli", "env", "token", "hmac"] {
+        assert!(accepted_identity(&config, &status(true, "token")).is_ok());
+        for fallback in ["gh-cli", "env", "user", "hmac"] {
             assert!(accepted_identity(&config, &status(true, fallback)).is_err());
         }
-        assert!(accepted_identity(&config, &status(false, "user")).is_err());
+        assert!(accepted_identity(&config, &status(false, "token")).is_err());
         config.use_stored_login = false;
         assert!(accepted_identity(&config, &status(true, "user")).is_err());
         config.use_stored_login = true;
@@ -2821,7 +2723,7 @@ mod tests {
     fn explicit_sdk_credential_preserves_isolation_without_stripping_its_injected_token() {
         let root = tempfile::tempdir().unwrap();
         let runtime = std::env::current_exe().unwrap();
-        let disabled = authenticated_options(root.path(), &runtime, None, false);
+        let disabled = authenticated_options(root.path(), &runtime, None);
         assert!(disabled.github_token.is_none());
         assert!(
             disabled
@@ -2833,7 +2735,6 @@ mod tests {
             root.path(),
             &runtime,
             Some("fixture-sdk-token".into()),
-            true,
         );
         assert_eq!(enabled.github_token.as_deref(), Some("fixture-sdk-token"));
         assert!(
@@ -2887,6 +2788,25 @@ mod tests {
             config.copilot_credential_env = Some(ambient.into());
             assert!(config.validate().is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn missing_encrypted_sign_in_fails_before_runtime_start_without_legacy_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config {
+            runtime: std::env::current_exe().unwrap(),
+            model: "fixture-model".into(),
+            copilot_credential_env: None,
+            use_stored_login: true,
+            servers: BTreeMap::new(),
+        };
+        let error = match Harness::start(root.path(), config).await {
+            Ok(_) => panic!("No runtime may start without the encrypted credential"),
+            Err(error) => error,
+        };
+        assert!(error.contains("No saved encrypted Copilot sign-in"));
+        assert!(!root.path().join("copilot").exists());
+        assert!(!root.path().join("workspace").exists());
     }
 
     #[tokio::test]

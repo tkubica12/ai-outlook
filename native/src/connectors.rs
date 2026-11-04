@@ -768,13 +768,13 @@ impl Device {
     }
 }
 #[derive(Deserialize)]
-struct Token {
-    access_token: Option<String>,
-    token_type: Option<String>,
-    expires_in: Option<u64>,
-    refresh_token: Option<String>,
-    refresh_token_expires_in: Option<u64>,
-    error: Option<String>,
+pub(crate) struct Token {
+    pub(crate) access_token: Option<String>,
+    pub(crate) token_type: Option<String>,
+    pub(crate) expires_in: Option<u64>,
+    pub(crate) refresh_token: Option<String>,
+    pub(crate) refresh_token_expires_in: Option<u64>,
+    pub(crate) error: Option<String>,
     interval: Option<u64>,
 }
 impl Token {
@@ -837,12 +837,36 @@ impl Token {
 }
 async fn github_login(client_id: &str, progress: impl Fn(String)) -> Result<Saved, String> {
     validate_client_id(client_id)?;
+    let token = github_device_token(client_id, None, true, progress).await?;
+    github_account_saved(token.credentials(client_id, None)?).await
+}
+
+pub(crate) async fn github_device_token(
+    client_id: &str,
+    scope: Option<&str>,
+    open_browser: bool,
+    progress: impl Fn(String),
+) -> Result<Token, String> {
+    github_device_token_at(client_id, scope, open_browser, progress, "https://github.com").await
+}
+
+async fn github_device_token_at(
+    client_id: &str,
+    scope: Option<&str>,
+    open_browser: bool,
+    progress: impl Fn(String),
+    origin: &str,
+) -> Result<Token, String> {
     let http = client(Kind::Github, "")?;
+    let mut fields = vec![("client_id", client_id)];
+    if let Some(scope) = scope {
+        fields.push(("scope", scope));
+    }
     let device: Device = json_response(
-        http.post("https://github.com/login/device/code")
+        http.post(format!("{origin}/login/device/code"))
             .header("accept", "application/json")
             .header("content-type", "application/x-www-form-urlencoded")
-            .body(form(&[("client_id", client_id)]))
+            .body(form(&fields))
             .send()
             .await
             .map_err(|_| "GitHub device sign-in could not start")?,
@@ -854,10 +878,12 @@ async fn github_login(client_id: &str, progress: impl Fn(String)) -> Result<Save
         "Enter {} at github.com/login/device",
         device.user_code
     ));
-    let address = device.verification_uri.clone();
-    tokio::task::spawn_blocking(move || crate::browser::open(&address))
-        .await
-        .map_err(|_| "GitHub browser opener stopped")??;
+    if open_browser {
+        let address = device.verification_uri.clone();
+        tokio::task::spawn_blocking(move || crate::browser::open(&address))
+            .await
+            .map_err(|_| "GitHub browser opener stopped")??;
+    }
     let mut interval = device.interval;
     loop {
         tokio::time::sleep(Duration::from_secs(interval)).await;
@@ -865,7 +891,7 @@ async fn github_login(client_id: &str, progress: impl Fn(String)) -> Result<Save
             return Err("GitHub sign-in expired; sign in again".into());
         }
         let token: Token = json_response(
-            http.post("https://github.com/login/oauth/access_token")
+            http.post(format!("{origin}/login/oauth/access_token"))
                 .header("accept", "application/json")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .body(form(&[
@@ -882,7 +908,7 @@ async fn github_login(client_id: &str, progress: impl Fn(String)) -> Result<Save
             interval = next;
             continue;
         }
-        return github_account_saved(token.credentials(client_id, None)?).await;
+        return Ok(token);
     }
 }
 
@@ -891,12 +917,26 @@ async fn github_account(
     client_id: Option<String>,
     expires_at: Option<i64>,
 ) -> Result<Saved, String> {
+    let login = github_identity(&credential).await?;
+    let saved = Saved {
+        credential,
+        client_id,
+        login: Some(login),
+        expires_at,
+        refresh_token: None,
+        refresh_expires_at: None,
+    };
+    saved.validate(Kind::Github)?;
+    Ok(saved)
+}
+
+pub(crate) async fn github_identity(credential: &str) -> Result<String, String> {
     #[derive(Deserialize)]
     struct Identity {
         login: String,
     }
     let identity: Identity = json_response(
-        client(Kind::Github, &credential)?
+        client(Kind::Github, credential)?
             .get("https://api.github.com/user")
             .header("accept", "application/vnd.github+json")
             .send()
@@ -904,16 +944,13 @@ async fn github_account(
             .map_err(|_| "GitHub account verification failed")?,
     )
     .await?;
-    let saved = Saved {
-        credential,
-        client_id,
-        login: Some(identity.login),
-        expires_at,
-        refresh_token: None,
-        refresh_expires_at: None,
-    };
-    saved.validate(Kind::Github)?;
-    Ok(saved)
+    if identity.login.is_empty()
+        || identity.login.len() > 100
+        || !identity.login.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("GitHub account identity is invalid".into());
+    }
+    Ok(identity.login)
 }
 
 async fn github_account_saved(mut saved: Saved) -> Result<Saved, String> {
@@ -1375,6 +1412,60 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn copilot_device_flow_uses_explicit_scopes_without_browser_or_ambient_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for step in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    bytes.push(stream.read_u8().await.unwrap());
+                    assert!(bytes.len() < 32768);
+                }
+                let headers = String::from_utf8(bytes).unwrap();
+                let length = headers.lines().find_map(|line| {
+                    line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                }).unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                let values = url::form_urlencoded::parse(&body).into_owned().collect::<BTreeMap<_, _>>();
+                assert_eq!(values["client_id"], "Ov23fixture");
+                assert!(!values.contains_key("client_secret"));
+                assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+                let response = match step {
+                    0 => {
+                        assert!(headers.starts_with("POST /login/device/code "));
+                        assert_eq!(values["scope"], "read:user read:org");
+                        assert_eq!(values.len(), 2);
+                        serde_json::json!({"device_code":"a".repeat(40), "user_code":"ABCD-EFGH",
+                            "verification_uri":"https://github.com/login/device", "expires_in":900, "interval":1})
+                    }
+                    1 | 2 => {
+                        assert!(headers.starts_with("POST /login/oauth/access_token "));
+                        assert_eq!(values["device_code"], "a".repeat(40));
+                        assert_eq!(values["grant_type"], "urn:ietf:params:oauth:grant-type:device_code");
+                        assert_eq!(values.len(), 3);
+                        if step == 1 { serde_json::json!({"error":"authorization_pending"}) }
+                        else { serde_json::json!({"access_token":"gho_fixture", "token_type":"bearer"}) }
+                    }
+                    _ => unreachable!(),
+                }.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let progress = std::sync::Mutex::new(Vec::new());
+        let token = tokio::time::timeout(Duration::from_secs(8),
+            github_device_token_at("Ov23fixture", Some("read:user read:org"), false,
+                |message| progress.lock().unwrap().push(message), &origin)
+        ).await.unwrap().unwrap();
+        server.await.unwrap();
+        assert_eq!(token.access_token.as_deref(), Some("gho_fixture"));
+        assert_eq!(*progress.lock().unwrap(), vec!["Enter ABCD-EFGH at github.com/login/device"]);
     }
 
     #[cfg(windows)]

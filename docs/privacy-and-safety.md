@@ -20,8 +20,9 @@ file permissions; only the files marked DPAPI are additionally encrypted.
 | `diagnostics.jsonl` (rotated) | Reason codes, request IDs and HTTP status codes; never prompts, credentials, meeting titles or provider responses |
 | `workiq-login.db` | WorkIQ sign-in, **DPAPI-encrypted**, bound to account, tenant and client |
 | `connector-login.db` | WebIQ key and GitHub tokens, **DPAPI-encrypted**, bound to provider and endpoint |
+| `copilot-login.db` | Tomlook's Copilot OAuth token and verified identity, **DPAPI-encrypted**, bound to the Copilot OAuth application and GitHub host |
 | `connections.json`, `decision-router.json` | Copilot runtime and Foundry configuration; never secrets |
-| `copilot\`, `workspace\` | The isolated Copilot CLI home (including its stored login file) and working directory |
+| `copilot\`, `workspace\` | The isolated Copilot CLI home and working directory; new sign-ins never store a token here. Legacy login files are not imported or automatically removed |
 | `company-icons\` | Cached company favicons |
 | `notification-icon.png`, `instance.lock` | Notification icon and the single-instance lock |
 
@@ -39,10 +40,14 @@ previous executable is kept as `Tomlook.exe.old` until the next start.
 - **WorkIQ, WebIQ, GitHub:** saved sign-ins are encrypted with Windows DPAPI
   for the current Windows user. Access tokens are used in memory and never
   passed to the AI runtime; the AI receives tool results only.
-- **GitHub Copilot:** the Copilot CLI stores its login in Tomlook's isolated
-  Copilot home (a file readable by your Windows account), separate from your
-  regular Copilot profile. Ambient `GH_TOKEN`/`GITHUB_TOKEN`-style variables
-  and `gh` logins are removed from the runtime's environment and rejected.
+- **GitHub Copilot:** Tomlook obtains its own OAuth token through an explicit
+  device-code sign-in, verifies the GitHub identity, and saves it with
+  current-user Windows DPAPI encryption. Only that token is explicitly passed
+  to the isolated runtime, in memory and its child-process environment; it is
+  never stored as plaintext runtime configuration. The SDK stays in Empty mode,
+  the shared keychain stays disabled, and ambient `GH_TOKEN`/`GITHUB_TOKEN`-style
+  variables and `gh` logins are removed and rejected. Legacy isolated login
+  files are not imported; sign in once in Tomlook after upgrading.
 - **Azure CLI (Foundry, MSX):** tokens are requested from Azure CLI, checked
   against the configured tenant and kept in memory only. Azure CLI keeps its
   own sign-in cache.
@@ -54,7 +59,7 @@ previous executable is kept as `Tomlook.exe.old` until the next start.
 | Service | Endpoint | When |
 |---|---|---|
 | WorkIQ (Microsoft 365) | `workiq.svc.cloud.microsoft/mcp`, sign-in at `login.microsoftonline.com` | After sign-in: calendar and unanswered-invitation sync, selected team-group membership refresh, research reads, transcripts, free/busy, directory lookups, photos, and approved writes. Explicit team discovery reads bounded historical-mail recipient headers. Microsoft Graph operations are made through WorkIQ's tools. |
-| GitHub Copilot | Through the installed Copilot CLI runtime | AI requests and Copilot sign-in |
+| GitHub Copilot | AI through the installed Copilot CLI runtime; sign-in at `github.com/login/device`, `github.com/login/device/code`, `github.com/login/oauth/access_token`, identity at `api.github.com/user` | AI requests; device-code sign-in only after **Sign in**, with `read:user read:org` OAuth scopes |
 | WebIQ | `api.microsoft.ai/v3/mcp` | Key verification and public web searches by the model |
 | GitHub connector | `api.githubcopilot.com/mcp/` (read-only), `github.com/login/device`, `github.com/login/oauth/access_token`, `api.github.com/user` | Sign-in, token renewal and repository reads |
 | Foundry | The configured `*.services.ai.azure.com` endpoint, token via Azure CLI | Only for Ask in **Auto** mode |

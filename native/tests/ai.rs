@@ -112,6 +112,34 @@ fn preview_never_starts_a_runtime_and_shutdown_is_bounded() {
 }
 
 #[test]
+fn failed_copilot_sign_in_reports_failure_instead_of_generic_completion() {
+    let root = tempfile::tempdir().unwrap();
+    let mut engine =
+        Engine::start(root.path().into(), false, eframe::egui::Context::default()).unwrap();
+    engine.commands.blocking_send(Command::SignInAi).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut login_failed = false;
+    let mut disconnected = false;
+    while !login_failed || !disconnected {
+        let notice = engine.notices.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap();
+        match notice {
+            Notice::AiLogin { busy: false, message } => {
+                assert!(message.starts_with("AI sign-in failed:"), "{message}");
+                assert!(!message.contains("finished") && !message.contains("completed"));
+                login_failed = true;
+            }
+            Notice::Connection { ready: false, .. } => disconnected = true,
+            Notice::Connection { ready: true, .. } => panic!("Missing configuration must not connect"),
+            _ => {}
+        }
+    }
+    assert!(!root.path().join("copilot-login.db").exists());
+    assert!(!root.path().join("copilot").exists());
+    engine.commands.blocking_send(Command::Stop).unwrap();
+    engine.done.take().unwrap().recv_timeout(Duration::from_secs(3)).unwrap();
+}
+
+#[test]
 fn hosted_workiq_rejects_invalid_account_without_runtime_or_ai_admission() {
     let root = tempfile::tempdir().unwrap();
     let mut engine =

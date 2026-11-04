@@ -14,6 +14,7 @@ pub mod company;
 pub mod connectors;
 pub mod context;
 pub mod copilot;
+mod copilot_auth;
 mod credentials;
 pub mod customers;
 pub mod decision;

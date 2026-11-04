@@ -238,12 +238,12 @@ impl Tomlook {
         }
     }
 
-    /// The AI dialog's isolated browser sign-in; the setup checklist calls the same flow.
+    /// The AI dialog's isolated device sign-in; the setup checklist calls the same flow.
     pub(super) fn sign_in_ai(&mut self) {
         if !self.ai_login_busy && !self.ai_ready && self.ai_command(ai::Command::SignInAi) {
             self.ai_login_busy = true;
             self.ai_login_status = None;
-            self.connection = "AI browser sign-in queued...".into();
+            self.connection = "AI device sign-in queued...".into();
         }
     }
 
@@ -392,6 +392,7 @@ impl Tomlook {
                     ui.weak(language.text(message));
                 }
                 if self.ai_login_busy {
+                    ui.hyperlink_to("github.com/login/device", "https://github.com/login/device");
                     if ui.button(language.text("Cancel AI sign-in")).clicked() {
                         self.ai_command(ai::Command::CancelAiLogin);
                     }

@@ -88,23 +88,30 @@ profile, `gh` login or token environment variables.
      modes use fixed models);
    - `servers`: `{}` (WebIQ and GitHub are connected from the status bar).
 3. Restart Tomlook, click **GitHub Copilot** in the status bar and choose
-   **Sign in**. Approve the sign-in in the browser.
+   **Sign in**. Open the displayed `github.com/login/device` link, enter the
+   one-time code and approve GitHub Copilot CLI sign-in. Tomlook waits without
+   opening a terminal or browser automatically; **Cancel AI sign-in** stops it.
 
-Alternative to step 3, from PowerShell:
+Tomlook uses the Copilot CLI public OAuth application, requesting `read:user`
+and `read:org` to identify the authorized user and organization membership.
+It verifies the GitHub identity and saves the token in `copilot-login.db`,
+encrypted with Windows DPAPI for the current Windows user. The isolated SDK
+runtime receives this token explicitly in its child-process environment;
+the shared system keychain remains disabled. No token is written to the
+runtime's configuration file, and no existing Copilot or `gh` login is imported.
+The older isolated `copilot login` workaround is no longer used: after
+upgrading, sign in once from Tomlook to create its encrypted record.
 
-```powershell
-$env:COPILOT_HOME = "$env:LOCALAPPDATA\Tomlook\copilot"; $env:COPILOT_DISABLE_KEYTAR = '1'
-Remove-Item Env:GH_TOKEN, Env:GITHUB_TOKEN, Env:COPILOT_GITHUB_TOKEN -ErrorAction SilentlyContinue
-copilot login
-```
-
-Tomlook accepts only the stored `user` identity of that isolated home. The
-Copilot CLI stores this login as a file under `%LOCALAPPDATA%\Tomlook\copilot`,
-readable by your Windows account. Instead of a stored login,
+Instead of a stored login,
 `copilot_credential_env` can name a `TOMLOOK_*` environment variable that
 holds a token (never put the token itself in the file); the two options are
 mutually exclusive. Connecting checks the identity only and sends no model
 request.
+
+If GitHub revokes the token or its optional lifetime expires, choose **Sign in**
+again. A Windows DPAPI failure is reported; Tomlook never falls back to plaintext
+storage or another application's credentials. An unsuccessful sign-in is shown
+as a failure, not a generic successful completion.
 
 ## WebIQ (public web search)
 

@@ -1567,22 +1567,36 @@ impl Engine {
                                     let output = output.clone();
                                     let context = context.clone();
                                     let root = root.clone();
-                                    notify(Notice::AiLogin { busy: true, message: "Starting isolated SDK browser sign-in; no terminal or model request...".into() });
+                                    notify(Notice::AiLogin { busy: true, message: "Starting Copilot device sign-in; credentials stay encrypted in Tomlook...".into() });
                                     tasks.spawn(async move {
                                         let result = async {
                                             let config = Config::load(&root)?.for_native_app();
-                                            let harness = Harness::start(&root, config).await?;
-                                            let progress = move |message: &str| {
-                                                if let Err(error) = output.send(Notice::AiLogin { busy: true, message: message.into() }) {
+                                            let progress = move |message: String| {
+                                                if let Err(error) = output.send(Notice::AiLogin { busy: true, message }) {
                                                     eprintln!("Tomlook: {error}");
                                                 }
                                                 context.request_repaint();
                                             };
+                                            let mut cancelled_runtime = cancelled.clone();
+                                            let mut stopped_runtime = shutdown.clone();
+                                            Harness::github_login(&root, &config, cancelled, shutdown, progress).await?;
+                                            if *cancelled_runtime.borrow() || *stopped_runtime.borrow() {
+                                                return Err("AI device sign-in cancelled".into());
+                                            }
+                                            let harness = Harness::start(&root, config).await?;
                                             let result = async {
-                                                harness.github_login(cancelled, shutdown, progress).await?;
-                                                let health = harness.health().await?;
-                                                if !health.authenticated { return Err("AI browser sign-in finished but the isolated identity was not accepted".into()); }
-                                                Ok(())
+                                                if *cancelled_runtime.borrow() || *stopped_runtime.borrow() {
+                                                    return Err("AI device sign-in cancelled".into());
+                                                }
+                                                tokio::select! {
+                                                    biased;
+                                                    _ = cancelled_runtime.changed() => Err("AI device sign-in cancelled".into()),
+                                                    _ = stopped_runtime.changed() => Err("AI device sign-in stopped during shutdown".into()),
+                                                    health = harness.health() => {
+                                                        if !health?.authenticated { return Err("AI device sign-in finished but the isolated identity was not accepted".into()); }
+                                                        Ok(())
+                                                    }
+                                                }
                                             }.await;
                                             match result {
                                                 Ok(()) => Ok(Arc::new(harness)),
@@ -2203,7 +2217,10 @@ impl Engine {
                                 Some(Ok(Completion::Connection(result))) => {
                                     starting = false;
                                     if ai_login_cancel.take().is_some() {
-                                        notify(Notice::AiLogin { busy: false, message: "AI sign-in finished; see the connection status.".into() });
+                                        notify(Notice::AiLogin { busy: false, message: match &result {
+                                            Ok(_) => "AI sign-in completed.".into(),
+                                            Err(error) => format!("AI sign-in failed: {error}"),
+                                        } });
                                     }
                                     match result {
                                         Ok(connected_harness) => {

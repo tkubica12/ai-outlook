@@ -8412,6 +8412,37 @@ fn setup_probe(runtime: bool, saved: bool) -> Arc<tomlook::setup::Probe> {
 }
 
 #[test]
+fn copilot_device_sign_in_displays_the_code_and_cancel_without_opening_a_browser() {
+    for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
+        let (mut app, _storage, mut commands, notices) = task_fixture(language);
+        app.ai_ready = false;
+        app.connection_panel = Some(ConnectionPanel::Ai);
+        notices.send(ai::Notice::AiLogin {
+            busy: true,
+            message: "Enter ABCD-EFGH at github.com/login/device".into(),
+        }).unwrap();
+        app.receive();
+        let context = egui::Context::default();
+        let show: Show = &|app, ui| app.connection_dialog(ui.ctx());
+        let text = settled(&context, &mut app, show);
+        assert!(text.contains("ABCD-EFGH") && text.contains("github.com/login/device"), "{text}");
+        assert!(commands.try_recv().is_err(), "Rendering never starts a login or opens a browser");
+        click_text(&context, &mut app, show, language.text("Cancel AI sign-in").as_ref());
+        assert!(matches!(commands.try_recv(), Ok(ai::Command::CancelAiLogin)));
+        notices.send(ai::Notice::AiLogin {
+            busy: false,
+            message: "AI sign-in failed: cancelled".into(),
+        }).unwrap();
+        notices.send(ai::Notice::Connection { ready: false, message: "cancelled".into() }).unwrap();
+        app.receive();
+        let text = settled(&context, &mut app, show);
+        assert!(!app.ai_login_busy && !app.ai_ready);
+        assert!(text.contains(language.text("AI sign-in failed: cancelled").as_ref()), "{text}");
+        assert!(!text.contains("AI sign-in completed."));
+    }
+}
+
+#[test]
 fn setup_checklist_is_bilingual_and_its_actions_reuse_the_existing_connection_flows() {
     for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
         let (mut app, receiver, mut ai_commands, _) = task_fixture(language);
