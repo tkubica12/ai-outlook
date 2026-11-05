@@ -495,13 +495,28 @@ v0.13 show **not checked** until their day is refreshed.
 
 External e-mail domains of a meeting are grouped into customers. Your own
 domains, consumer mail domains and, for a Microsoft sign-in,
-Microsoft-owned domains are never customers. Unknown domains appear as
-**Unconfirmed customer**.
+Microsoft-owned domains are never customers. Unknown domains are grouped by
+organization (for example `drmax.eu`, `drmax.sk` and `dr-max.global` with
+attendees from "Dr.Max BDC" and "Dr.Max SVK" become one **Dr.Max**) and shown
+as **Unconfirmed**.
 
-- **Confirm customer** sets the name and domains and, with MSX connected,
-  offers MSX account candidates with confidence and evidence. Nothing is
-  linked until you click **Confirm**. Per meeting you can choose **Not a
-  customer meeting**, **Only this customer** or **Detect automatically**.
+- With MSX connected, Tomlook looks up each unconfirmed organization in the
+  background (read-only) and shows a suggestion. Accounts in your MSX
+  territory (account teams you are on) are preferred, and a subsidiary that
+  shares the MSX top parent (TPID) of a territory account is represented by
+  it, so Dr.Max suggests **PENTA INVESTMENTS**. **Confirm Dr.Max → PENTA
+  INVESTMENTS** saves it in one click; nothing is linked before that.
+- **Choose customer...** opens the dialog with all candidates, their
+  confidence and evidence, a filterable list of your MSX territory, or a local
+  customer without MSX.
+- **It's a partner** remembers partners and vendors (with their logo) without
+  an MSX link; they are shown as partners and never offered as customers
+  again. **Don't track** hides the organization's domains for good. Both can
+  be changed or removed in **Customers**.
+- A new domain of a saved customer (another country, for example) offers
+  **Add to Dr.Max**.
+- Per meeting you can choose **Not a customer meeting**, **Only this
+  customer** or **Detect automatically**.
 - The **customer timeline** (from the meeting card, a company name or icon,
   **Customers** in Commands, or Settings → MSX) shows meetings one month back
   and six months ahead, notes and decisions, tasks, MSX opportunities and

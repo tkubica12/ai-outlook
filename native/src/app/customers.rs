@@ -36,6 +36,8 @@ pub(super) enum Link {
 pub(super) struct ConfirmDraft {
     /// The unconfirmed domain the dialog was opened for.
     pub(super) domain: Option<String>,
+    /// All unconfirmed domains of the organization the dialog was opened for.
+    pub(super) group: Vec<String>,
     pub(super) people: Vec<String>,
     /// The customer being edited.
     pub(super) editing: Option<String>,
@@ -45,8 +47,11 @@ pub(super) struct ConfirmDraft {
     name_edited: bool,
     /// Comma-separated e-mail domains.
     pub(super) domains: String,
+    pub(super) kind: model::Kind,
     pub(super) link: Link,
     pub(super) lookup: Lookup,
+    /// Filter of the territory list.
+    pub(super) filter: String,
     pub(super) error: Option<String>,
     focus: bool,
 }
@@ -81,6 +86,8 @@ pub(super) struct CustomersUi {
     pub(super) filter: String,
     pub(super) confirm: Option<ConfirmDraft>,
     request_id: u64,
+    /// Background MSX suggestions for unconfirmed organizations by organization key.
+    pub(super) tips: BTreeMap<String, Lookup>,
     /// Customer and request of the running MSX read.
     pub(super) msx_running: Option<(String, u64)>,
     pub(super) msx_errors: BTreeMap<String, String>,
@@ -103,10 +110,30 @@ pub(super) struct CustomersUi {
 
 enum CardAction {
     Open(String),
-    Confirm(String, Vec<String>),
     Pin(String),
     Exclude,
     Reset,
+    Organization(Box<OrganizationAction>),
+}
+
+/// One click on an unconfirmed organization.
+enum OrganizationAction {
+    /// Save it as a customer, linked to the suggested MSX account when there is one.
+    Confirm(model::Organization, Option<tomlook::msx::dataverse::AccountCandidate>),
+    /// Add its domains to a saved customer or partner of the same name.
+    AddTo(model::Organization, String),
+    Choose(model::Organization),
+    Save(model::Organization, model::Kind),
+}
+
+/// What the user sees for an organization: a saved one, an MSX customer of the territory, or
+/// a local name.
+fn kind_note(customer: &model::Customer) -> &'static str {
+    match customer.kind {
+        model::Kind::Partner => "Partner, not linked to MSX",
+        model::Kind::Ignored => "Not tracked; its domains are not offered",
+        model::Kind::Customer => "Local customer without an MSX link",
+    }
 }
 
 fn names(people: &[String]) -> String {
@@ -163,6 +190,8 @@ fn evidence(item: &tomlook::msx::dataverse::Evidence) -> String {
             format!("Name {}% similar to {name}", (similarity * 100.0).round())
         }
         Evidence::DomainMatchesName { domain } => format!("Domain {domain} matches the name"),
+        Evidence::Territory => "In your MSX territory".into(),
+        Evidence::TopParent { account, tpid } => format!("{account} has the same TPID {tpid}"),
     }
 }
 
@@ -688,8 +717,9 @@ impl Tomlook {
 
     // ---------- meeting details ----------
 
-    /// The customers of a meeting: confirmed ones open the customer panel, unconfirmed external
-    /// domains offer **Confirm customer**. Nothing is associated without the user.
+    /// The customers of a meeting: confirmed ones open the customer panel, partners are shown as
+    /// such and unconfirmed external domains are grouped by organization with an MSX suggestion
+    /// and one-click choices. Nothing is associated without the user.
     pub(super) fn customer_card(&mut self, ui: &mut egui::Ui, event: &Event) {
         let Some(account) = self.customer_account() else {
             return;
@@ -702,7 +732,8 @@ impl Tomlook {
         let language = self.preferences.language;
         let accent = self.accent();
         let chosen = book.override_for(&account, event).is_some();
-        let several = detection.parties.len() > 1;
+        let several = detection.customers().count() > 1;
+        let organizations = model::organizations(&book, &detection.parties);
         let mut action = None;
         egui::Frame::new()
             .fill(ui.visuals().faint_bg_color)
@@ -740,7 +771,7 @@ impl Tomlook {
                                 });
                                 match &customer.msx {
                                     Some(msx) => ui.weak(language.text(&format!("MSX: {}", msx.name))),
-                                    None => ui.weak(language.text("Local customer without an MSX link")),
+                                    None => ui.weak(language.text(kind_note(customer))),
                                 };
                                 if !people.is_empty() {
                                     ui.label(RichText::new(names(people)).small());
@@ -758,21 +789,33 @@ impl Tomlook {
                                 });
                             });
                         }
-                        Party::Unconfirmed { domain, people } => {
-                            ui.push_id(("meeting-unconfirmed", domain), |ui| {
-                                ui.label(language.text(&format!("Unconfirmed customer: {domain}")));
+                        Party::Partner { id, people, .. } => {
+                            let Some(partner) = book.customers.get(id) else {
+                                continue;
+                            };
+                            ui.push_id(("meeting-partner", id), |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    self.customer_icon(ui, partner);
+                                    if ui
+                                        .add(egui::Button::new(RichText::new(&partner.name).strong()).frame(false))
+                                        .on_hover_text(language.text("Open customer"))
+                                        .clicked()
+                                    {
+                                        action = Some(CardAction::Open(id.clone()));
+                                    }
+                                    chip(ui, "Partner", ui.visuals().weak_text_color());
+                                });
                                 if !people.is_empty() {
                                     ui.label(RichText::new(names(people)).small().weak());
                                 }
-                                if ui
-                                    .small_button(language.text("Confirm customer"))
-                                    .on_hover_text(language.text("Choose an MSX customer or keep a local one; nothing is linked without you."))
-                                    .clicked()
-                                {
-                                    action = Some(CardAction::Confirm(domain.clone(), people.clone()));
-                                }
                             });
                         }
+                        Party::Unconfirmed { .. } => {}
+                    }
+                }
+                for organization in &organizations {
+                    if let Some(chosen) = self.organization_row(ui, &book, organization, None) {
+                        action = Some(CardAction::Organization(Box::new(chosen)));
                     }
                 }
                 ui.add_space(4.0);
@@ -793,7 +836,7 @@ impl Tomlook {
         let now = chrono::Utc::now();
         match action {
             Some(CardAction::Open(id)) => self.open_customers(Some(id), Some(event.id.clone())),
-            Some(CardAction::Confirm(domain, people)) => self.open_customer_confirmation(&domain, people),
+            Some(CardAction::Organization(chosen)) => self.apply_organization(*chosen),
             Some(CardAction::Pin(id)) => self.command(Command::Customer(CustomerCommand::Choose(Box::new(
                 model::Override::new(&account, event, Some(id), now),
             )))),
@@ -813,39 +856,264 @@ impl Tomlook {
         ui.add_space(6.0);
     }
 
+    // ---------- unconfirmed organizations ----------
+
+    /// Starts one background MSX suggestion at a time for an organization not looked up yet.
+    fn request_tip(&mut self, organization: &model::Organization) {
+        if self.preview
+            || !self.preferences.msx_enabled
+            || !self.msx_connected()
+            || self.customers.tips.contains_key(&organization.key())
+            || self.customers.tips.values().any(|tip| matches!(tip, Lookup::Running(_)))
+        {
+            return;
+        }
+        self.customers.request_id += 1;
+        let id = self.customers.request_id;
+        if self.ai_command(ai::Command::CustomerTip {
+            id,
+            domains: organization.domains.clone(),
+            names: vec![organization.name.clone()],
+        }) {
+            self.customers.tips.insert(organization.key(), Lookup::Running(id));
+        } else {
+            self.ai_error = None;
+        }
+    }
+
+    /// One unconfirmed organization with its suggestion and one-click choices.
+    fn organization_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        book: &model::Book,
+        organization: &model::Organization,
+        meetings: Option<usize>,
+    ) -> Option<OrganizationAction> {
+        use tomlook::msx::dataverse::Selection;
+        let language = self.preferences.language;
+        let accent = self.accent();
+        self.request_tip(organization);
+        let tip = self.customers.tips.get(&organization.key()).cloned().unwrap_or_default();
+        let related = organization.related.as_ref().and_then(|id| book.customers.get(id));
+        let suggestion = match &tip {
+            Lookup::Ready(lookup) => match &lookup.selection {
+                Selection::Likely { account_id } => lookup.candidates.iter().find(|candidate| &candidate.id == account_id),
+                _ => None,
+            },
+            _ => None,
+        };
+        let mut action = None;
+        ui.push_id(("unconfirmed-organization", organization.key()), |ui| {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(language.text(&format!("Unconfirmed: {}", organization.name))).strong());
+                ui.weak(organization.domains.join(", "));
+                if let Some(meetings) = meetings {
+                    ui.weak(language.text(&format!("Meetings: {meetings}")));
+                }
+            });
+            if !organization.people.is_empty() {
+                ui.label(RichText::new(names(&organization.people)).small().weak());
+            }
+            match (&tip, suggestion, related) {
+                (_, _, Some(related)) => {
+                    ui.weak(language.text(&format!("Probably another domain of {}", related.name)));
+                }
+                (_, Some(candidate), None) => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(language.text(&format!("Suggestion: MSX customer {}", candidate.name)));
+                        if let Some(tpid) = &candidate.tpid {
+                            ui.weak(format!("TPID {tpid}"));
+                        }
+                        if candidate.evidence.contains(&tomlook::msx::dataverse::Evidence::Territory) {
+                            chip(ui, &language.text("Your territory"), accent);
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        candidate
+                            .evidence
+                            .iter()
+                            .map(|item| language.text(&evidence(item)).into_owned())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                }
+                (Lookup::Running(_), ..) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak(language.text("Looking for the customer in MSX..."));
+                    });
+                }
+                (Lookup::Ready(lookup), None, None) if !lookup.candidates.is_empty() => {
+                    ui.weak(language.text("Several MSX customers are possible; choose one."));
+                }
+                (Lookup::Ready(_), None, None) => {
+                    ui.weak(language.text("Not found in MSX: a partner, or a customer to choose yourself."));
+                }
+                _ => {}
+            }
+            ui.horizontal_wrapped(|ui| {
+                if let Some(related) = related {
+                    if ui
+                        .button(RichText::new(language.text(&format!("Add to {}", related.name))).strong())
+                        .clicked()
+                    {
+                        action = Some(OrganizationAction::AddTo(organization.clone(), related.id.clone()));
+                    }
+                } else if let Some(candidate) = suggestion {
+                    if ui
+                        .button(RichText::new(language.text(&format!("Confirm {} → {}", organization.name, candidate.name))).strong())
+                        .on_hover_text(language.text("Saves the customer with this MSX link; you can change it later."))
+                        .clicked()
+                    {
+                        action = Some(OrganizationAction::Confirm(organization.clone(), Some(candidate.clone())));
+                    }
+                } else if !matches!(&tip, Lookup::Running(_))
+                    && !matches!(&tip, Lookup::Ready(lookup) if !lookup.candidates.is_empty())
+                    && ui
+                        .button(language.text(&format!("Confirm {}", organization.name)))
+                        .on_hover_text(language.text("Saves a local customer; link MSX later."))
+                        .clicked()
+                {
+                    action = Some(OrganizationAction::Confirm(organization.clone(), None));
+                }
+                if ui
+                    .small_button(language.text("Choose customer..."))
+                    .on_hover_text(language.text("Choose an MSX customer of your territory, search MSX or keep a local one; nothing is linked without you."))
+                    .clicked()
+                {
+                    action = Some(OrganizationAction::Choose(organization.clone()));
+                }
+                if ui
+                    .small_button(language.text("It's a partner"))
+                    .on_hover_text(language.text("Remember it as a partner: no MSX link, never offered as a customer again."))
+                    .clicked()
+                {
+                    action = Some(OrganizationAction::Save(organization.clone(), model::Kind::Partner));
+                }
+                if ui
+                    .small_button(language.text("Don't track"))
+                    .on_hover_text(language.text("These domains are never offered again; undo it in Customers."))
+                    .clicked()
+                {
+                    action = Some(OrganizationAction::Save(organization.clone(), model::Kind::Ignored));
+                }
+            });
+        });
+        action
+    }
+
+    fn apply_organization(&mut self, action: OrganizationAction) {
+        let Some(account) = self.customer_account() else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let saved = match action {
+            OrganizationAction::Choose(organization) => {
+                self.open_organization_confirmation(&organization);
+                return;
+            }
+            OrganizationAction::AddTo(organization, id) => {
+                let Some(mut customer) = self.customer_book().customers.get(&id).cloned() else {
+                    return;
+                };
+                for domain in organization.domains {
+                    if !customer.domains.contains(&domain) {
+                        customer.domains.push(domain);
+                    }
+                }
+                customer.updated_at = now.max(customer.created_at);
+                Ok(customer)
+            }
+            OrganizationAction::Confirm(organization, candidate) => model::Customer::new(
+                &account,
+                &organization.name,
+                &organization.domains,
+                candidate.map(|candidate| model::MsxAccount {
+                    id: candidate.id,
+                    name: candidate.name,
+                    tpid: candidate.tpid,
+                    confidence: Some(candidate.confidence.clamp(0.0, 1.0)),
+                }),
+                now,
+            ),
+            OrganizationAction::Save(organization, kind) => {
+                model::Customer::new(&account, &organization.name, &organization.domains, None, now).map(|mut customer| {
+                    customer.kind = kind;
+                    customer
+                })
+            }
+        };
+        match saved.and_then(|customer| customer.validate().map(|()| customer)) {
+            Ok(customer) => {
+                self.command(Command::Customer(CustomerCommand::Save(Box::new(customer))));
+                self.customers.cached = None;
+            }
+            Err(error) => self.ai_error = Some(error),
+        }
+    }
+
     // ---------- confirmation ----------
 
     pub(super) fn open_customer_confirmation(&mut self, domain: &str, people: Vec<String>) {
         let Some(domain) = model::normalize_domain(domain) else {
             return;
         };
-        self.customers.confirm = Some(ConfirmDraft {
+        self.open_organization_confirmation(&model::Organization {
             name: model::suggested_name(&domain),
-            name_edited: false,
-            domains: domain.clone(),
-            domain: Some(domain),
+            domains: vec![domain],
             people,
+            related: None,
+        });
+    }
+
+    fn open_organization_confirmation(&mut self, organization: &model::Organization) {
+        let Some(domain) = organization.domains.first().cloned() else {
+            return;
+        };
+        let tip = self.customers.tips.get(&organization.key()).cloned().unwrap_or_default();
+        let mut draft = ConfirmDraft {
+            name: organization.name.clone(),
+            name_edited: organization.name != model::suggested_name(&domain),
+            domains: organization.domains.join(", "),
+            domain: Some(domain),
+            group: organization.domains.clone(),
+            people: organization.people.clone(),
             editing: None,
-            existing: None,
+            existing: organization.related.clone(),
+            kind: model::Kind::Customer,
             link: Link::Local,
             lookup: Lookup::Idle,
+            filter: String::new(),
             error: None,
             focus: true,
-        });
-        self.search_customer_accounts();
+        };
+        if let Lookup::Ready(lookup) = tip {
+            self.customers.request_id += 1;
+            draft.lookup = Lookup::Running(self.customers.request_id);
+            self.customers.confirm = Some(draft);
+            self.receive_customer_accounts(self.customers.request_id, Ok(lookup));
+        } else {
+            self.customers.confirm = Some(draft);
+            self.search_customer_accounts();
+        }
     }
 
     pub(super) fn open_customer_editor(&mut self, customer: &model::Customer) {
         self.customers.confirm = Some(ConfirmDraft {
             domain: None,
+            group: Vec::new(),
             people: Vec::new(),
             editing: Some(customer.id.clone()),
             existing: None,
             name: customer.name.clone(),
             name_edited: true,
             domains: customer.domains.join(", "),
+            kind: customer.kind,
             link: if customer.msx.is_some() { Link::Keep } else { Link::Local },
             lookup: Lookup::Idle,
+            filter: String::new(),
             error: None,
             focus: true,
         });
@@ -883,6 +1151,18 @@ impl Tomlook {
         id: u64,
         result: Result<tomlook::msx::dataverse::AccountLookup, String>,
     ) {
+        if let Some(tip) = self
+            .customers
+            .tips
+            .values_mut()
+            .find(|tip| **tip == Lookup::Running(id))
+        {
+            *tip = match result {
+                Ok(lookup) => Lookup::Ready(lookup),
+                Err(error) => Lookup::Failed(error),
+            };
+            return;
+        }
         let Some(draft) = &mut self.customers.confirm else {
             return;
         };
@@ -927,6 +1207,7 @@ impl Tomlook {
                     let candidate = lookup
                         .candidates
                         .iter()
+                        .chain(&lookup.territory)
                         .find(|candidate| &candidate.id == id)
                         .ok_or("Search MSX again before linking a customer")?;
                     Some(model::MsxAccount {
@@ -944,7 +1225,7 @@ impl Tomlook {
                 .get(existing)
                 .cloned()
                 .ok_or("This customer no longer exists")?;
-            for domain in draft.domain.iter() {
+            for domain in draft.domain.iter().chain(&draft.group) {
                 if !customer.domains.contains(domain) {
                     customer.domains.push(domain.clone());
                 }
@@ -960,18 +1241,21 @@ impl Tomlook {
                 .ok_or("This customer no longer exists")?;
             customer.name = draft.name.split_whitespace().collect::<Vec<_>>().join(" ");
             customer.domains = model::normalize_domains(&split_domains(&draft.domains))?;
-            customer.msx = link(customer.msx.clone())?;
+            customer.kind = draft.kind;
+            customer.msx = if draft.kind.is_customer() { link(customer.msx.clone())? } else { None };
             customer.confirmed = true;
             customer.updated_at = now.max(customer.created_at);
             customer
         } else {
-            model::Customer::new(
+            let mut customer = model::Customer::new(
                 &account,
                 &draft.name,
                 &split_domains(&draft.domains),
-                link(None)?,
+                if draft.kind.is_customer() { link(None)? } else { None },
                 now,
-            )?
+            )?;
+            customer.kind = draft.kind;
+            customer
         };
         customer.validate()?;
         if customer.domains.is_empty() {
@@ -1004,7 +1288,9 @@ impl Tomlook {
             .default_width(540.0)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 90.0])
             .show(context, |ui| {
-                if let Some(domain) = &draft.domain {
+                if draft.group.len() > 1 {
+                    ui.label(format!("{}: {}", language.text("E-mail domains"), draft.group.join(", ")));
+                } else if let Some(domain) = &draft.domain {
                     ui.label(format!("{}: {domain}", language.text("E-mail domain")));
                 }
                 if !draft.people.is_empty() {
@@ -1030,6 +1316,14 @@ impl Tomlook {
                 }
                 if draft.existing.is_none() {
                     ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.radio_value(&mut draft.kind, model::Kind::Customer, language.text("Customer organization"));
+                        ui.radio_value(&mut draft.kind, model::Kind::Partner, language.text("Partner organization"))
+                            .on_hover_text(language.text("Remember it as a partner: no MSX link, never offered as a customer again."));
+                        ui.radio_value(&mut draft.kind, model::Kind::Ignored, language.text("Don't track"))
+                            .on_hover_text(language.text("These domains are never offered again; undo it in Customers."));
+                    });
+                    ui.add_space(4.0);
                     ui.label(language.text("Customer name"));
                     let name = ui.add(
                         egui::TextEdit::singleline(&mut draft.name)
@@ -1050,6 +1344,8 @@ impl Tomlook {
                             .desired_width(360.0),
                     );
                     ui.add_space(6.0);
+                }
+                if draft.existing.is_none() && draft.kind.is_customer() {
                     ui.strong(language.text("MSX customer"));
                     if let Some(msx) = &current {
                         ui.radio_value(&mut draft.link, Link::Keep, language.text(&format!("Keep the current MSX link: {}", msx.name)));
@@ -1125,6 +1421,40 @@ impl Tomlook {
                                 draft.link = Link::Candidate(candidate.id.clone());
                                 if !draft.name_edited {
                                     draft.name = candidate.name.clone();
+                                }
+                            }
+                            if !lookup.territory.is_empty() {
+                                ui.add_space(6.0);
+                                ui.strong(language.text("Your MSX territory"));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut draft.filter)
+                                        .id(Id::new("customer-territory-filter"))
+                                        .hint_text(language.text("Filter customers..."))
+                                        .desired_width(260.0),
+                                );
+                                let query = draft.filter.trim().to_lowercase();
+                                let mut picked = None;
+                                egui::ScrollArea::vertical()
+                                    .id_salt("customer-territory")
+                                    .max_height(220.0)
+                                    .show(ui, |ui| {
+                                        for account in lookup.territory.iter().filter(|account| {
+                                            query.is_empty() || account.name.to_lowercase().contains(&query)
+                                        }) {
+                                            ui.push_id(("msx-territory", &account.id), |ui| {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    if ui.radio(draft.link == Link::Candidate(account.id.clone()), &account.name).clicked() {
+                                                        picked = Some(account.id.clone());
+                                                    }
+                                                    if let Some(tpid) = &account.tpid {
+                                                        ui.weak(format!("TPID {tpid}"));
+                                                    }
+                                                });
+                                            });
+                                        }
+                                    });
+                                if let Some(id) = picked {
+                                    draft.link = Link::Candidate(id);
                                 }
                             }
                             if connected && ui.button(language.text("Search MSX again")).clicked() {
@@ -1212,8 +1542,9 @@ impl Tomlook {
         }
     }
 
-    /// External domains of recent and upcoming meetings that no confirmed customer covers.
-    fn unconfirmed_domains(&self, book: &model::Book) -> Vec<(String, Vec<String>, usize)> {
+    /// Organizations of recent and upcoming meetings whose domains no saved organization covers,
+    /// with the number of meetings each attended.
+    fn unconfirmed_organizations(&self, book: &model::Book) -> Vec<(model::Organization, usize)> {
         let Some(account) = self.customer_account() else {
             return Vec::new();
         };
@@ -1222,7 +1553,7 @@ impl Tomlook {
         let first = today - chrono::Duration::days(model::RECENT_DAYS);
         let last = today + chrono::Duration::days(30);
         let mut seen = BTreeSet::new();
-        let mut domains = BTreeMap::<String, (BTreeSet<String>, usize)>::new();
+        let mut groups = BTreeMap::<String, (model::Organization, BTreeSet<String>, BTreeSet<String>, usize)>::new();
         for index in self
             .calendar
             .days
@@ -1233,21 +1564,28 @@ impl Tomlook {
             if !seen.insert(index) || !model::counted(event) {
                 continue;
             }
-            for party in model::detect(book, &detector, &account, event).parties {
-                if let Party::Unconfirmed { domain, people } = party {
-                    let entry = domains.entry(domain).or_default();
-                    entry.0.extend(people);
-                    entry.1 += 1;
-                }
+            let detection = model::detect(book, &detector, &account, event);
+            for organization in model::organizations(book, &detection.parties) {
+                let stem = model::organization_stem(&organization.domains[0]);
+                let entry = groups
+                    .entry(stem)
+                    .or_insert_with(|| (organization.clone(), BTreeSet::new(), BTreeSet::new(), 0));
+                entry.1.extend(organization.domains);
+                entry.2.extend(organization.people);
+                entry.3 += 1;
             }
         }
-        let mut domains = domains
-            .into_iter()
-            .map(|(domain, (people, meetings))| (domain, people.into_iter().collect(), meetings))
+        let mut organizations = groups
+            .into_values()
+            .map(|(mut organization, domains, people, meetings)| {
+                organization.domains = domains.into_iter().collect();
+                organization.people = people.into_iter().collect();
+                (organization, meetings)
+            })
             .collect::<Vec<_>>();
-        domains.sort_by(|left, right| right.2.cmp(&left.2).then(left.0.cmp(&right.0)));
-        domains.truncate(8);
-        domains
+        organizations.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.name.cmp(&right.0.name)));
+        organizations.truncate(8);
+        organizations
     }
 
     fn customer_list(&mut self, ui: &mut egui::Ui, book: &model::Book) {
@@ -1301,8 +1639,13 @@ impl Tomlook {
                             ui.weak(language.text(&format!("MSX: {}", msx.name)));
                         }
                         None => {
-                            ui.weak(language.text("Local customer without an MSX link"));
+                            ui.weak(language.text(kind_note(customer)));
                         }
+                    }
+                    match customer.kind {
+                        model::Kind::Partner => chip(ui, "Partner", ui.visuals().weak_text_color()),
+                        model::Kind::Ignored => chip(ui, &language.text("Don't track"), ui.visuals().weak_text_color()),
+                        model::Kind::Customer => {}
                     }
                     if customer.sample {
                         chip(ui, &language.text("Sample data"), ui.visuals().weak_text_color());
@@ -1314,26 +1657,20 @@ impl Tomlook {
             self.customers.selected = Some(id);
             self.customers.remove = None;
         }
-        let unconfirmed = self.unconfirmed_domains(book);
+        let unconfirmed = self.unconfirmed_organizations(book);
         if !unconfirmed.is_empty() {
             ui.add_space(10.0);
+            let mut chosen = None;
             card(ui, accent, &language.text("Unconfirmed customers in your meetings"), Some(unconfirmed.len()), |ui| {
-                let mut confirm = None;
-                for (domain, people, meetings) in &unconfirmed {
-                    ui.push_id(("unconfirmed-domain", domain), |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(language.text(&format!("Unconfirmed customer: {domain}")));
-                            ui.weak(language.text(&format!("Meetings: {meetings}")));
-                            if ui.small_button(language.text("Confirm customer")).clicked() {
-                                confirm = Some((domain.clone(), people.clone()));
-                            }
-                        });
-                    });
-                }
-                if let Some((domain, people)) = confirm {
-                    self.open_customer_confirmation(&domain, people);
+                for (organization, meetings) in &unconfirmed {
+                    if let Some(action) = self.organization_row(ui, book, organization, Some(*meetings)) {
+                        chosen = Some(action);
+                    }
                 }
             });
+            if let Some(action) = chosen {
+                self.apply_organization(action);
+            }
         }
     }
 
@@ -1393,7 +1730,7 @@ impl Tomlook {
                 }
             }
             None => {
-                ui.weak(language.text("Local customer without an MSX link"));
+                ui.weak(language.text(kind_note(&customer)));
             }
         });
         let mut edit = false;

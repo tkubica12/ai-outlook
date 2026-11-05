@@ -766,6 +766,10 @@ pub enum Evidence {
     ContactDomain { domain: String, contacts: usize },
     NameSimilarity { name: String, similarity: f32 },
     DomainMatchesName { domain: String },
+    /// The account belongs to the signed-in user's account team.
+    Territory,
+    /// Another matching account shares this account's MSX top parent.
+    TopParent { account: String, tpid: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -783,6 +787,8 @@ pub struct AccountCandidate {
 }
 
 const TPID_COLUMNS: [&str; 3] = ["msp_mstopparentid", "msp_tpid", "msp_accounttpid"];
+/// Account-team accounts read for the customer picker.
+const TERRITORY_LIMIT: usize = 100;
 
 pub(super) fn account(row: &Value) -> Option<AccountCandidate> {
     let id = guid(row, "accountid")?;
@@ -867,6 +873,19 @@ pub enum Selection {
 }
 
 pub fn select(candidates: &[AccountCandidate]) -> Selection {
+    // One plausible account of the user's own territory is the expected customer.
+    if let [only] = candidates
+        .iter()
+        .filter(|candidate| candidate.evidence.contains(&Evidence::Territory))
+        .collect::<Vec<_>>()
+        .as_slice()
+        && only.confidence >= 0.6
+        && candidates.first().is_some_and(|first| first.id == only.id)
+    {
+        return Selection::Likely {
+            account_id: only.id.clone(),
+        };
+    }
     match candidates {
         [] => Selection::NoMatch,
         [first, rest @ ..]
@@ -881,6 +900,71 @@ pub fn select(candidates: &[AccountCandidate]) -> Selection {
         }
         _ => Selection::Ambiguous,
     }
+}
+
+/// Boosts matching accounts of the user's territory. A matching account outside it that shares
+/// the MSX top parent (TPID) of a territory account is represented by that territory account,
+/// e.g. a pharmacy chain subsidiary by its owning group.
+pub fn apply_territory(
+    candidates: Vec<AccountCandidate>,
+    territory: &[AccountCandidate],
+) -> Vec<AccountCandidate> {
+    const BOOST: f32 = 0.3;
+    let mut merged = BTreeMap::<String, AccountCandidate>::new();
+    for candidate in candidates {
+        let owned = territory.iter().find(|account| account.id == candidate.id);
+        let parent = owned.is_none().then(|| {
+            candidate.tpid.as_ref().and_then(|tpid| {
+                territory
+                    .iter()
+                    .find(|account| account.tpid.as_ref() == Some(tpid))
+                    .map(|account| (account, tpid.clone()))
+            })
+        });
+        let candidate = match (owned, parent.flatten()) {
+            (Some(_), _) => {
+                let mut candidate = candidate;
+                candidate.evidence.push(Evidence::Territory);
+                candidate.confidence += BOOST;
+                candidate
+            }
+            (None, Some((account, tpid))) => {
+                let mut parent = account.clone();
+                parent.evidence = candidate.evidence;
+                parent.evidence.push(Evidence::TopParent {
+                    account: candidate.name,
+                    tpid,
+                });
+                parent.evidence.push(Evidence::Territory);
+                parent.confidence = candidate.confidence + BOOST;
+                parent
+            }
+            (None, None) => candidate,
+        };
+        let mut candidate = candidate;
+        candidate.confidence = (candidate.confidence.min(0.95) * 100.0).round() / 100.0;
+        match merged.get_mut(&candidate.id) {
+            Some(existing) if existing.confidence >= candidate.confidence => {
+                for item in candidate.evidence {
+                    if !existing.evidence.contains(&item) {
+                        existing.evidence.push(item);
+                    }
+                }
+            }
+            Some(existing) => {
+                for item in std::mem::take(&mut existing.evidence) {
+                    if !candidate.evidence.contains(&item) {
+                        candidate.evidence.push(item);
+                    }
+                }
+                *existing = candidate;
+            }
+            None => {
+                merged.insert(candidate.id.clone(), candidate);
+            }
+        }
+    }
+    merged.into_values().collect()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -933,6 +1017,8 @@ pub struct AccountLookup {
     pub requires_confirmation: bool,
     pub rejected_inputs: Vec<String>,
     pub sources: Vec<Source>,
+    /// The signed-in user's account-team accounts to choose from; empty when unavailable.
+    pub territory: Vec<AccountCandidate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1247,6 +1333,7 @@ impl Client {
                 requires_confirmation: true,
                 rejected_inputs,
                 sources: Vec::new(),
+                territory: Vec::new(),
             });
         }
         let schema = self.table_schema("account").await;
@@ -1314,7 +1401,7 @@ impl Client {
                 accounts.entry(candidate.id.clone()).or_insert(candidate);
             }
         }
-        let mut candidates = accounts
+        let candidates = accounts
             .into_values()
             .map(|mut candidate| {
                 let hits = contacts.get(&candidate.id).cloned().unwrap_or_default();
@@ -1323,6 +1410,15 @@ impl Client {
             })
             .filter(|candidate| !candidate.evidence.is_empty())
             .collect::<Vec<_>>();
+        // The territory only ranks candidates; without it the lookup still works.
+        let territory = match self.territory().await {
+            Ok(territory) => {
+                sources.push(territory.source);
+                territory.value
+            }
+            Err(_) => Vec::new(),
+        };
+        let mut candidates = apply_territory(candidates, &territory);
         candidates.sort_by(|left, right| {
             right
                 .confidence
@@ -1336,7 +1432,60 @@ impl Client {
             requires_confirmation: true,
             rejected_inputs,
             sources,
+            territory,
         })
+    }
+
+    /// Active accounts whose account team includes the signed-in MSX user, read once per
+    /// token identity.
+    pub async fn territory(&self) -> Result<Sourced<Vec<AccountCandidate>>, String> {
+        let user = self.whoami().await?;
+        let claims = self
+            .connection(Resource::Dataverse)
+            .await
+            .map_err(|error| error.message().to_owned())?
+            .claims;
+        let mut cached = self.territory.lock().await;
+        if let Some((identity, territory)) = cached.as_ref()
+            && *identity == claims
+        {
+            return Ok(territory.clone());
+        }
+        let schema = self.table_schema("account").await;
+        let columns = schema
+            .select(
+                &["accountid", "name"],
+                &["websiteurl", "accountnumber", "ownerid"],
+                &[
+                    "owneridname",
+                    "msp_mstopparentid",
+                    "msp_tpid",
+                    "msp_accounttpid",
+                ],
+            )
+            .iter()
+            .map(|column| format!("account.{column}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT TOP {TERRITORY_LIMIT} {columns} FROM account JOIN team ON team.regardingobjectid = account.accountid JOIN teammembership ON team.teamid = teammembership.teamid WHERE teammembership.systemuserid = {} AND account.statecode = 0 ORDER BY account.name",
+            sql_string(&user.value.id)
+        );
+        let (rows, source) = self
+            .read("account, team, teammembership", sql, TERRITORY_LIMIT)
+            .await?;
+        let mut seen = BTreeSet::new();
+        let accounts = rows
+            .iter()
+            .filter_map(account)
+            .filter(|account| seen.insert(account.id.clone()))
+            .collect::<Vec<_>>();
+        let territory = Sourced {
+            value: accounts,
+            source,
+        };
+        *cached = Some((claims, territory.clone()));
+        Ok(territory)
     }
 
     /// Open opportunities, active future milestones and the user's owned milestone tasks.

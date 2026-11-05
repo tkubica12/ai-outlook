@@ -193,6 +193,13 @@ pub enum Command {
         domains: Vec<String>,
         names: Vec<String>,
     },
+    /// The same read-only search in the background for a meeting card's suggestion; it never
+    /// cancels an explicit search.
+    CustomerTip {
+        id: u64,
+        domains: Vec<String>,
+        names: Vec<String>,
+    },
     /// One explicit research of recent communication with a customer's people.
     CustomerResearch(Box<crate::customers::research::Request>),
     Stop,
@@ -907,6 +914,7 @@ impl Engine {
                 let mut connector_disabled = std::collections::BTreeSet::new();
                 let mut desired_workiq: Option<String> = None;
                 let mut workiq_retry = crate::retry::Retry::default();
+                let mut workiq_sign_in = crate::retry::SignIn::default();
                 let mut connector_revision_pending = Some(String::new());
                 let (external_progress, mut external_updates) = async_mpsc::channel(8);
                 let mut tasks = tokio::task::JoinSet::new();
@@ -1014,6 +1022,32 @@ impl Engine {
                                 Completion::HostedWorkiq { generation, result }
                             });
                         }
+                        if hosted_cancel.is_none() && workiq.is_none() && desired_workiq.is_some()
+                            && workiq_sign_in.take_due(Instant::now())
+                            && let Some(account) = desired_workiq.clone() {
+                            workiq_retry.clear();
+                            workiq_generation += 1;
+                            let generation = workiq_generation;
+                            let (cancel, cancelled) = watch::channel(false);
+                            hosted_cancel = Some(cancel);
+                            let root = root.clone();
+                            let shutdown = stopped.clone();
+                            let output = output.clone();
+                            let context = context.clone();
+                            telemetry.record("workiq", "automatic_sign_in_started", None, 0);
+                            notify(Notice::HostedWorkiq { busy: true, ready: false, message: "Saved WorkIQ sign-in expired; opening browser sign-in automatically...".into() });
+                            tasks.spawn(async move {
+                                let progress = move |phase: crate::workiq::hosted::Phase| {
+                                    if let Err(error) = output.send(Notice::HostedWorkiq { busy: true, ready: false, message: phase.message().into() }) {
+                                        eprintln!("Tomlook: {error}");
+                                    }
+                                    context.request_repaint();
+                                };
+                                let result = hosted_check(cancelled, shutdown,
+                                    crate::workiq::connection::Connection::connect_saved(&root, &account, true, progress)).await.map(Arc::new);
+                                Completion::HostedWorkiq { generation, result }
+                            });
+                        }
                         if msx_cancel.is_none() && msx_retry.due(Instant::now())
                             && let Some(client) = msx.clone() {
                             msx_retry.started();
@@ -1115,7 +1149,7 @@ impl Engine {
                     }
                     let heartbeat = Instant::now() + Duration::from_secs(30);
                     let retry_deadline = connector_retries.values().filter_map(crate::retry::Retry::deadline)
-                        .chain(workiq_retry.deadline()).chain(ai_retry.deadline()).chain(msx_retry.deadline()).min()
+                        .chain(workiq_retry.deadline()).chain(workiq_sign_in.deadline()).chain(ai_retry.deadline()).chain(msx_retry.deadline()).min()
                         .unwrap_or(heartbeat).min(heartbeat);
                     tokio::select! {
                         biased;
@@ -1628,6 +1662,7 @@ impl Engine {
                                     };
                                     desired_workiq = Some(account.clone());
                                     workiq_retry.clear();
+                                    workiq_sign_in.cancel();
                                     let (cancel, cancelled) = watch::channel(false);
                                     hosted_cancel = Some(cancel);
                                     let shutdown = stopped.clone();
@@ -1651,11 +1686,13 @@ impl Engine {
                                 Some(Command::CancelWorkiq) => {
                                     desired_workiq = None;
                                     workiq_retry.clear();
+                                    workiq_sign_in.cancel();
                                     if let Some(cancel) = &hosted_cancel { let _ = cancel.send(true); }
                                 }
                                 Some(Command::DisconnectWorkiq(account)) => {
                                     desired_workiq = None;
                                     workiq_retry.clear();
+                                    workiq_sign_in.cancel();
                                     visible_refresh = None;
                                     background_refresh = None;
                                     photos_queue.clear();
@@ -1937,13 +1974,18 @@ impl Engine {
                                         Completion::Lookup(Box::new(Notice::CustomerMsx { id, customer, result }))
                                     });
                                 }
-                                Some(Command::CustomerAccounts { id, domains, names }) => {
+                                Some(command @ (Command::CustomerAccounts { .. } | Command::CustomerTip { .. })) => {
+                                    let (lane, id, domains, names) = match command {
+                                        Command::CustomerAccounts { id, domains, names } => ("customer-accounts", id, domains, names),
+                                        Command::CustomerTip { id, domains, names } => ("customer-tip", id, domains, names),
+                                        _ => unreachable!(),
+                                    };
                                     let client = msx.clone().filter(|client| !demo && client.ready(crate::msx::Resource::Dataverse));
                                     let reason = if demo { crate::msx::DEMO.to_owned() }
                                         else if msx.is_none() { crate::msx::DISABLED.to_owned() }
                                         else { "MSX is not connected. Sign in from the MSX status first; nothing was read.".to_owned() };
                                     let (cancel, cancelled) = watch::channel(false);
-                                    if let Some(previous) = lookup_cancels.insert("customer-accounts", cancel) { let _ = previous.send(true); }
+                                    if let Some(previous) = lookup_cancels.insert(lane, cancel) { let _ = previous.send(true); }
                                     let shutdown = stopped.clone();
                                     tasks.spawn(async move {
                                         let result = match client {
@@ -2141,6 +2183,7 @@ impl Engine {
                                     match result {
                                         Ok(connection) if current && !stopping && !cancelled && desired_workiq.is_some() => {
                                             workiq_retry.clear();
+                                            workiq_sign_in.cancel();
                                             telemetry.record("workiq", "verified", None, 0);
                                             workiq_connected.store(true, Ordering::Release);
                                             notify(Notice::HostedWorkiq { busy: false, ready: true, message: format!("Connected as {}", connection.account) });
@@ -2165,7 +2208,15 @@ impl Engine {
                                             if let Some(delay) = delay {
                                                 telemetry.record("workiq", "retry_scheduled_seconds", None, delay.as_secs());
                                             }
-                                            notify(Notice::HostedWorkiq { busy: false, ready: false, message: crate::retry::failure_message(error, delay) });
+                                            let message = if delay.is_none() && desired_workiq.is_some() && !stopping && !cancelled
+                                                && crate::retry::needs_sign_in(&error) {
+                                                let wait = workiq_sign_in.schedule(Instant::now());
+                                                telemetry.record("workiq", "automatic_sign_in_scheduled_seconds", None, wait.as_secs());
+                                                format!("{error}\nAutomatic browser sign-in in about {} minutes.", wait.as_secs().div_ceil(60))
+                                            } else {
+                                                crate::retry::failure_message(error, delay)
+                                            };
+                                            notify(Notice::HostedWorkiq { busy: false, ready: false, message });
                                         }
                                         Err(error) => telemetry.failure("workiq", &error, None),
                                     }

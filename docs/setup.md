@@ -211,7 +211,8 @@ profile.
 | Copilot connects but is rejected | Only the stored `user` identity of Tomlook's isolated Copilot home is accepted, never `gh` or environment identities; sign in again from the GitHub Copilot dialog. |
 | Days show **Not synced** | WorkIQ is not connected or synchronization failed; see WorkIQ status and **Retry sync**. Unsynced days are never shown as free. |
 | Automatic Insights do not start | Check **Identity match** in the setup checklist: both connections, the WorkIQ account that owns the calendar, today synchronized, Insights not paused. |
-| A connection shows its next retry delay | A transient error; Tomlook retries after 30 s, 1, 2, 4 and 8 minutes, then every 15 minutes, using only the saved sign-in. Rejected credentials or policy errors need a new sign-in. |
+| A connection shows its next retry delay | A transient error, including a network that is not up yet after sleep; Tomlook retries after 30 s, 1, 2, 4 and 8 minutes, then every 15 minutes, using only the saved sign-in. Rejected credentials or policy errors need a new sign-in. |
+| WorkIQ shows **Automatic browser sign-in in about N minutes** | Microsoft Entra rejected the saved WorkIQ sign-in. Tomlook opens browser sign-in for the selected account by itself, at most once per hour; with Windows single sign-on it usually completes without clicking. **Disconnect** stops it. |
 | Daily AI limit reached | New AI work waits until tomorrow; raise the limit in **Insights activity → AI usage**. |
 | A calendar change is rejected with an HTTP status | The provider or tenant policy refused it; nothing was changed. You can try again explicitly. |
 | A change shows as uncertain | The result is unknown. Check Outlook, then use **Check calendar result**; Tomlook never resubmits it by itself. |

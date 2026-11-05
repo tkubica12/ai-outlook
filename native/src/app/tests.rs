@@ -8224,7 +8224,7 @@ fn customer_panel_shows_timeline_notes_tasks_msx_states_consumption_and_communic
         click_text(&context, &mut app, show, language.text("All customers").as_ref());
         let text = settled(&context, &mut app, show);
         assert!(app.customers.selected.is_none());
-        assert!(text.contains(&language.text("Unconfirmed customer: orbit.example").into_owned()), "{text}");
+        assert!(text.contains(&language.text("Unconfirmed: Orbit").into_owned()), "{text}");
         assert!(text.contains(language.text("Unconfirmed customers in your meetings").as_ref()));
     }
 }
@@ -8240,15 +8240,16 @@ fn meeting_card_confirms_customers_only_after_an_explicit_choice() {
         let card = orbit.clone();
         let show: Show = &move |app: &mut Tomlook, ui: &mut egui::Ui| { app.customer_card(ui, &card); app.confirm_customer_dialog(ui.ctx()); };
         let text = settled(&context, &mut app, show);
-        assert!(text.contains(&language.text("Unconfirmed customer: orbit.example").into_owned()), "{text}");
+        assert!(text.contains(&language.text("Unconfirmed: Orbit").into_owned()) && text.contains("orbit.example"), "{text}");
         assert!(text.contains("Kim Lambert") && text.contains(language.text("Not a customer meeting").as_ref()));
-        click_text(&context, &mut app, show, language.text("Confirm customer").as_ref());
+        assert!(text.contains(&language.text("Confirm Orbit").into_owned()), "Without MSX a local customer is one click\n{text}");
+        click_text(&context, &mut app, show, language.text("Choose customer...").as_ref());
         assert!(app.customers.confirm.is_some());
         assert!(ai_commands.try_recv().is_err(), "MSX is not connected: no account search");
         let text = settled(&context, &mut app, show);
         for label in ["Customer name", "E-mail domains", "Local customer only (no MSX link)",
             "MSX is not connected; you can confirm a local customer now and link MSX later.",
-            "Inferred matches are never linked without your confirmation.", "Confirm"] {
+            "Inferred matches are never linked without your confirmation.", "Confirm", "Customer organization", "Partner organization", "Don't track"] {
             assert!(text.contains(language.text(label).as_ref()), "{language:?}: missing {label}\n{text}");
         }
         assert!(receiver.try_iter().all(|command| !matches!(command, Command::Customer(_))), "Opening the dialog saves nothing");
@@ -8260,17 +8261,25 @@ fn meeting_card_confirms_customers_only_after_an_explicit_choice() {
         assert_eq!((saved.name.as_str(), saved.domains.as_slice(), saved.msx.is_none(), saved.confirmed), ("Orbit", &["orbit.example".to_owned()][..], true, true));
         assert!(app.customers.confirm.is_none());
 
+        click_text(&context, &mut app, show, language.text("It's a partner").as_ref());
+        let partner = receiver.try_iter().find_map(|command| match command {
+            Command::Customer(tomlook::worker::CustomerCommand::Save(customer)) => Some(customer),
+            _ => None,
+        }).expect("One click remembers a partner");
+        assert_eq!((partner.kind, partner.msx.is_none(), partner.domains.as_slice()), (tomlook::customers::Kind::Partner, true, &["orbit.example".to_owned()][..]));
+
         notices.send(ai::Notice::Msx(msx_status(Phase::Connected, tomlook::msx::CONNECTED, None))).unwrap();
         app.receive();
-        click_text(&context, &mut app, show, language.text("Confirm customer").as_ref());
-        let search = match ai_commands.try_recv() {
-            Ok(ai::Command::CustomerAccounts { id, domains, names }) => {
+        let text = settled(&context, &mut app, show);
+        let tip = match ai_commands.try_recv() {
+            Ok(ai::Command::CustomerTip { id, domains, names }) => {
                 assert_eq!((domains, names), (vec!["orbit.example".to_owned()], vec!["Orbit".to_owned()]));
                 id
             }
-            _ => panic!("MSX connected: candidates are searched"),
+            _ => panic!("MSX connected: the card looks for a suggestion in the background"),
         };
-        assert!(settled(&context, &mut app, show).contains(language.text("Searching MSX for matching customers...").as_ref()));
+        assert!(ai_commands.try_recv().is_err(), "One background lookup per organization");
+        assert!(text.contains(language.text("Looking for the customer in MSX...").as_ref()), "{text}");
         let candidate = |id: &str, name: &str, confidence: f32| tomlook::msx::dataverse::AccountCandidate {
             id: id.into(), name: name.into(), tpid: Some("777".into()), account_number: None, website: Some("https://www.orbit.example".into()),
             owner: Some(tomlook::msx::dataverse::Owner { id: None, name: Some("Jamie Brooks".into()) }),
@@ -8278,18 +8287,34 @@ fn meeting_card_confirms_customers_only_after_an_explicit_choice() {
             evidence: vec![tomlook::msx::dataverse::Evidence::WebsiteDomain { domain: "orbit.example".into(), website: "https://www.orbit.example".into() }],
         };
         let likely = "11111111-0000-4000-8000-000000000001";
-        notices.send(ai::Notice::CustomerAccounts { id: search, result: Ok(tomlook::msx::dataverse::AccountLookup {
-            candidates: vec![candidate(likely, "Orbit Systems", 0.82), candidate("22222222-0000-4000-8000-000000000002", "Orbit Travel", 0.4)],
+        let mut systems = candidate(likely, "Orbit Systems", 0.82);
+        systems.evidence.push(tomlook::msx::dataverse::Evidence::Territory);
+        let territory = candidate("33333333-0000-4000-8000-000000000003", "Northstar Group", 0.0);
+        notices.send(ai::Notice::CustomerAccounts { id: tip, result: Ok(tomlook::msx::dataverse::AccountLookup {
+            candidates: vec![systems.clone(), candidate("22222222-0000-4000-8000-000000000002", "Orbit Travel", 0.4)],
             selection: tomlook::msx::dataverse::Selection::Likely { account_id: likely.into() },
-            requires_confirmation: true, rejected_inputs: vec![], sources: vec![],
+            requires_confirmation: true, rejected_inputs: vec![], sources: vec![], territory: vec![systems, territory],
         }) }).unwrap();
         app.receive();
         assert!(receiver.try_iter().all(|command| !matches!(command, Command::Customer(_))), "A likely match is never saved silently");
         let text = settled(&context, &mut app, show);
+        for expected in [language.text("Suggestion: MSX customer Orbit Systems").into_owned(), language.text("Your territory").into_owned(), "TPID 777".into()] {
+            assert!(text.contains(&expected), "{language:?}: missing {expected}\n{text}");
+        }
+        click_text(&context, &mut app, show, language.text("Confirm Orbit → Orbit Systems").as_ref());
+        let quick = receiver.try_iter().find_map(|command| match command {
+            Command::Customer(tomlook::worker::CustomerCommand::Save(customer)) => Some(customer),
+            _ => None,
+        }).expect("One click confirms the suggestion");
+        assert_eq!((quick.name.as_str(), quick.msx.as_ref().map(|msx| msx.id.as_str())), ("Orbit", Some(likely)), "The meeting's name stays, linked to MSX");
+
+        click_text(&context, &mut app, show, language.text("Choose customer...").as_ref());
+        assert!(ai_commands.try_recv().is_err(), "The dialog reuses the background suggestion");
+        let text = settled(&context, &mut app, show);
         for expected in [
             language.text("Likely match").into_owned(), "Orbit Systems".into(), "Orbit Travel".into(), "TPID 777".into(),
             language.text("Confidence 82%").into_owned(), language.text("Website https://www.orbit.example matches orbit.example").into_owned(),
-            language.text("Owner: Jamie Brooks").into_owned(),
+            language.text("Owner: Jamie Brooks").into_owned(), language.text("Your MSX territory").into_owned(), "Northstar Group".into(),
         ] {
             assert!(text.contains(&expected), "{language:?}: missing {expected}\n{text}");
         }
@@ -8395,7 +8420,7 @@ fn demo_customer_panel_shows_marked_sample_data_and_never_reads_msx_or_asks_ai()
         let card_event = app.calendar.events.iter().find(|event| event.title == "Orbit / Project kickoff").unwrap().clone();
         let card: Show = &move |app: &mut Tomlook, ui: &mut egui::Ui| app.customer_card(ui, &card_event);
         let text = settled(&context, &mut app, card);
-        assert!(text.contains(&language.text("Unconfirmed customer: orbit.invalid").into_owned()), "{text}");
+        assert!(text.contains(&language.text("Unconfirmed: Orbit").into_owned()), "{text}");
         assert!(!text.contains("example.invalid"), "Fictional colleagues are the demo user's own organization");
     }
 }

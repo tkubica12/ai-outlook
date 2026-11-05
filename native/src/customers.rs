@@ -169,6 +169,24 @@ impl MsxAccount {
     }
 }
 
+/// What an organization is to the user.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    #[default]
+    Customer,
+    /// A partner or vendor: remembered locally, never linked to MSX or treated as a customer.
+    Partner,
+    /// An organization the user does not track; its domains are never offered again.
+    Ignored,
+}
+
+impl Kind {
+    pub fn is_customer(&self) -> bool {
+        *self == Self::Customer
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Customer {
@@ -186,6 +204,8 @@ pub struct Customer {
     /// Fictional demo data, never from MSX or AI.
     #[serde(default)]
     pub sample: bool,
+    #[serde(default, skip_serializing_if = "Kind::is_customer")]
+    pub kind: Kind,
 }
 
 fn new_id(account: &str, name: &str, now: DateTime<Utc>) -> String {
@@ -243,6 +263,7 @@ impl Customer {
             created_at: now,
             updated_at: now,
             sample: false,
+            kind: Kind::Customer,
         };
         customer.validate()?;
         Ok(customer)
@@ -269,6 +290,9 @@ impl Customer {
             return Err("Customer domains are invalid".into());
         }
         if let Some(msx) = &self.msx {
+            if !self.kind.is_customer() {
+                return Err("Only customers can be linked to MSX".into());
+            }
             msx.validate()?;
         }
         if self.updated_at < self.created_at {
@@ -469,6 +493,12 @@ pub enum Party {
         people: Vec<String>,
         pinned: bool,
     },
+    /// A saved partner or vendor; never a customer of the meeting.
+    Partner {
+        id: String,
+        domains: Vec<String>,
+        people: Vec<String>,
+    },
     /// An external domain no confirmed customer covers yet.
     Unconfirmed { domain: String, people: Vec<String> },
 }
@@ -484,7 +514,7 @@ impl Detection {
     pub fn customers(&self) -> impl Iterator<Item = &str> {
         self.parties.iter().filter_map(|party| match party {
             Party::Customer { id, .. } => Some(id.as_str()),
-            Party::Unconfirmed { .. } => None,
+            Party::Partner { .. } | Party::Unconfirmed { .. } => None,
         })
     }
 
@@ -506,7 +536,7 @@ pub fn detect(book: &Book, detector: &Detector, account: &str, event: &Event) ->
         }
         Some(Override {
             customer: Some(id), ..
-        }) if book.customers.contains_key(id) => {
+        }) if book.customers.get(id).is_some_and(|customer| customer.kind.is_customer()) => {
             let customer = &book.customers[id];
             let (matched, people): (Vec<_>, Vec<_>) = domains
                 .iter()
@@ -526,17 +556,25 @@ pub fn detect(book: &Book, detector: &Detector, account: &str, event: &Event) ->
         _ => {}
     }
     let mut customers = BTreeMap::<String, (Vec<String>, Vec<String>)>::new();
+    let mut partners = BTreeMap::<String, (Vec<String>, Vec<String>)>::new();
     let mut unconfirmed = Vec::new();
     for (domain, people) in domains {
         match book.customer_for(&domain) {
+            Some(customer) if customer.kind == Kind::Ignored => {}
             Some(customer) => {
-                let entry = customers.entry(customer.id.clone()).or_default();
+                let target = if customer.kind == Kind::Partner {
+                    &mut partners
+                } else {
+                    &mut customers
+                };
+                let entry = target.entry(customer.id.clone()).or_default();
                 entry.0.push(domain);
                 entry.1.extend(people);
             }
             None => unconfirmed.push((domain, people)),
         }
     }
+    let name = |id: &str| book.customers[id].name.to_lowercase();
     let mut parties = customers
         .into_iter()
         .map(|(id, (domains, people))| Party::Customer {
@@ -547,9 +585,18 @@ pub fn detect(book: &Book, detector: &Detector, account: &str, event: &Event) ->
         })
         .collect::<Vec<_>>();
     parties.sort_by_key(|party| match party {
-        Party::Customer { id, .. } => book.customers[id].name.to_lowercase(),
+        Party::Customer { id, .. } | Party::Partner { id, .. } => name(id),
         Party::Unconfirmed { .. } => String::new(),
     });
+    let mut partners = partners
+        .into_iter()
+        .map(|(id, (domains, people))| Party::Partner { id, domains, people })
+        .collect::<Vec<_>>();
+    partners.sort_by_key(|party| match party {
+        Party::Customer { id, .. } | Party::Partner { id, .. } => name(id),
+        Party::Unconfirmed { .. } => String::new(),
+    });
+    parties.extend(partners);
     unconfirmed.sort_by(|(left, a), (right, b)| b.len().cmp(&a.len()).then(left.cmp(right)));
     parties.extend(
         unconfirmed
@@ -560,6 +607,118 @@ pub fn detect(book: &Book, detector: &Detector, account: &str, event: &Event) ->
         parties,
         excluded: false,
     }
+}
+
+/// Unconfirmed external domains that most likely belong to one organization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Organization {
+    /// Suggested display name, from attendee affiliations or the domain.
+    pub name: String,
+    pub domains: Vec<String>,
+    pub people: Vec<String>,
+    /// A saved customer or partner with a same-named domain the domains likely belong to.
+    pub related: Option<String>,
+}
+
+impl Organization {
+    /// Stable identity of the group within a session.
+    pub fn key(&self) -> String {
+        self.domains.join(",")
+    }
+}
+
+/// The distinctive label of a domain as lowercase letters and digits: `dr-max.global` and
+/// `drmax.eu` both give `drmax`.
+pub fn organization_stem(domain: &str) -> String {
+    let labels = domain.split('.').collect::<Vec<_>>();
+    let index = if labels.len() >= 3 && labels[labels.len() - 2].len() <= 3 {
+        labels.len() - 3
+    } else {
+        labels.len().saturating_sub(2)
+    };
+    alphanumeric(labels.get(index).copied().unwrap_or(domain))
+}
+
+fn alphanumeric(text: &str) -> String {
+    text.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+/// The organization in a display name such as `NOVÁK Jan (Contoso CZ) <jan@contoso.cz>`.
+fn affiliation(person: &str) -> Option<&str> {
+    let name = person.split('<').next().unwrap_or(person);
+    let (_, rest) = name.rsplit_once('(')?;
+    let inner = rest.split(')').next()?.trim();
+    (!inner.is_empty() && inner.chars().count() <= 60 && !inner.chars().any(char::is_control))
+        .then_some(inner)
+}
+
+/// A display name for domains sharing `stem`: the words all attendee affiliations start with
+/// when they name the same organization, otherwise the domain's own label.
+fn organization_name(stem: &str, domains: &[String], people: &[String]) -> String {
+    let affiliations = people.iter().filter_map(|person| affiliation(person)).collect::<Vec<_>>();
+    let common = affiliations.split_first().map(|(first, rest)| {
+        let mut words = first.split_whitespace().collect::<Vec<_>>();
+        for other in rest {
+            let other = other.split_whitespace().collect::<Vec<_>>();
+            let shared = words
+                .iter()
+                .zip(&other)
+                .take_while(|(left, right)| left.eq_ignore_ascii_case(right))
+                .count();
+            words.truncate(shared);
+        }
+        words.join(" ")
+    });
+    common
+        .filter(|name| {
+            let folded = alphanumeric(name);
+            folded.len() >= 3 && (folded.starts_with(stem) || stem.starts_with(&folded))
+        })
+        .map(|name| bounded(&name, NAME_LIMIT))
+        .unwrap_or_else(|| suggested_name(&domains[0]))
+}
+
+/// Groups a meeting's unconfirmed domains by organization, in order of appearance.
+pub fn organizations(book: &Book, parties: &[Party]) -> Vec<Organization> {
+    let mut groups = Vec::<(String, Vec<String>, Vec<String>)>::new();
+    for party in parties {
+        let Party::Unconfirmed { domain, people } = party else {
+            continue;
+        };
+        let stem = organization_stem(domain);
+        match groups.iter_mut().find(|(other, ..)| stem.len() >= 3 && *other == stem) {
+            Some((_, domains, members)) => {
+                domains.push(domain.clone());
+                members.extend(people.iter().cloned());
+            }
+            None => groups.push((stem, vec![domain.clone()], people.clone())),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(stem, domains, people)| Organization {
+            name: organization_name(&stem, &domains, &people),
+            related: (stem.len() >= 3)
+                .then(|| {
+                    book.sorted()
+                        .into_iter()
+                        .filter(|customer| customer.confirmed && customer.kind != Kind::Ignored)
+                        .find(|customer| {
+                            customer
+                                .domains
+                                .iter()
+                                .any(|domain| organization_stem(domain) == stem)
+                        })
+                        .map(|customer| customer.id.clone())
+                })
+                .flatten(),
+            domains,
+            people,
+        })
+        .collect()
 }
 
 /// Cancelled, declined and held-time meetings are not part of a customer's history.
@@ -616,10 +775,10 @@ pub fn timeline(
     let recent = now - Duration::days(RECENT_DAYS);
     for event in calendar.events.iter().filter(|event| counted(event)) {
         let detection = detect(book, detector, account, event);
-        let Some(Party::Customer { people: attendees, .. }) = detection
+        let Some(Party::Customer { people: attendees, .. } | Party::Partner { people: attendees, .. }) = detection
             .parties
             .iter()
-            .find(|party| matches!(party, Party::Customer { id, .. } if id == customer))
+            .find(|party| matches!(party, Party::Customer { id, .. } | Party::Partner { id, .. } if id == customer))
         else {
             continue;
         };
@@ -1372,7 +1531,7 @@ pub fn preparation_input(
     let customers = detection
         .customers()
         .filter_map(|id| book.customers.get(id))
-        .filter(|customer| customer.confirmed)
+        .filter(|customer| customer.confirmed && customer.kind.is_customer())
         .take(2)
         .cloned()
         .collect::<Vec<_>>();

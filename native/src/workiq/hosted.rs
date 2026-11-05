@@ -150,9 +150,16 @@ fn auth_error(error: AuthError) -> String {
 }
 
 pub(super) fn initialization_error(error: rmcp::service::ClientInitializeError) -> String {
+    format!(
+        "Authenticated hosted WorkIQ initialization failed: {}; provider content withheld",
+        initialization_reason(&error)
+    )
+}
+
+fn initialization_reason(error: &rmcp::service::ClientInitializeError) -> String {
     use rmcp::service::ClientInitializeError;
     let authorization_required = error.is_authorization_required();
-    let reason = match &error {
+    match error {
         ClientInitializeError::JsonRpcError(data) => {
             format!("JSON-RPC error code {:?}", data.code)
         }
@@ -191,10 +198,7 @@ pub(super) fn initialization_error(error: rmcp::service::ClientInitializeError) 
             }
         }
         _ => "connection/lifecycle failure".into(),
-    };
-    format!(
-        "Authenticated hosted WorkIQ initialization failed: {reason}; provider content withheld"
-    )
+    }
 }
 
 async fn discovery(
@@ -209,10 +213,16 @@ async fn discovery(
                 .map_err(|_| "Close unexpected unauthenticated WorkIQ session failed")?;
             return Err("Hosted WorkIQ accepted initialization without authentication; refusing to read an unverified user context".into());
         }
-        Err(error) => error
-            .auth_challenge()
-            .ok_or("Hosted WorkIQ initialization failed without an OAuth challenge; no credentials or tools were used")?
-            .to_owned(),
+        Err(error) => match error.auth_challenge() {
+            Some(challenge) => challenge.to_owned(),
+            // Typically the network is not up yet (e.g. after sleep); the reason keeps it retryable.
+            None => {
+                return Err(format!(
+                    "Hosted WorkIQ discovery failed without an OAuth challenge: {}; no credentials or tools were used",
+                    initialization_reason(&error)
+                ));
+            }
+        },
     };
     let resource_url = url::Url::parse(ENDPOINT).map_err(|_| "Invalid fixed WorkIQ endpoint")?;
     let params = WWWAuthenticateParams::parse(&challenge, &resource_url);
@@ -226,7 +236,12 @@ async fn discovery(
         .get(RESOURCE_METADATA)
         .send()
         .await
-        .map_err(|error| format!("Fetch WorkIQ resource metadata: {}", error.without_url()))?;
+        .map_err(|error| {
+            format!(
+                "WorkIQ resource metadata could not reach the provider: {}",
+                error.without_url()
+            )
+        })?;
     if !response.status().is_success() {
         return Err(format!(
             "WorkIQ resource metadata returned HTTP {}",
@@ -238,7 +253,7 @@ async fn discovery(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| "Read WorkIQ resource metadata failed")?
+        .map_err(|_| "WorkIQ resource metadata transport failed")?
     {
         if body.len() + chunk.len() > 65_536 {
             return Err("WorkIQ resource metadata exceeded its 64 KiB limit".into());

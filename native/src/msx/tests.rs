@@ -177,6 +177,12 @@ fn dataverse(query: &str) -> Value {
             "{query}"
         );
         json!({"value":[{"systemuserid": USER, "fullname": "Signed In", "internalemailaddress": "someone@example.test"}]})
+    } else if query.contains("JOIN teammembership") {
+        assert!(query.contains(&format!("teammembership.systemuserid = '{USER}'")), "{query}");
+        json!({"value":[
+            {"account.accountid": ACCOUNT, "account.name": "Contoso Ltd", "account.msp_mstopparentid": "424242"},
+            {"account.accountid": ACCOUNT, "account.name": "Contoso Ltd", "account.msp_mstopparentid": "424242"}
+        ]})
     } else if query.contains("FROM contact JOIN account") {
         json!({"value":[
             {"account.accountid": ACCOUNT, "account.name": "Contoso Ltd", "account.websiteurl": "contoso.com"},
@@ -545,6 +551,8 @@ async fn accounts_are_ranked_with_evidence_and_need_confirmation() {
         }
     );
     assert_eq!(lookup.candidates[0].tpid.as_deref(), Some("424242"));
+    assert!(lookup.candidates[0].evidence.contains(&dataverse::Evidence::Territory));
+    assert_eq!(lookup.territory.len(), 1, "Duplicate team rows are one account");
     assert_eq!(lookup.rejected_inputs.len(), 2);
     assert!(
         lookup

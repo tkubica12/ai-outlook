@@ -324,6 +324,8 @@ pub struct Client {
     model: tokio::sync::Mutex<Option<Arc<acr::ModelSchema>>>,
     /// The resolved MSX user and the token identity it was resolved for.
     user: tokio::sync::Mutex<Option<(auth::Claims, Sourced<dataverse::SystemUser>)>>,
+    /// The user's account-team accounts and the token identity they were read for.
+    territory: tokio::sync::Mutex<Option<(auth::Claims, Sourced<Vec<dataverse::AccountCandidate>>)>>,
     status: std::sync::Mutex<Status>,
     publish: Publish,
 }
@@ -376,6 +378,7 @@ impl Client {
             schemas: std::sync::Mutex::new(BTreeMap::new()),
             model: tokio::sync::Mutex::new(None),
             user: tokio::sync::Mutex::new(None),
+            territory: tokio::sync::Mutex::new(None),
             status: std::sync::Mutex::new(Status::new(tenant)),
             publish,
         }

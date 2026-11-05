@@ -159,6 +159,68 @@ fn detection_uses_confirmed_customers_meeting_choices_and_keeps_unknown_domains_
 }
 
 #[test]
+fn unconfirmed_domains_group_by_organization_and_partners_or_ignored_ones_are_never_customers() {
+    let event = meeting(
+        "1",
+        "Hackathon",
+        at(2, 10),
+        60,
+        &[
+            "DLOUHÁ Markéta (Dr.Max BDC) <marketa@drmax.eu>",
+            "JURÁSEK Martin (Dr.Max SVK) <martin@drmax.sk>",
+            "VÁLKY Viktor (Dr.Max SVK) <viktor@dr-max.global>",
+            "jindrich.tuma <jindrich.tuma@bighub.cz>",
+            "Pat <pat@labs.example.co.uk>",
+        ],
+    );
+    let empty = book(&[]);
+    let detection = detect(&empty, &detector(), OWNER, &event);
+    let groups = organizations(&empty, &detection.parties);
+    assert_eq!(
+        groups.iter().map(|group| (group.name.as_str(), group.domains.clone())).collect::<Vec<_>>(),
+        [
+            ("Bighub", vec!["bighub.cz".to_owned()]),
+            ("Dr.Max", vec!["dr-max.global".to_owned(), "drmax.eu".to_owned(), "drmax.sk".to_owned()]),
+            ("Example", vec!["labs.example.co.uk".to_owned()]),
+        ]
+    );
+    assert_eq!(groups[1].people.len(), 3);
+    assert!(groups.iter().all(|group| group.related.is_none()));
+    assert_eq!(organization_stem("dr-max.global"), "drmax");
+    assert_eq!(organization_stem("mail.northstar.co.uk"), "northstar");
+
+    let drmax = customer("Dr.Max", &["drmax.eu"]);
+    let mut bighub = customer("BigHub", &["bighub.cz"]);
+    bighub.kind = Kind::Partner;
+    let mut ignored = customer("Example", &["example.co.uk"]);
+    ignored.kind = Kind::Ignored;
+    let mut saved = book(&[&drmax, &bighub, &ignored]);
+    let detection = detect(&saved, &detector(), OWNER, &event);
+    assert_eq!(detection.customers().collect::<Vec<_>>(), [drmax.id.as_str()]);
+    assert!(detection.parties.iter().any(|party| matches!(party, Party::Partner { id, people, .. } if *id == bighub.id && people.len() == 1)));
+    assert!(!detection.parties.iter().any(|party| matches!(party, Party::Unconfirmed { domain, .. } if domain.contains("example"))), "Ignored domains are never offered");
+    let groups = organizations(&saved, &detection.parties);
+    assert_eq!(groups.len(), 1);
+    assert_eq!((groups[0].domains.len(), groups[0].related.as_deref()), (2, Some(drmax.id.as_str())), "Other countries join the saved customer");
+    assert!(preparation_input(&saved, &detector(), OWNER, &event).is_some_and(|input| input.customers.len() == 1 && input.customers[0].id == drmax.id));
+
+    let partner_only = meeting("2", "Partner sync", at(3, 10), 30, &["Jindrich <jindrich.tuma@bighub.cz>"]);
+    assert!(preparation_input(&saved, &detector(), OWNER, &partner_only).is_none(), "A partner adds no customer context");
+    let pin = Override::new(OWNER, &partner_only, Some(bighub.id.clone()), Utc::now());
+    saved.overrides.insert(pin.occurrence.clone(), pin);
+    assert_eq!(detect(&saved, &detector(), OWNER, &partner_only).customers().count(), 0, "A partner is never pinned as the customer");
+    let timeline = timeline(&Calendar::default(), &saved, &detector(), OWNER, &bighub.id, now(), &|_| false, &|_| false);
+    assert!(timeline.past.is_empty() && timeline.upcoming.is_empty());
+
+    bighub.msx = Some(msx_account());
+    assert!(bighub.validate().is_err(), "Only customers link to MSX");
+    let json = serde_json::to_value(&drmax).unwrap();
+    assert!(json.get("kind").is_none(), "Customers keep the original stored format");
+    let restored: Customer = serde_json::from_value(serde_json::to_value(&ignored).unwrap()).unwrap();
+    assert_eq!(restored.kind, Kind::Ignored);
+}
+
+#[test]
 fn customers_validate_names_domains_ids_and_msx_links() {
     assert!(Customer::new(OWNER, "  Northstar   Inc ", &["@WWW.Northstar.com".into(), "northstar.com".into()], None, Utc::now())
         .is_ok_and(|customer| customer.name == "Northstar Inc" && customer.domains == ["northstar.com"]));

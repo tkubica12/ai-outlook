@@ -159,6 +159,58 @@ fn candidates_carry_evidence_and_ambiguity_is_never_silently_resolved() {
 }
 
 #[test]
+fn a_subsidiary_outside_the_territory_is_represented_by_its_territory_top_parent() {
+    let with = |id: char, name: &str, tpid: Option<&str>, confidence: f32| {
+        let mut candidate = candidate(id, name, None);
+        candidate.tpid = tpid.map(str::to_owned);
+        candidate.confidence = confidence;
+        candidate.evidence = vec![Evidence::ContactDomain {
+            domain: "drmax.eu".into(),
+            contacts: 2,
+        }];
+        candidate
+    };
+    let penta = with('a', "PENTA INVESTMENTS", Some("9582911"), 0.0);
+    let territory = vec![penta.clone(), with('e', "ALZA.CZ", Some("11202098"), 0.0)];
+    let candidates = vec![
+        with('b', "DR. MAX BDC", Some("9582911"), 0.65),
+        with('c', "DR. MAX", Some("45476255"), 0.75),
+        with('a', "PENTA INVESTMENTS", Some("9582911"), 0.55),
+    ];
+    let mut ranked = apply_territory(candidates, &territory);
+    ranked.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
+    assert_eq!(ranked.len(), 2, "The subsidiary merges into its territory parent");
+    assert_eq!((ranked[0].name.as_str(), ranked[0].confidence), ("PENTA INVESTMENTS", 0.95));
+    assert!(ranked[0].evidence.contains(&Evidence::Territory));
+    assert!(ranked[0].evidence.contains(&Evidence::TopParent {
+        account: "DR. MAX BDC".into(),
+        tpid: "9582911".into()
+    }));
+    assert_eq!(
+        select(&ranked),
+        Selection::Likely {
+            account_id: penta.id.clone()
+        }
+    );
+    let close = vec![
+        with('a', "PENTA INVESTMENTS", Some("9582911"), 0.4),
+        with('c', "DR. MAX", Some("45476255"), 0.65),
+    ];
+    let mut close = apply_territory(close, &territory);
+    close.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
+    assert_eq!(
+        select(&close),
+        Selection::Likely {
+            account_id: penta.id.clone()
+        },
+        "One territory account ahead of outside accounts is the expected customer"
+    );
+    let unchanged = apply_territory(vec![with('c', "DR. MAX", Some("45476255"), 0.75)], &[]);
+    assert_eq!(unchanged[0].confidence, 0.75);
+    assert!(!unchanged[0].evidence.contains(&Evidence::Territory));
+}
+
+#[test]
 fn records_parse_joined_columns_formatted_values_and_dates() {
     let opportunity = opportunity(&json!({
         "opportunityid": "{11111111-1111-1111-1111-111111111111}",

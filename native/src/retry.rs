@@ -34,6 +34,57 @@ impl Retry {
     }
 }
 
+/// Automatic browser sign-in after a saved sign-in is rejected, at most once per interval.
+#[derive(Default)]
+pub struct SignIn {
+    last: Option<Instant>,
+    deadline: Option<Instant>,
+}
+
+impl SignIn {
+    pub const INTERVAL: Duration = Duration::from_secs(3600);
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+    pub fn schedule(&mut self, now: Instant) -> Duration {
+        let at = self
+            .last
+            .map_or(now, |last| (last + Self::INTERVAL).max(now));
+        self.deadline = Some(at);
+        at - now
+    }
+    /// Consumes a due deadline and starts the rate-limit interval.
+    pub fn take_due(&mut self, now: Instant) -> bool {
+        if self.deadline.is_some_and(|deadline| now >= deadline) {
+            self.deadline = None;
+            self.last = Some(now);
+            return true;
+        }
+        false
+    }
+    pub fn cancel(&mut self) {
+        self.deadline = None;
+    }
+}
+
+/// Errors only an interactive browser sign-in can resolve.
+pub fn needs_sign_in(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    !transient(&error)
+        && [
+            "authorization required",
+            "refresh token rejected",
+            "token exchange rejected",
+            "needs sign-in",
+            "sign in again",
+            "http 401",
+            "browser authorization returned",
+        ]
+        .iter()
+        .any(|reason| error.contains(reason))
+}
+
 pub fn transient(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     if [
@@ -91,6 +142,7 @@ pub fn transient(error: &str) -> bool {
         "handshake failed",
         "connection/lifecycle failure",
         "OAuth HTTP request failed",
+        "token refresh failed",
         "tool discovery failed",
         "connection failed",
         "connection closed",
@@ -156,8 +208,13 @@ mod tests {
             "SDK ping failed: connection closed",
             "SDK authentication check failed: transport closed",
             "The isolated Copilot runtime did not complete its handshake in 30 seconds",
+            "Hosted WorkIQ discovery failed without an OAuth challenge: transport/protocol failure; no credentials or tools were used",
+            "Hosted WorkIQ discovery failed without an OAuth challenge: HTTP 503; no credentials or tools were used",
+            "WorkIQ resource metadata could not reach the provider",
+            "Hosted WorkIQ token refresh failed; credential details withheld",
         ] {
             assert!(transient(error), "{error}");
+            assert!(!needs_sign_in(error), "{error}");
         }
         for error in [
             "Hosted WorkIQ authorization required; credential details withheld",
@@ -172,6 +229,39 @@ mod tests {
         ] {
             assert!(!transient(error), "{error}");
         }
+    }
+
+    #[test]
+    fn rejected_sign_in_opens_the_browser_at_most_once_per_hour() {
+        for error in [
+            "Hosted WorkIQ authorization required; credential details withheld",
+            "Hosted WorkIQ refresh token rejected (AADSTS700082); credential details withheld",
+            "WorkIQ needs sign-in. Click the status bar to connect.",
+            "Authenticated hosted WorkIQ initialization failed: HTTP 401; provider content withheld",
+            "WorkIQ browser authorization returned interaction_required",
+        ] {
+            assert!(needs_sign_in(error), "{error}");
+        }
+        for error in [
+            "WorkIQ signed-in account does not match the explicitly selected work account",
+            "Could not bind the registered loopback callback on 127.0.0.1:8080; no browser was opened",
+            "WorkIQ browser sign-in exceeded its 10-minute deadline",
+        ] {
+            assert!(!needs_sign_in(error), "{error}");
+        }
+        let now = Instant::now();
+        let mut sign_in = SignIn::default();
+        assert!(!sign_in.take_due(now));
+        assert_eq!(sign_in.schedule(now), Duration::ZERO);
+        assert!(sign_in.take_due(now));
+        assert!(!sign_in.take_due(now));
+        let later = now + Duration::from_secs(60);
+        assert_eq!(sign_in.schedule(later), SignIn::INTERVAL - Duration::from_secs(60));
+        assert!(!sign_in.take_due(later));
+        sign_in.cancel();
+        assert!(sign_in.deadline().is_none());
+        sign_in.schedule(later);
+        assert!(sign_in.take_due(now + SignIn::INTERVAL));
     }
 
     #[test]
