@@ -1889,11 +1889,22 @@ impl Worker {
                         }
                     }
                     let owner = current_owner;
-                    for recommendation in inbox.values_mut().filter(|recommendation| matches!(recommendation.state, crate::recommendations::State::Pending | crate::recommendations::State::NotSent)) {
-                        if recommendation.current(&calendar, owner.as_deref(), now).is_none() {
+                    for recommendation in inbox.values_mut().filter(|recommendation| matches!(recommendation.state,
+                        crate::recommendations::State::Pending | crate::recommendations::State::NotSent | crate::recommendations::State::Review)) {
+                        if owner.as_deref() == Some(recommendation.account.as_str()) && recommendation.outdated(&calendar, now) {
+                            recommendation.state = crate::recommendations::State::Expired;
+                            recommendation.message = "The meeting has ended; this change is no longer offered".into();
+                            inbox_revision += 1;
+                        } else if recommendation.state != crate::recommendations::State::Review
+                            && recommendation.current(&calendar, owner.as_deref(), now).is_none() {
                             recommendation.state = crate::recommendations::State::Expired;
                             inbox_revision += 1;
                         }
+                    }
+                    if let Some(account) = owner.as_deref() {
+                        let before = inbox.len();
+                        crate::recommendations::compact(&mut inbox, &calendar, Some(account), now);
+                        if before != inbox.len() { inbox_revision += 1; }
                     }
                     let requested_recap = recap_requested.as_ref().and_then(|id| calendar.event_index(id))
                         .map(|index| &calendar.events[index])

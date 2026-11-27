@@ -1296,7 +1296,7 @@ impl Client {
             ));
         }
         if lookups.is_empty() {
-            return Err("The Azure CLI token has no identity to resolve an MSX user".into());
+            return Err("The MSX sign-in has no identity to resolve an MSX user".into());
         }
         for (filter, matched_by) in lookups {
             let sql = format!(

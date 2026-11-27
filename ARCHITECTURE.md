@@ -87,14 +87,14 @@ flowchart LR
 | Storage and scheduling | `worker.rs` (storage worker) + `worker\invitations.rs`, `storage.rs` (schema, preferences, legacy import), `calendar.rs` (events, layout, filters), `calendar_sync.rs`, `scheduler.rs` (preparation queue, fingerprints), `search.rs` (fuzzy keyword index), `retry.rs`, `telemetry.rs`, `fixture_cache.rs`, `showcase.rs` (offline demo), `interaction_trace.rs` |
 | AI | `ai.rs` (executor), `copilot.rs` (isolated SDK harness, sessions, tool registry), `chat.rs` (Ask modes, durable research), `chat_cache.rs` (calendar/Insights read tools), `ask.rs` (slash commands), `context.rs` and `source_index.rs` (local documents), `evidence.rs` (tool evidence, citation binding, redaction), `decision.rs` (Foundry router), `prompts.rs`, `changes.rs` and `proposals.rs` (AI-proposed edits), `recommendations.rs`, `recaps.rs` (post-meeting notes) |
 | Features | `invitations.rs` (account-owned queue, local priorities, team cache), `myday.rs`, `weekly.rs`, `tasks.rs`, `followup.rs`, `feedback.rs`, `customers.rs` + `customers\`, `attendees.rs`, `availability.rs`, `scheduling.rs` (Find a time, BLOCKERs), `event_creation.rs`, `company.rs` (icons), `setup.rs`, `reminders.rs`, `updater.rs` |
-| Connectors | `workiq.rs` + `workiq\` (`hosted` sign-in, `connection` reads, `vault`, `invitations`, `calendar_write`, `chat_write`, `cloud`, `meeting_notes`), `connectors.rs` (WebIQ, GitHub and shared GitHub device-flow protocol), `copilot_auth.rs` (independent DPAPI Copilot sign-in), `credentials.rs` (DPAPI), `msx.rs` + `msx\` (`auth`, `mcp`, `dataverse`, `acr`, `tools`), `azure_cli.rs` |
+| Connectors | `workiq.rs` + `workiq\` (`hosted` sign-in, `connection` reads, `vault`, `invitations`, `calendar_write`, `chat_write`, `cloud`, `meeting_notes`), `connectors.rs` (WebIQ, GitHub and shared GitHub device-flow protocol), `copilot_auth.rs` (independent DPAPI Copilot sign-in), `credentials.rs` (DPAPI), `msx.rs` + `msx\` (`auth`, `oauth` browser sign-in and DPAPI vault, `mcp`, `dataverse`, `acr`, `tools`), `azure_cli.rs` |
 | Tools | `bin\` probes and `release-sign` (see [development.md](docs/development.md#probes-and-diagnostics)) |
 
 ## Data model highlights
 
 - **Profile** (`%LOCALAPPDATA%\Tomlook`): `tomlook.db` (all product state),
   `ai-usage.db`, `ask-research.db`, `source-index.db`, DPAPI vaults
-  `workiq-login.db`, `connector-login.db` and `copilot-login.db`, `connections.json`,
+  `workiq-login.db`, `connector-login.db`, `copilot-login.db` and `msx-login.db`, `connections.json`,
   `decision-router.json`, the isolated `copilot\` home. Details:
   [privacy-and-safety.md](docs/privacy-and-safety.md#what-is-stored-locally).
 - **Calendar cache** is owned by one account (the calendar owner's e-mail).
@@ -183,7 +183,8 @@ dispatch time and is not part of the fingerprint either.
 
 Validated results and the completed ledger entry are written in one
 transaction with read-back. Automatic failures retry up to three times with
-backoff; manual failures wait for an explicit retry. Insights within 14 days
+backoff, then daily (immediately after a meeting or configuration change);
+manual failures wait for an explicit retry. Insights within 14 days
 are refreshed after 24 hours. Upcoming preparation and transcript checks
 alternate in one background lane, so interactive questions always keep a slot.
 A daily request budget (`ai-usage.db`) is admitted before any session starts.

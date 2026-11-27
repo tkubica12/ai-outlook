@@ -531,6 +531,46 @@ fn automatic_queue_contains_only_accepted_or_owned_meetings_and_recovers_indepen
 }
 
 #[test]
+fn exhausted_automatic_failures_retry_daily_while_manual_and_halted_failures_wait() {
+    let calendar = fixture(3);
+    let mut queue = Queue::default();
+    queue.reconcile(&calendar, clock());
+    for _ in 0..4 {
+        queue.jobs.get_mut("fixture-0").unwrap().retry_at = None;
+        queue.reconcile(&calendar, clock());
+        let (id, flight) = queue.dispatch().unwrap();
+        assert_eq!(flight.event_id, "fixture-0");
+        queue.background_failed(id, "fixture provider error".into());
+    }
+    let job = &queue.jobs["fixture-0"];
+    assert_eq!((job.state, job.retries), (State::Failed, 3));
+    assert!(job.message.ends_with("Next automatic attempt in 24 hours."));
+    let retry_at = job.retry_at.unwrap();
+    assert!(retry_at > Local::now().fixed_offset() + Duration::hours(23));
+    queue.reconcile(&calendar, clock());
+    assert_eq!(queue.jobs["fixture-0"].state, State::Failed, "No retry before the daily attempt is due");
+    queue.jobs.get_mut("fixture-0").unwrap().retry_at = Some(clock() - Duration::minutes(1));
+    queue.reconcile(&calendar, clock());
+    assert_eq!(queue.jobs["fixture-0"].state, State::Queued);
+    let (id, _) = queue.dispatch().unwrap();
+    queue.background_failed(id, "fixture provider error".into());
+    assert_eq!(queue.jobs["fixture-0"].state, State::Failed, "A daily attempt is a single attempt");
+
+    let legacy = queue.jobs.get_mut("fixture-1").unwrap();
+    legacy.state = State::Failed;
+    legacy.message = "Meeting or AI configuration changed; inspect the previous outcome before explicit retry".into();
+    queue.request_now(&calendar.events[2], true).unwrap();
+    let (manual, _) = queue.dispatch().unwrap();
+    queue.finish(manual, Err("fixture manual error".into()));
+    queue.reconcile(&calendar, clock());
+    assert_eq!(queue.jobs["fixture-1"].state, State::Failed, "A halted queue waits for explicit retry");
+    queue.failure = None;
+    queue.reconcile(&calendar, clock());
+    assert_eq!(queue.jobs["fixture-1"].state, State::Queued, "Older stuck automatic failures recover");
+    assert_eq!(queue.jobs["fixture-2"].state, State::Failed, "Manual failures still need explicit retry");
+}
+
+#[test]
 fn activity_snapshot_indexes_preserve_every_state_order_and_original_job() {
     let calendar = fixture(5000);
     let mut queue = Queue::default();

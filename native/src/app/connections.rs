@@ -14,19 +14,21 @@ impl Tomlook {
                     let problems = self.activity.index.len(ActivityFilter::Problems);
                     let working = self.activity.queue.flights.len();
                     let waiting = self.activity.queued + self.activity.deferred;
+                    let now = Local::now().fixed_offset();
                     let has_messages = self.error.is_some() || self.activity.error.is_some() || self.activity.sync.error.is_some() || problems > 0
-                        || self.activity.event_creations.values().any(|record| self.calendar_owner.as_deref() == Some(record.account.as_str()))
+                        || self.activity.event_creations.values().any(|record| self.calendar_owner.as_deref() == Some(record.account.as_str()) && !record.ended(now))
                         || self.activity.proposals.values().any(|proposal| proposal.in_flight() || proposal.needs_review())
                         || self.activity.recommendations.values().any(|recommendation|
                             recommendation.state == tomlook::recommendations::State::Review
-                                && self.calendar_owner.as_deref() == Some(recommendation.account.as_str()))
+                                && self.calendar_owner.as_deref() == Some(recommendation.account.as_str())
+                                && !recommendation.outdated(&self.calendar, now))
                         || self.external_status.values().any(|status| !status.ready && !status.busy && !status.message.is_empty() && status.message != "Not connected");
-                    let now = Local::now().fixed_offset();
                     let recommendations = self.activity.recommendation_view.iter().filter_map(|entry| self.activity.recommendations.get(&entry.id)).filter(|recommendation|
                         recommendation.visible(&self.calendar, self.calendar_owner.as_deref(), now)).count()
                         + self.activity.event_creations.values().filter(|record|
                             record.state == tomlook::event_creation::State::Pending
-                                && self.calendar_owner.as_deref() == Some(record.account.as_str())).count();
+                                && self.calendar_owner.as_deref() == Some(record.account.as_str())
+                                && !record.ended(now)).count();
                     if (has_messages || recommendations > 0) && inbox_button(ui, language, has_messages, recommendations).clicked() {
                         self.messages_open = true;
                         if self.ai.is_some() { self.ai_command(ai::Command::RefreshCalendarAvailability); }
@@ -264,6 +266,10 @@ impl Tomlook {
         } else {
             &status.message
         }));
+        let services = [
+            ("Dataverse (MSX)", &status.dataverse),
+            ("Power BI (Azure consumption)", &status.powerbi),
+        ];
         egui::Grid::new("msx-connection")
             .num_columns(2)
             .spacing([12.0, 4.0])
@@ -277,10 +283,7 @@ impl Tomlook {
                     None => ui.label(language.text("Not known yet")),
                 };
                 ui.end_row();
-                for (label, service) in [
-                    ("Dataverse (MSX)", &status.dataverse),
-                    ("Power BI (Azure consumption)", &status.powerbi),
-                ] {
+                for (label, service) in services {
                     ui.weak(language.text(label));
                     let state = ui.label(language.text(service.phase.label()));
                     if !service.message.is_empty() {
@@ -289,6 +292,18 @@ impl Tomlook {
                     ui.end_row();
                 }
             });
+        for (label, service) in services {
+            if matches!(service.phase, Phase::Unavailable | Phase::SignInRequired)
+                && !service.message.is_empty()
+                && service.message != status.message
+            {
+                ui.label(format!(
+                    "{}: {}",
+                    language.text(label),
+                    language.text(&service.message)
+                ));
+            }
+        }
         if let Some(code) = &status.device_code {
             ui.horizontal(|ui| {
                 ui.monospace(code);
@@ -315,7 +330,7 @@ impl Tomlook {
                 if ui
                     .button(language.text("Sign in to MSX"))
                     .on_hover_text(language.text(
-                        "Opens Microsoft sign-in through Azure CLI (browser or Windows prompt).",
+                        "Opens Microsoft sign-in for MSX in your browser; Power BI uses Azure CLI.",
                     ))
                     .clicked()
                     && self.ai_command(ai::Command::SignInMsx { device_code: false })
@@ -325,7 +340,7 @@ impl Tomlook {
                 if ui
                     .button(language.text("Use device code"))
                     .on_hover_text(language.text(
-                        "Alternative sign-in with a code on another device; your tenant may block it.",
+                        "MSX still signs in through the browser; a signed-out Power BI uses an Azure CLI code on another device, which your tenant may block.",
                     ))
                     .clicked()
                     && self.ai_command(ai::Command::SignInMsx { device_code: true })
@@ -340,7 +355,7 @@ impl Tomlook {
                 if ui
                     .button(language.text("Disconnect"))
                     .on_hover_text(language.text(
-                        "Forgets Tomlook's in-memory MSX tokens; your Azure CLI sign-in stays.",
+                        "Removes Tomlook's saved MSX sign-in and in-memory tokens; your Azure CLI sign-in stays.",
                     ))
                     .clicked()
                     && self.ai_command(ai::Command::DisconnectMsx)
@@ -351,10 +366,10 @@ impl Tomlook {
         }
         ui.add_space(6.0);
         ui.weak(language.text(
-            "Uses your Azure CLI sign-in; may change Azure CLI's default account.",
+            "MSX uses its own browser sign-in; Power BI uses your Azure CLI sign-in, which may change Azure CLI's default account.",
         ));
         ui.weak(language.text(
-            "Read-only: Tomlook never creates or changes MSX records. Tokens stay in memory.",
+            "Read-only: Tomlook never creates or changes MSX records. The MSX sign-in is saved encrypted for this Windows user.",
         ));
     }
 

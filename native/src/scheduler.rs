@@ -361,6 +361,7 @@ impl Queue {
                 eligible(event, now) || self.jobs.get(&event.id).is_some_and(|job| job.manual)
             })
             .collect::<Vec<_>>();
+        let halted = self.failure.is_some();
         for event in relevant {
             let key = if !inputs_changed && let Some(job) = self.jobs.get(&event.id) {
                 job.fingerprint.clone()
@@ -437,6 +438,18 @@ impl Queue {
                 job.state = State::Deferred;
                 job.retries = 0;
                 job.message = "Refreshing upcoming meeting context".into();
+            }
+            // Automatic research is read-only: an exhausted failure gets one attempt a day,
+            // and at once after a meeting/configuration change or from an older ledger.
+            // Manual requests and a halted queue still need an explicit retry.
+            if job.state == State::Failed
+                && !job.manual
+                && !halted
+                && job.retry_at.is_none_or(|retry| retry <= now)
+            {
+                job.state = State::Deferred;
+                job.retry_at = None;
+                job.message = "Retrying a failed automatic preparation".into();
             }
             job.verified = verified;
             job.on_demand = event.unconfirmed();
@@ -785,16 +798,21 @@ impl Queue {
         self.failure = previous_failure;
         if let Some(job) = self.jobs.get_mut(&flight.event_id)
             && !job.manual
-            && job.retries < 3
         {
-            job.retries += 1;
-            let delay = 30 * (1_i64 << job.retries);
-            job.retry_at = Some(Local::now().fixed_offset() + Duration::seconds(delay));
-            job.state = State::Deferred;
-            job.message = format!(
-                "Preparation failed: {message}. Retry {}/3 in {delay}s.",
-                job.retries
-            );
+            if job.retries < 3 {
+                job.retries += 1;
+                let delay = 30 * (1_i64 << job.retries);
+                job.retry_at = Some(Local::now().fixed_offset() + Duration::seconds(delay));
+                job.state = State::Deferred;
+                job.message = format!(
+                    "Preparation failed: {message}. Retry {}/3 in {delay}s.",
+                    job.retries
+                );
+            } else {
+                job.retry_at = Some(Local::now().fixed_offset() + Duration::hours(24));
+                job.message =
+                    format!("Preparation failed: {message}. Next automatic attempt in 24 hours.");
+            }
         }
         self.admit();
     }

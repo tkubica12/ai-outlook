@@ -261,7 +261,8 @@ pub fn probe(root: &Path) -> Probe {
         .iter()
         .any(|name| root.join(name).exists())
         || crate::workiq::saved_sign_in_exists(root)
-        || crate::connectors::saved_sign_in_exists(root);
+        || crate::connectors::saved_sign_in_exists(root)
+        || crate::msx::oauth::saved_sign_in_exists(root);
     Probe {
         azure_cli: crate::azure_cli::installed(),
         copilot,
@@ -1634,7 +1635,8 @@ mod tests {
         );
         assert!(
             !root.path().join("connector-login.db").exists()
-                && !root.path().join("workiq-login.db").exists(),
+                && !root.path().join("workiq-login.db").exists()
+                && !root.path().join("msx-login.db").exists(),
             "The probe never creates credential databases"
         );
         let created = rusqlite::Connection::open(root.path().join("connector-login.db")).unwrap();
@@ -1659,6 +1661,19 @@ mod tests {
                 "CREATE TABLE login(account TEXT PRIMARY KEY, payload BLOB NOT NULL);
             INSERT INTO login VALUES('owner@contoso.example',X'00');",
             )
+            .unwrap();
+        assert!(probe(root.path()).saved_connections);
+
+        let root = tempfile::tempdir().unwrap();
+        let vault = rusqlite::Connection::open(root.path().join("msx-login.db")).unwrap();
+        vault
+            .execute_batch(
+                "CREATE TABLE login(account TEXT PRIMARY KEY, payload BLOB NOT NULL);",
+            )
+            .unwrap();
+        assert!(!probe(root.path()).saved_connections);
+        vault
+            .execute("INSERT INTO login VALUES('tenant',X'00')", [])
             .unwrap();
         assert!(probe(root.path()).saved_connections);
 

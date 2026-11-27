@@ -1135,7 +1135,7 @@ impl Engine {
                         for cancel in connector_cancels.values() { let _ = cancel.send(true); }
                     }
                     if stopping && tasks.is_empty() {
-                        if let Some(client) = msx.take() { client.disconnect().await; }
+                        if let Some(client) = msx.take() { client.close().await; }
                         if let Some(connection) = workiq.take()
                             && let Err(error) = connection.close().await {
                                 notify(Notice::HostedWorkiq { busy: false, ready: false, message: error });
@@ -1232,15 +1232,15 @@ impl Engine {
                                         msx_generation += 1;
                                         msx_retry.clear();
                                         if let Some(old) = msx.take() {
-                                            tasks.spawn(async move { old.disconnect().await; Completion::MsxClosed });
+                                            tasks.spawn(async move { old.close().await; Completion::MsxClosed });
                                         }
                                         if !settings.enabled {
                                             notify(Notice::Msx(crate::msx::Status::disabled()));
                                         } else if let Err(error) = crate::msx::validate_tenant(&settings.tenant) {
                                             notify(Notice::Msx(crate::msx::Status { phase: crate::msx::Phase::Unavailable, message: error, ..crate::msx::Status::new(&settings.tenant) }));
                                         } else {
-                                            // Idle until a cached token exists: one quiet, bounded, non-interactive check.
-                                            let client = Arc::new(crate::msx::Client::new(&settings, msx_publish.clone()));
+                                            // Idle until a saved sign-in exists: one quiet, bounded, non-interactive check.
+                                            let client = Arc::new(crate::msx::Client::new(&root, &settings, msx_publish.clone()));
                                             notify(Notice::Msx(client.status()));
                                             msx_cancel = Some(start_msx(&mut tasks, client.clone(), msx_generation, MsxOperation::Check { explicit: false }, stopped.clone()));
                                             msx = Some(client);
@@ -2412,7 +2412,7 @@ impl Engine {
                         for (cancel, _) in cancellations.values() { cancel_request(cancel); }
                     }
                     if stopping && tasks.is_empty() {
-                        if let Some(client) = msx.take() { client.disconnect().await; }
+                        if let Some(client) = msx.take() { client.close().await; }
                         if let Some(connection) = workiq.take()
                             && let Err(error) = connection.close().await {
                                 notify(Notice::HostedWorkiq { busy: false, ready: false, message: error });
@@ -2537,8 +2537,9 @@ fn question_prompt(
     question: &Question,
     redactor: &crate::evidence::Redactor,
 ) -> Result<String, String> {
+    // The user-question limit does not apply to the built-in preparation prompt.
     if question.question.trim().is_empty()
-        || question.question.len() > 8000
+        || (question.question != PREPARATION_PROMPT && question.question.len() > 8000)
         || question
             .public_topic
             .as_ref()
@@ -4991,6 +4992,11 @@ mod prompt_tests {
             language: crate::i18n::Language::En,
         };
         assert!(question_prompt(&question, &redactor).is_err());
+        question.question = PREPARATION_PROMPT.into();
+        assert!(
+            PREPARATION_PROMPT.len() > 8000 && question_prompt(&question, &redactor).is_ok(),
+            "The built-in preparation prompt is not a bounded user question"
+        );
         question.question = "Safe fixture".into();
         question.public_topic = Some("x".repeat(2001));
         assert!(question_prompt(&question, &redactor).is_err());

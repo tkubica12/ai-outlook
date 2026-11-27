@@ -328,13 +328,24 @@ impl Recommendation {
             })
     }
 
+    /// An unfinished calendar change for a meeting that has already ended is no longer useful.
+    /// Notes edits and follow-ups belong after the meeting and keep their own lifetime.
+    pub fn outdated(&self, calendar: &Calendar, now: DateTime<FixedOffset>) -> bool {
+        matches!(self.state, State::Pending | State::NotSent | State::Review)
+            && self.suggestion.kind != Kind::FollowUp
+            && !matches!(self.manual_change, Some(Change::Document(_)))
+            && calendar
+                .event_index(&self.event_id)
+                .is_some_and(|index| calendar.events[index].end <= now)
+    }
+
     pub fn visible(
         &self,
         calendar: &Calendar,
         owner: Option<&str>,
         now: DateTime<FixedOffset>,
     ) -> bool {
-        if owner != Some(self.account.as_str()) {
+        if owner != Some(self.account.as_str()) || self.outdated(calendar, now) {
             return false;
         }
         match self.state {
@@ -722,7 +733,9 @@ pub fn compact(
             recommendation.state,
             State::Applied | State::Dismissed | State::Expired
         ) || recommendation.created_at >= now - Duration::days(30)
-            || recommendation.current(calendar, owner, now).is_some()
+            || recommendation.current(calendar, owner, now).is_some_and(|event| {
+                event.end > now || recommendation.suggestion.kind == Kind::FollowUp
+            })
     });
 }
 
@@ -1621,5 +1634,41 @@ mod tests {
         assert!(first.current(&calendar, Some("other"), now).is_none());
         calendar.events[0].title.push_str(" changed");
         assert!(first.current(&calendar, Some("owner"), now).is_none());
+    }
+
+    #[test]
+    fn unfinished_changes_to_ended_meetings_expire_but_notes_edits_and_follow_ups_remain() {
+        let now = chrono::Local::now().fixed_offset();
+        let mut event = crate::calendar::fixture(1).remove(0);
+        event.extra.insert("type".into(), serde_json::json!("singleInstance"));
+        event.start = now - Duration::hours(2);
+        event.end = now - Duration::hours(1);
+        let mut change =
+            Recommendation::from_manual(&event, "owner", Change::Category("Call".into()), now).unwrap();
+        let mut calendar = Calendar::build(vec![event], Default::default(), Vec::new()).unwrap();
+        for state in [State::Pending, State::NotSent, State::Review] {
+            change.state = state;
+            assert!(change.outdated(&calendar, now), "{state:?}");
+            assert!(!change.visible(&calendar, Some("owner"), now), "{state:?}");
+        }
+        for state in [State::Dispatching, State::Applied, State::Expired, State::Dismissed] {
+            change.state = state;
+            assert!(!change.outdated(&calendar, now), "{state:?} is never rewritten");
+        }
+        change.state = State::NotSent;
+        let mut follow_up = change.clone();
+        follow_up.suggestion.kind = Kind::FollowUp;
+        follow_up.manual_change = None;
+        assert!(!follow_up.outdated(&calendar, now));
+        let mut notes = change.clone();
+        notes.manual_change = Some(Change::Document(crate::changes::DocumentEdit {
+            document: crate::changes::Document::Notes,
+            revision: String::new(),
+            before: Vec::new(),
+            after: Vec::new(),
+        }));
+        assert!(!notes.outdated(&calendar, now));
+        calendar.events[0].end = now + Duration::hours(1);
+        assert!(!change.outdated(&calendar, now), "A meeting still in progress keeps its changes");
     }
 }

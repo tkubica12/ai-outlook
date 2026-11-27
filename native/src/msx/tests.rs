@@ -1,5 +1,5 @@
 use super::*;
-use auth::tests::{FakeRunner, Reply};
+use auth::tests::{FakeGrant, FakeRunner, Reply};
 use mcp::{CallError, ToolInfo};
 use rmcp::model::CallToolResult;
 use serde_json::json;
@@ -251,6 +251,10 @@ type Signals = (
 );
 
 fn fixture(handler: Box<Handler>, replies: Vec<Reply>) -> Fixture {
+    fixture_with(handler, replies, FakeGrant::signed_in())
+}
+
+fn fixture_with(handler: Box<Handler>, replies: Vec<Reply>, grant: Arc<FakeGrant>) -> Fixture {
     let fake = Arc::new(Fake {
         tools: tools(),
         handler,
@@ -264,6 +268,7 @@ fn fixture(handler: Box<Handler>, replies: Vec<Reply>) -> Fixture {
     let client = Arc::new(Client::with(
         auth::tests::TENANT,
         runner.clone(),
+        grant,
         Arc::new(FakeConnector(fake.clone())),
         Arc::new(move |status| sink.lock().unwrap().push(status)),
     ));
@@ -307,9 +312,11 @@ fn status_summaries_follow_both_services_and_labels_are_stable() {
         (status.phase, status.message.as_str()),
         (Phase::Connected, DATAVERSE_ONLY)
     );
+    assert_eq!(status.label(), "MSX: partially connected");
     status.powerbi = Service::new(Phase::Connected, "");
     status.summarize();
     assert_eq!(status.message, CONNECTED);
+    assert_eq!(status.label(), "MSX: connected");
     status.dataverse = Service::new(Phase::SignInRequired, auth::TOKEN_TIMEOUT);
     status.powerbi = Service::new(Phase::Unavailable, "x");
     status.summarize();
@@ -355,8 +362,33 @@ fn status_summaries_follow_both_services_and_labels_are_stable() {
 }
 
 #[tokio::test]
-async fn a_quiet_check_without_a_cached_token_requires_sign_in_once_and_never_prompts() {
-    let (client, fake, runner, published) = fixture(standard(), vec![Reply::Timeout]);
+async fn dataverse_access_denial_is_actionable_without_hiding_power_bi() {
+    let (client, fake, _runner, _published) = fixture(standard(), vec![]);
+    *fake.refuse_connect.lock().unwrap() = Some(CallError::Rejected(
+        "HTTP 403: access denied; check provider permissions".into(),
+    ));
+    let (_cancel, cancelled, _stop, shutdown) = signals();
+    let failure = client.check(false, cancelled, shutdown).await.unwrap_err();
+    assert_eq!(failure.message, DATAVERSE_ACCESS_DENIED);
+    assert!(!failure.retry);
+    let status = client.status();
+    assert_eq!(status.dataverse.phase, Phase::Unavailable);
+    assert_eq!(status.dataverse.message, DATAVERSE_ACCESS_DENIED);
+    assert_eq!(status.powerbi.phase, Phase::Connected);
+    assert_eq!(status.label(), "MSX: partially connected");
+
+    let other = mcp_error(
+        Resource::PowerBi,
+        CallError::Rejected("HTTP 403: access denied; check provider permissions".into()),
+    );
+    assert!(other.message().starts_with("Power BI refused the connection: HTTP 403"));
+}
+
+#[tokio::test]
+async fn a_quiet_check_without_a_saved_sign_in_requires_sign_in_once_and_never_prompts() {
+    let grant = Arc::new(FakeGrant::default());
+    let (client, fake, runner, published) =
+        fixture_with(standard(), vec![Reply::Timeout], grant.clone());
     let (_cancel, cancelled, _stop, shutdown) = signals();
     let failure = client
         .check(false, cancelled.clone(), shutdown.clone())
@@ -365,20 +397,21 @@ async fn a_quiet_check_without_a_cached_token_requires_sign_in_once_and_never_pr
     assert_eq!(
         failure,
         Failure {
-            message: auth::TOKEN_TIMEOUT.into(),
+            message: auth::SIGN_IN_REQUIRED.into(),
             retry: false
         }
     );
     let status = client.status();
     assert_eq!(status.phase, Phase::SignInRequired);
-    assert_eq!(status.powerbi.phase, Phase::SignInRequired);
+    assert_eq!(status.dataverse.message, auth::SIGN_IN_REQUIRED);
     assert_eq!(
-        runner.calls.lock().unwrap().len(),
-        1,
-        "Power BI did not wait another 20 seconds"
+        (status.powerbi.phase, status.powerbi.message.as_str()),
+        (Phase::SignInRequired, auth::TOKEN_TIMEOUT)
     );
+    assert_eq!(*grant.refreshes.lock().unwrap(), 1);
+    assert_eq!(runner.calls.lock().unwrap().len(), 1);
     assert!(
-        runner.logins.lock().unwrap().is_empty(),
+        runner.logins.lock().unwrap().is_empty() && *grant.sign_ins.lock().unwrap() == 0,
         "No interactive sign-in without a user action"
     );
     assert_eq!(fake.connects.load(Ordering::SeqCst), 0);
@@ -387,7 +420,15 @@ async fn a_quiet_check_without_a_cached_token_requires_sign_in_once_and_never_pr
         .await
         .unwrap_err();
     assert!(client.ai_query("SELECT name FROM account").await.is_err());
-    assert_eq!(runner.calls.lock().unwrap().len(), 1, "No busy retry");
+    assert_eq!(
+        (
+            *grant.refreshes.lock().unwrap(),
+            runner.calls.lock().unwrap().len()
+        ),
+        (1, 1),
+        "No busy retry"
+    );
+    *grant.saved.lock().unwrap() = true;
     client.check(true, cancelled, shutdown).await.unwrap();
     assert_eq!(client.status().phase, Phase::Connected);
     assert!(
@@ -471,19 +512,23 @@ async fn a_connected_check_allowlists_read_tools_and_resolves_the_signed_in_user
 
 #[tokio::test]
 async fn a_rejected_token_is_refreshed_once_then_sign_in_is_required_without_a_loop() {
-    let (client, fake, runner, _published) =
-        fixture(Box::new(|_, _, _| Err(CallError::Unauthorized)), vec![]);
+    let grant = FakeGrant::signed_in();
+    let (client, fake, _runner, _published) = fixture_with(
+        Box::new(|_, _, _| Err(CallError::Unauthorized)),
+        vec![],
+        grant.clone(),
+    );
     let error = client
         .ai_query("SELECT name FROM account")
         .await
         .unwrap_err();
     assert!(error.contains("sign in to MSX again"), "{error}");
-    assert_eq!(runner.calls.lock().unwrap().len(), 2);
+    assert_eq!(*grant.refreshes.lock().unwrap(), 2);
     assert_eq!(fake.connects.load(Ordering::SeqCst), 2);
     assert_eq!(client.status().dataverse.phase, Phase::SignInRequired);
     assert!(client.ai_query("SELECT name FROM account").await.is_err());
     assert_eq!(
-        runner.calls.lock().unwrap().len(),
+        *grant.refreshes.lock().unwrap(),
         2,
         "Later reads fail fast until the user acts"
     );
@@ -523,10 +568,38 @@ async fn transient_failures_are_retryable_and_the_next_read_reconnects() {
     assert_eq!(client.status().dataverse.phase, Phase::Connected);
     *fake.refuse_connect.lock().unwrap() =
         Some(CallError::Transport("cannot reach the provider".into()));
-    client.disconnect().await;
+    client.close().await;
     let (_cancel, cancelled, _stop, shutdown) = signals();
     let failure = client.check(true, cancelled, shutdown).await.unwrap_err();
     assert!(failure.retry, "{failure:?}");
+}
+
+#[tokio::test]
+async fn closing_keeps_the_saved_sign_in_and_disconnect_removes_it() {
+    let grant = FakeGrant::signed_in();
+    let (client, _fake, _runner, _published) = fixture_with(standard(), vec![], grant.clone());
+    let (_cancel, cancelled, _stop, shutdown) = signals();
+    client
+        .check(false, cancelled.clone(), shutdown.clone())
+        .await
+        .unwrap();
+    client.close().await;
+    assert_eq!(*grant.cleared.lock().unwrap(), 0);
+    client
+        .check(false, cancelled.clone(), shutdown.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        *grant.refreshes.lock().unwrap(),
+        2,
+        "Closing forgot the in-memory token only"
+    );
+    client.disconnect().await;
+    assert_eq!(*grant.cleared.lock().unwrap(), 1);
+    assert!(!*grant.saved.lock().unwrap());
+    let failure = client.check(false, cancelled, shutdown).await.unwrap_err();
+    assert_eq!(failure.message, DISCONNECTED);
+    assert_eq!(*grant.refreshes.lock().unwrap(), 2);
 }
 
 #[tokio::test]
@@ -733,7 +806,8 @@ fn by_identity() -> Box<Handler> {
 
 #[tokio::test]
 async fn owned_tasks_follow_the_current_token_identity_not_a_stale_cached_user() {
-    let (client, fake, runner, _published) = fixture(by_identity(), vec![]);
+    let grant = FakeGrant::signed_in();
+    let (client, fake, _runner, _published) = fixture_with(by_identity(), vec![], grant.clone());
     let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
     let until = today + chrono::Days::new(60);
     let task_query = || {
@@ -757,8 +831,8 @@ async fn owned_tasks_follow_the_current_token_identity_not_a_stale_cached_user()
     );
     assert!(task_query().contains(&format!("ownerid = '{USER}'")));
 
-    // The Azure CLI now issues another account's token, e.g. a refresh after `az login`.
-    *runner.identity.lock().unwrap() = Some(("other@example.test", OTHER_OBJECT));
+    // The saved sign-in now issues another account's token, e.g. after a sign-in elsewhere.
+    *grant.identity.lock().unwrap() = Some(("other@example.test", OTHER_OBJECT));
     client.tokens.forget(Resource::Dataverse).await;
     client.drop_session(Resource::Dataverse).await;
     let context = client.account_context(ACCOUNT, today, until).await.unwrap();
@@ -773,7 +847,7 @@ async fn owned_tasks_follow_the_current_token_identity_not_a_stale_cached_user()
     );
 
     // An explicit sign-in as a third account resolves that account's user.
-    *runner.identity.lock().unwrap() = Some(("third@example.test", THIRD_OBJECT));
+    *grant.identity.lock().unwrap() = Some(("third@example.test", THIRD_OBJECT));
     let (_cancel, cancelled, _stop, shutdown) = signals();
     client.sign_in(false, cancelled, shutdown).await.unwrap();
     assert_eq!(
@@ -844,10 +918,17 @@ async fn acr_is_labelled_with_model_unit_and_freshness_or_explicitly_unavailable
 
 #[tokio::test]
 async fn explicit_sign_in_shows_a_device_code_then_connects_and_disconnect_forgets_tokens() {
-    let (client, fake, runner, published) = fixture(standard(), vec![]);
+    let grant = Arc::new(FakeGrant::default());
+    let (client, fake, runner, published) =
+        fixture_with(standard(), vec![Reply::Timeout], grant.clone());
     let (_cancel, cancelled, _stop, shutdown) = signals();
     client.sign_in(true, cancelled, shutdown).await.unwrap();
-    assert_eq!(runner.logins.lock().unwrap().len(), 1);
+    assert_eq!(*grant.sign_ins.lock().unwrap(), 1);
+    assert_eq!(
+        runner.logins.lock().unwrap().len(),
+        1,
+        "Power BI had no Azure CLI token, so only it used the CLI sign-in"
+    );
     assert!(
         published
             .lock()
@@ -859,7 +940,9 @@ async fn explicit_sign_in_shows_a_device_code_then_connects_and_disconnect_forge
     );
     assert_eq!(client.status().phase, Phase::Connected);
     let tokens = runner.calls.lock().unwrap().len();
+    let refreshes = *grant.refreshes.lock().unwrap();
     client.disconnect().await;
+    assert_eq!(*grant.cleared.lock().unwrap(), 1);
     let status = client.status();
     assert_eq!(
         (status.phase, status.message.as_str()),
@@ -875,15 +958,21 @@ async fn explicit_sign_in_shows_a_device_code_then_connects_and_disconnect_forge
         "Nothing reconnects silently after Disconnect"
     );
     assert_eq!(runner.calls.lock().unwrap().len(), tokens);
+    assert_eq!(*grant.refreshes.lock().unwrap(), refreshes);
     let (_cancel, cancelled, _stop, shutdown) = signals();
-    client.check(true, cancelled, shutdown).await.unwrap();
-    client.ai_query("SELECT name FROM account").await.unwrap();
+    let failure = client.check(true, cancelled, shutdown).await.unwrap_err();
+    assert_eq!(
+        failure.message,
+        auth::SIGN_IN_REQUIRED,
+        "The saved MSX sign-in was removed"
+    );
+    assert_eq!(client.status().powerbi.phase, Phase::Connected);
     assert_eq!(
         runner.calls.lock().unwrap().len(),
-        tokens + 2,
-        "Disconnect forgot both in-memory tokens"
+        tokens + 1,
+        "Disconnect forgot the in-memory Power BI token but kept the Azure CLI sign-in"
     );
-    assert!(fake.connects.load(Ordering::SeqCst) >= 4);
+    assert!(fake.connects.load(Ordering::SeqCst) >= 3);
 }
 
 #[tokio::test]

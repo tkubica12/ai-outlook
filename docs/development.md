@@ -131,7 +131,7 @@ None of them calls a model or writes to a calendar.
 | `workiq-probe <state> [WorkIQ-Calendar]` | OAuth discovery of a per-workload WorkIQ server; no sign-in |
 | `workiq-context-probe <state> <email>` | One workplace context read with the saved sign-in; prints only duration and size |
 | `workiq-availability-probe <state> [email]` | Create-schema shapes, your own free/busy and meeting suggestions with the saved sign-in; never writes |
-| `msx-probe [tenant]` | Azure CLI token check, MSX tool discovery, user resolution and one `TOP 1` read; prints shapes only |
+| `msx-probe [--sign-in] [tenant]` | MSX check with the saved sign-in (`--sign-in` opens the browser sign-in first), tool discovery, user resolution, one `TOP 1` read and a Power BI probe; prints shapes only |
 | `source-index <state> [--repositories <path>] [--cloud-folder <name>] [--query <terms>]` | Configures source collections (run while Tomlook is closed) and tests local search |
 | `calendar-fixture`, `seed-fixture` | Seed measurement profiles (see above) |
 | `release-sign` | Update manifest signing (see below) |

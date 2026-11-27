@@ -241,6 +241,7 @@ pub const TEXTS: &[(&str, &str)] = &[
     ("MSX: checking...", "MSX: ověřování..."),
     ("MSX: signing in...", "MSX: přihlašování..."),
     ("MSX: connected", "MSX: připojeno"),
+    ("MSX: partially connected", "MSX: částečně připojeno"),
     ("MSX: sign-in required", "MSX: nutné přihlášení"),
     ("MSX: unavailable", "MSX: nedostupné"),
     ("MSX: off", "MSX: vypnuto"),
@@ -261,24 +262,24 @@ pub const TEXTS: &[(&str, &str)] = &[
     ("Check connection", "Ověřit připojení"),
     ("Disconnect", "Odpojit"),
     (
-        "Opens Microsoft sign-in through Azure CLI (browser or Windows prompt).",
-        "Otevře přihlášení Microsoft přes Azure CLI (v prohlížeči nebo v okně Windows).",
+        "Opens Microsoft sign-in for MSX in your browser; Power BI uses Azure CLI.",
+        "Otevře přihlášení Microsoft k MSX v prohlížeči; Power BI používá Azure CLI.",
     ),
     (
-        "Alternative sign-in with a code on another device; your tenant may block it.",
-        "Náhradní přihlášení kódem na jiném zařízení; váš tenant ho může blokovat.",
+        "MSX still signs in through the browser; a signed-out Power BI uses an Azure CLI code on another device, which your tenant may block.",
+        "MSX se i tak přihlásí v prohlížeči; nepřihlášené Power BI použije kód z Azure CLI na jiném zařízení, což může váš tenant blokovat.",
     ),
     (
-        "Forgets Tomlook's in-memory MSX tokens; your Azure CLI sign-in stays.",
-        "Zapomene tokeny MSX uložené v paměti Tomlooku; přihlášení v Azure CLI zůstane.",
+        "Removes Tomlook's saved MSX sign-in and in-memory tokens; your Azure CLI sign-in stays.",
+        "Odstraní uložené přihlášení k MSX a tokeny v paměti Tomlooku; přihlášení v Azure CLI zůstane.",
     ),
     (
-        "Uses your Azure CLI sign-in; may change Azure CLI's default account.",
-        "Používá vaše přihlášení v Azure CLI; může změnit výchozí účet Azure CLI.",
+        "MSX uses its own browser sign-in; Power BI uses your Azure CLI sign-in, which may change Azure CLI's default account.",
+        "MSX používá vlastní přihlášení v prohlížeči; Power BI používá vaše přihlášení v Azure CLI, které může změnit výchozí účet Azure CLI.",
     ),
     (
-        "Read-only: Tomlook never creates or changes MSX records. Tokens stay in memory.",
-        "Jen pro čtení: Tomlook v MSX nikdy nic nevytváří ani nemění. Tokeny zůstávají jen v paměti.",
+        "Read-only: Tomlook never creates or changes MSX records. The MSX sign-in is saved encrypted for this Windows user.",
+        "Jen pro čtení: Tomlook v MSX nikdy nic nevytváří ani nemění. Přihlášení k MSX se ukládá šifrovaně pro tohoto uživatele Windows.",
     ),
     ("MSX and Azure consumption", "MSX a spotřeba Azure"),
     (
@@ -287,8 +288,8 @@ pub const TEXTS: &[(&str, &str)] = &[
     ),
     ("Use MSX and Azure consumption", "Používat MSX a spotřebu Azure"),
     (
-        "Tomlook stays idle until you sign in or Azure CLI already has a token. It never opens a sign-in prompt on its own.",
-        "Tomlook nic nedělá, dokud se nepřihlásíte nebo dokud Azure CLI nemá platný token. Přihlašovací okno sám nikdy neotevře.",
+        "Tomlook stays idle until you sign in or a saved MSX sign-in or Azure CLI token exists. It never opens a sign-in prompt on its own.",
+        "Tomlook nic nedělá, dokud se nepřihlásíte nebo dokud neexistuje uložené přihlášení k MSX či token Azure CLI. Přihlašovací okno sám nikdy neotevře.",
     ),
     ("Microsoft tenant ID", "ID tenanta Microsoft"),
     ("Save tenant", "Uložit tenanta"),
@@ -315,22 +316,30 @@ pub const TEXTS: &[(&str, &str)] = &[
         "Power BI connected; Dataverse is unavailable.",
         "Power BI je připojené; Dataverse není k dispozici.",
     ),
+    (
+        "Dataverse denied access (HTTP 403). Check your MSX (Dataverse) permissions.",
+        "Dataverse zamítl přístup (HTTP 403). Ověřte svá oprávnění k MSX (Dataverse).",
+    ),
     ("MSX is turned off in Settings.", "MSX je vypnuté v Nastavení."),
     (
         "Offline demo never connects MSX.",
         "Offline ukázka se k MSX nikdy nepřipojuje.",
     ),
     (
-        "Disconnected. In-memory MSX tokens were forgotten; your Azure CLI sign-in is unchanged.",
-        "Odpojeno. Tokeny MSX z paměti byly zapomenuty; přihlášení v Azure CLI se nezměnilo.",
+        "Disconnected. The saved MSX sign-in and in-memory tokens were removed; your Azure CLI sign-in is unchanged.",
+        "Odpojeno. Uložené přihlášení k MSX a tokeny v paměti byly odstraněny; přihlášení v Azure CLI se nezměnilo.",
     ),
     (
-        "Complete the Microsoft sign-in that Azure CLI opened (browser or Windows prompt).",
-        "Dokončete přihlášení Microsoft, které otevřelo Azure CLI (v prohlížeči nebo v okně Windows).",
+        "Disconnected, but the saved MSX sign-in could not be removed.",
+        "Odpojeno, ale uložené přihlášení k MSX se nepodařilo odstranit.",
     ),
     (
-        "Requesting a device code from Azure CLI (up to 60 seconds)...",
-        "Čekám na kód zařízení od Azure CLI (nejvýše 60 sekund)...",
+        "Complete the Microsoft sign-in in your browser.",
+        "Dokončete přihlášení Microsoft v prohlížeči.",
+    ),
+    (
+        "Opening the MSX sign-in in your browser; Power BI may then request an Azure CLI device code...",
+        "Otevírám přihlášení k MSX v prohlížeči; Power BI si pak může vyžádat kód zařízení od Azure CLI...",
     ),
     ("MSX check cancelled.", "Ověření MSX bylo zrušeno."),
     (
@@ -365,6 +374,14 @@ pub const TEXTS: &[(&str, &str)] = &[
         "Azure CLI vrátilo nepoužitelnou odpověď s tokenem; MSX nebylo připojeno.",
     ),
     (
+        "Azure CLI returned an unusable account list; MSX was not connected.",
+        "Azure CLI vrátilo nepoužitelný seznam účtů; MSX nebylo připojeno.",
+    ),
+    (
+        "Multiple Azure CLI identities are available for the MSX tenant. Sign in to MSX to choose one.",
+        "Pro tenanta MSX je v Azure CLI k dispozici více identit. Přihlášením k MSX vyberte jednu z nich.",
+    ),
+    (
         "Azure CLI could not reach Microsoft sign-in; check connectivity. Retrying automatically.",
         "Azure CLI se nespojilo s přihlašovací službou Microsoft; zkontrolujte připojení. Pokus se automaticky zopakuje.",
     ),
@@ -376,6 +393,46 @@ pub const TEXTS: &[(&str, &str)] = &[
     (
         "MSX sign-in timed out. Start sign-in again.",
         "Přihlášení k MSX vypršelo. Spusťte ho znovu.",
+    ),
+    (
+        "MSX sign-in refresh timed out; retrying automatically.",
+        "Obnovení přihlášení k MSX vypršelo; pokus se automaticky zopakuje.",
+    ),
+    (
+        "MSX could not reach Microsoft sign-in; check connectivity. Retrying automatically.",
+        "MSX se nespojilo s přihlašovací službou Microsoft; zkontrolujte připojení. Pokus se automaticky zopakuje.",
+    ),
+    (
+        "Microsoft sign-in returned an unusable response; MSX was not connected.",
+        "Přihlašovací služba Microsoft vrátila nepoužitelnou odpověď; MSX nebylo připojeno.",
+    ),
+    (
+        "Microsoft sign-in returned a token for a different tenant; MSX was not connected.",
+        "Přihlašovací služba Microsoft vrátila token pro jiného tenanta; MSX nebylo připojeno.",
+    ),
+    (
+        "Tomlook could not prepare a secure connection to Microsoft sign-in.",
+        "Tomlook nedokázal připravit zabezpečené spojení s přihlašovací službou Microsoft.",
+    ),
+    (
+        "Tomlook could not start its local sign-in listener; no browser was opened.",
+        "Tomlook nedokázal spustit místní příjem přihlášení; prohlížeč nebyl otevřen.",
+    ),
+    (
+        "Tomlook could not open your browser for the MSX sign-in.",
+        "Tomlook nedokázal otevřít prohlížeč pro přihlášení k MSX.",
+    ),
+    (
+        "MSX sign-in failed or was blocked by tenant policy. Try again.",
+        "Přihlášení k MSX se nezdařilo nebo ho zablokovaly zásady tenanta. Zkuste to znovu.",
+    ),
+    (
+        "MSX sign-in succeeded, but Tomlook could not save it securely; MSX was not connected.",
+        "Přihlášení k MSX proběhlo, ale Tomlook ho nedokázal bezpečně uložit; MSX nebylo připojeno.",
+    ),
+    (
+        "The saved MSX sign-in could not be removed.",
+        "Uložené přihlášení k MSX se nepodařilo odstranit.",
     ),
     (
         "Azure CLI did not provide a device code within 60 seconds. Your tenant may block device-code sign-in; use Sign in to MSX instead.",
@@ -1642,6 +1699,10 @@ Vrať stručný závěr, datovaný seznam rezervací a finálních pozvánek, d�
         "Po změně kalendáře už doporučení není aktuální.",
     ),
     (
+        "The meeting has ended; this change is no longer offered",
+        "Schůzka už skončila, takže se tato změna už nenabízí.",
+    ),
+    (
         "Calendar change verified by read-back",
         "Změna kalendáře byla ověřená opětovným načtením.",
     ),
@@ -1868,6 +1929,10 @@ Vrať stručný závěr, datovaný seznam rezervací a finálních pozvánek, d�
     (
         "Refreshing upcoming meeting context",
         "Obnovuji souvislosti k nadcházející schůzce",
+    ),
+    (
+        "Retrying a failed automatic preparation",
+        "Znovu zkouším neúspěšné automatické zjištění souvislostí",
     ),
     (
         "Calendar coverage is unverified; no automatic analysis",
@@ -3989,6 +4054,10 @@ const PATTERNS: &[(&str, &str)] = &[
         "Zjištění souvislostí se nezdařilo: {0}. Pokus {1}/3 za {2} s.",
     ),
     (
+        "Preparation failed: {}. Next automatic attempt in 24 hours.",
+        "Zjištění souvislostí se nezdařilo: {0}. Další automatický pokus za 24 hodin.",
+    ),
+    (
         "{} must contain 1-{} UTF-8 bytes without unsupported control characters",
         "{0} musí mít 1–{1} bajtů v UTF-8 bez nepodporovaných řídicích znaků",
     ),
@@ -4158,8 +4227,20 @@ const PATTERNS: &[(&str, &str)] = &[
         "Je nutné přihlášení k MSX (Azure CLI hlásí {0}).",
     ),
     (
-        "{} rejected the Azure CLI token; sign in to MSX again.",
-        "{0} odmítlo token z Azure CLI; přihlaste se k MSX znovu.",
+        "MSX sign-in required (Microsoft sign-in reported {}).",
+        "Je nutné přihlášení k MSX (přihlašovací služba Microsoft hlásí {0}).",
+    ),
+    (
+        "MSX sign-in failed (Microsoft sign-in reported {}).",
+        "Přihlášení k MSX se nezdařilo (přihlašovací služba Microsoft hlásí {0}).",
+    ),
+    (
+        "Microsoft sign-in returned HTTP {}; retrying automatically.",
+        "Přihlašovací služba Microsoft vrátila HTTP {0}; pokus se automaticky zopakuje.",
+    ),
+    (
+        "{} rejected the sign-in; sign in to MSX again.",
+        "{0} odmítlo přihlášení; přihlaste se k MSX znovu.",
     ),
     ("{} is unreachable: {}", "{0} není dostupné: {1}"),
     ("{} refused the connection: {}", "{0} odmítlo připojení: {1}"),
@@ -4435,7 +4516,7 @@ mod tests {
 
     #[test]
     fn msx_statuses_and_provider_failures_are_localized_without_changing_codes() {
-        use crate::msx::{Phase, Status, auth};
+        use crate::msx::{Phase, Status, auth, oauth};
         for phase in [
             Phase::NotConnected,
             Phase::Checking,
@@ -4461,11 +4542,13 @@ mod tests {
             crate::msx::DISABLED,
             crate::msx::DEMO,
             crate::msx::DISCONNECTED,
+            crate::msx::DISCONNECT_INCOMPLETE,
             crate::msx::BROWSER_PROMPT,
             crate::msx::DEVICE_REQUEST,
             crate::msx::DEVICE_PROMPT,
             crate::msx::CHECK_CANCELLED,
             crate::msx::INVALID_TENANT,
+            crate::msx::DATAVERSE_ACCESS_DENIED,
             auth::SIGN_IN_REQUIRED,
             auth::TOKEN_TIMEOUT,
             auth::CLI_MISSING,
@@ -4476,7 +4559,17 @@ mod tests {
             auth::LOGIN_FAILED,
             auth::LOGIN_CANCELLED,
             auth::LOGIN_TIMED_OUT,
+            auth::REFRESH_TIMEOUT,
             auth::DEVICE_CODE_TIMEOUT,
+            oauth::NETWORK,
+            oauth::INVALID_RESPONSE,
+            oauth::TENANT_MISMATCH,
+            oauth::HTTP_FAILED,
+            oauth::LISTENER_FAILED,
+            oauth::BROWSER_FAILED,
+            oauth::LOGIN_FAILED,
+            oauth::SAVE_FAILED,
+            oauth::CLEAR_FAILED,
             "Connected (read-only).",
             "Dataverse read timed out",
             "Power BI read timed out",
@@ -4493,6 +4586,16 @@ mod tests {
             "Je nutné přihlášení k MSX (Azure CLI hlásí AADSTS50076)."
         );
         assert_eq!(
+            Language::Cs.text(
+                "MSX sign-in required (Microsoft sign-in reported AADSTS700082)."
+            ),
+            "Je nutné přihlášení k MSX (přihlašovací služba Microsoft hlásí AADSTS700082)."
+        );
+        assert_eq!(
+            Language::Cs.text("Microsoft sign-in returned HTTP 503; retrying automatically."),
+            "Přihlašovací služba Microsoft vrátila HTTP 503; pokus se automaticky zopakuje."
+        );
+        assert_eq!(
             Language::Cs.text("Dataverse is unreachable: HTTP 503: provider unavailable; retry later"),
             format!(
                 "Dataverse není dostupné: {}",
@@ -4500,8 +4603,8 @@ mod tests {
             )
         );
         assert_eq!(
-            Language::Cs.text("Power BI rejected the Azure CLI token; sign in to MSX again."),
-            "Power BI odmítlo token z Azure CLI; přihlaste se k MSX znovu."
+            Language::Cs.text("Power BI rejected the sign-in; sign in to MSX again."),
+            "Power BI odmítlo přihlášení; přihlaste se k MSX znovu."
         );
         assert_eq!(
             Language::Cs.text(

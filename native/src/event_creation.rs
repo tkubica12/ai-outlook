@@ -488,6 +488,14 @@ impl Record {
             .collect()
     }
 
+    /// Every time this record would create is over, so it no longer belongs in Messages.
+    /// A creation still in flight stays visible until its outcome is known.
+    pub fn ended(&self, now: DateTime<FixedOffset>) -> bool {
+        self.state != State::Creating
+            && self.draft.end <= now
+            && self.parts().iter().all(|part| part.end <= now)
+    }
+
     pub fn label(&self) -> &'static str {
         if self.hold.is_some() {
             return match self.state {
@@ -650,6 +658,17 @@ pub(crate) mod tests {
         assert_eq!(record.review_message(&message), message, "Never repeated");
         let plain = Record::new("owner".into(), draft()).unwrap();
         assert_eq!(plain.review_message("Uncertain."), "Uncertain.");
+    }
+
+    #[test]
+    fn creation_records_end_after_their_last_part_but_never_while_in_flight() {
+        let mut record = Record::new("owner".into(), draft()).unwrap();
+        record.state = State::NotSent;
+        let end = record.draft.end;
+        assert!(!record.ended(end), "The travel block after the event is still ahead");
+        assert!(record.ended(end + Duration::minutes(30)));
+        record.state = State::Creating;
+        assert!(!record.ended(end + Duration::days(1)), "An in-flight creation stays visible");
     }
 
     pub fn parent() -> Event {

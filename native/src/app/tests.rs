@@ -3899,8 +3899,8 @@ fn msx_connection_offers_only_explicit_sign_in_and_is_localized() {
             "Disconnect",
             "Signed-in Azure account",
             "Not known yet",
-            "Uses your Azure CLI sign-in; may change Azure CLI's default account.",
-            "Read-only: Tomlook never creates or changes MSX records. Tokens stay in memory.",
+            "MSX uses its own browser sign-in; Power BI uses your Azure CLI sign-in, which may change Azure CLI's default account.",
+            "Read-only: Tomlook never creates or changes MSX records. The MSX sign-in is saved encrypted for this Windows user.",
         ] {
             assert!(shown.contains(language.text(expected).as_ref()), "{language:?}: missing {expected} in {shown}");
         }
@@ -3910,6 +3910,16 @@ fn msx_connection_offers_only_explicit_sign_in_and_is_localized() {
         }
         assert!(quiet, "Rendering never opens a browser or copies anything");
         assert!(commands.try_recv().is_err(), "Opening the dialog never starts a check or sign-in");
+
+        let mut partial = msx_status(Phase::Connected, tomlook::msx::POWERBI_ONLY, None);
+        partial.dataverse = tomlook::msx::Service {
+            phase: Phase::Unavailable,
+            message: tomlook::msx::DATAVERSE_ACCESS_DENIED.into(),
+        };
+        notices.send(ai::Notice::Msx(partial)).unwrap();
+        app.receive();
+        let (shown, _) = text(&mut app);
+        assert!(shown.contains(language.text(tomlook::msx::DATAVERSE_ACCESS_DENIED).as_ref()), "{language:?}: missing Dataverse error in {shown}");
 
         click(&mut app, language.text("Sign in to MSX").as_ref());
         assert!(matches!(commands.try_recv().unwrap(), ai::Command::SignInMsx { device_code: false }));
@@ -7617,10 +7627,10 @@ fn messages_name_invitees_and_warn_that_uncertain_invitations_may_already_be_out
         let (mut app, _, _) = assistant_fixture();
         app.preferences.language = language;
         app.calendar_owner = Some("owner".into());
+        let start = chrono::Local::now().fixed_offset() + chrono::Duration::days(7);
         let draft = tomlook::event_creation::Draft {
             title: "Synthetic invitation".into(), description: String::new(),
-            start: chrono::DateTime::parse_from_rfc3339("2026-11-03T10:00:00+01:00").unwrap(),
-            end: chrono::DateTime::parse_from_rfc3339("2026-11-03T11:00:00+01:00").unwrap(),
+            start, end: start + chrono::Duration::hours(1),
             category: None, private: false, teams: false, travel_minutes: None, language,
             attendees: tomlook::attendees::parse_input("Alex Rivers <alex@example.com>").unwrap(),
         };
@@ -7629,7 +7639,7 @@ fn messages_name_invitees_and_warn_that_uncertain_invitations_may_already_be_out
         record.state = tomlook::event_creation::State::Review;
         record.message = record.review_message(tomlook::workiq::connection::calendar_write::UNCERTAIN);
         app.activity = Arc::new(tomlook::worker::Activity {
-            event_creations: Arc::new([(record.id.clone(), record)].into()),
+            event_creations: Arc::new([(record.id.clone(), record.clone())].into()),
             ..Default::default()
         });
         app.messages_open = true;
@@ -7637,8 +7647,18 @@ fn messages_name_invitees_and_warn_that_uncertain_invitations_may_already_be_out
         let show: Show = &|app, ui| app.overlays(ui.ctx());
         draw_with(&context, &mut app, vec![], show);
         let text = settled(&context, &mut app, show);
+        assert!(text.contains("Synthetic invitation"), "{text}");
         assert!(text.contains(language.text(tomlook::event_creation::INVITATIONS_MAY_BE_SENT).as_ref()), "{text}");
         assert!(text.contains(&format!("{}: Alex Rivers", language.text("Invited"))), "{text}");
+        record.draft.start -= chrono::Duration::days(14);
+        record.draft.end -= chrono::Duration::days(14);
+        app.activity = Arc::new(tomlook::worker::Activity {
+            event_creations: Arc::new([(record.id.clone(), record)].into()),
+            ..Default::default()
+        });
+        draw_with(&context, &mut app, vec![], show);
+        let text = settled(&context, &mut app, show);
+        assert!(!text.contains("Synthetic invitation"), "Ended creations leave Messages\n{text}");
     }
 }
 

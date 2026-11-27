@@ -209,7 +209,7 @@ impl Tomlook {
         {
             self.save_preferences();
         }
-        ui.weak(language.text("Tomlook stays idle until you sign in or Azure CLI already has a token. It never opens a sign-in prompt on its own."));
+        ui.weak(language.text("Tomlook stays idle until you sign in or a saved MSX sign-in or Azure CLI token exists. It never opens a sign-in prompt on its own."));
         ui.add_space(20.0);
         ui.strong(language.text("Microsoft tenant ID"));
         ui.add(
@@ -643,7 +643,9 @@ impl Tomlook {
                 .resizable(true)
                 .show(context, |ui| {
                     let creations = self.activity.event_creations.clone();
-                    let mut records = creations.values().filter(|record| self.calendar_owner.as_deref() == Some(record.account.as_str())).collect::<Vec<_>>();
+                    let now = chrono::Local::now().fixed_offset();
+                    let mut records = creations.values().filter(|record| self.calendar_owner.as_deref() == Some(record.account.as_str())
+                        && !record.ended(now)).collect::<Vec<_>>();
                     records.sort_by_key(|record| (
                         record.state == tomlook::event_creation::State::Pending,
                         self.recommendation_selected.as_deref() == Some(record.id.as_str()),
@@ -675,7 +677,6 @@ impl Tomlook {
                             });
                         });
                     }
-                    let now = chrono::Local::now().fixed_offset();
                     let recommendations = self
                         .activity
                         .recommendation_view

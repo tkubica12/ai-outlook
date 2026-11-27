@@ -1,18 +1,20 @@
 //! MSX (Dataverse) and Azure consumption (Power BI) read-only data layer.
 //!
-//! Tokens come from the user's Azure CLI sign-in and stay in memory. Background work never
-//! starts an interactive sign-in; only [`Client::sign_in`] does, after an explicit user action.
-//! Only allowlisted read tools are ever called, and every response is bounded.
+//! Dataverse uses Tomlook's own browser sign-in ([`oauth`]), saved encrypted for the Windows
+//! user; Power BI uses the user's Azure CLI sign-in. Access tokens stay in memory. Background
+//! work never starts an interactive sign-in; only [`Client::sign_in`] does, after an explicit
+//! user action. Only allowlisted read tools are ever called, and every response is bounded.
 pub mod acr;
 pub mod auth;
 pub mod dataverse;
 pub mod mcp;
+pub mod oauth;
 pub mod tools;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 pub const DEFAULT_TENANT: &str = "72f988bf-86f1-41af-91ab-2d7cd011db47";
@@ -30,13 +32,15 @@ pub const CONNECTED: &str = "Connected read-only to Dataverse and Power BI.";
 pub const DATAVERSE_ONLY: &str =
     "Dataverse connected; Azure consumption (Power BI) is unavailable.";
 pub const POWERBI_ONLY: &str = "Power BI connected; Dataverse is unavailable.";
+pub const DATAVERSE_ACCESS_DENIED: &str =
+    "Dataverse denied access (HTTP 403). Check your MSX (Dataverse) permissions.";
 pub const DISABLED: &str = "MSX is turned off in Settings.";
 pub const DEMO: &str = "Offline demo never connects MSX.";
-pub const DISCONNECTED: &str =
-    "Disconnected. In-memory MSX tokens were forgotten; your Azure CLI sign-in is unchanged.";
-pub const BROWSER_PROMPT: &str =
-    "Complete the Microsoft sign-in that Azure CLI opened (browser or Windows prompt).";
-pub const DEVICE_REQUEST: &str = "Requesting a device code from Azure CLI (up to 60 seconds)...";
+pub const DISCONNECTED: &str = "Disconnected. The saved MSX sign-in and in-memory tokens were removed; your Azure CLI sign-in is unchanged.";
+pub const DISCONNECT_INCOMPLETE: &str =
+    "Disconnected, but the saved MSX sign-in could not be removed.";
+pub const BROWSER_PROMPT: &str = "Complete the Microsoft sign-in in your browser.";
+pub const DEVICE_REQUEST: &str = "Opening the MSX sign-in in your browser; Power BI may then request an Azure CLI device code...";
 pub const DEVICE_PROMPT: &str = "Enter this code on Microsoft's device sign-in page.";
 pub const CHECK_CANCELLED: &str = "MSX check cancelled.";
 pub const INVALID_TENANT: &str = "The MSX tenant must be a Microsoft Entra tenant ID (GUID).";
@@ -190,6 +194,12 @@ impl Status {
             Phase::NotConnected => "MSX: not connected",
             Phase::Checking => "MSX: checking...",
             Phase::SigningIn => "MSX: signing in...",
+            Phase::Connected
+                if self.dataverse.phase != Phase::Connected
+                    || self.powerbi.phase != Phase::Connected =>
+            {
+                "MSX: partially connected"
+            }
             Phase::Connected => "MSX: connected",
             Phase::SignInRequired => "MSX: sign-in required",
             Phase::Unavailable => "MSX: unavailable",
@@ -340,13 +350,22 @@ fn phase_of(error: &auth::AuthError) -> Phase {
 fn mcp_error(resource: Resource, error: mcp::CallError) -> auth::AuthError {
     match error {
         mcp::CallError::Unauthorized => auth::AuthError::SignInRequired(format!(
-            "{} rejected the Azure CLI token; sign in to MSX again.",
+            "{} rejected the sign-in; sign in to MSX again.",
             resource.label()
         )),
         mcp::CallError::Transport(reason) => auth::AuthError::Unavailable {
             message: format!("{} is unreachable: {reason}", resource.label()),
             transient: true,
         },
+        mcp::CallError::Rejected(reason)
+            if resource == Resource::Dataverse
+                && (reason == "HTTP 403" || reason.starts_with("HTTP 403:")) =>
+        {
+            auth::AuthError::Unavailable {
+                message: DATAVERSE_ACCESS_DENIED.into(),
+                transient: false,
+            }
+        }
         mcp::CallError::Rejected(reason) => auth::AuthError::Unavailable {
             message: format!("{} refused the connection: {reason}", resource.label()),
             transient: false,
@@ -355,11 +374,13 @@ fn mcp_error(resource: Resource, error: mcp::CallError) -> auth::AuthError {
 }
 
 impl Client {
-    /// A client that uses the installed Azure CLI and the live MCP endpoints.
-    pub fn new(settings: &Settings, publish: Publish) -> Self {
+    /// A client with the saved browser sign-in, the installed Azure CLI and the live MCP
+    /// endpoints. `root` is the Tomlook profile that holds the saved sign-in.
+    pub fn new(root: &Path, settings: &Settings, publish: Publish) -> Self {
         Self::with(
             &settings.tenant,
             Arc::new(auth::CliRunner::installed()),
+            Arc::new(oauth::BrowserGrant::new(root, &settings.tenant)),
             Arc::new(mcp::RmcpConnector),
             publish,
         )
@@ -368,11 +389,12 @@ impl Client {
     pub fn with(
         tenant: &str,
         runner: Arc<dyn auth::Runner>,
+        grant: Arc<dyn oauth::Grant>,
         connector: Arc<dyn mcp::Connector>,
         publish: Publish,
     ) -> Self {
         Self {
-            tokens: auth::Tokens::new(runner, tenant),
+            tokens: auth::Tokens::new(runner, grant, tenant),
             connector,
             live: [tokio::sync::Mutex::new(None), tokio::sync::Mutex::new(None)],
             schemas: std::sync::Mutex::new(BTreeMap::new()),
@@ -456,7 +478,11 @@ impl Client {
                 self.update(|status| {
                     *status.service_mut(resource) =
                         Service::new(Phase::Connected, "Connected (read-only).");
-                    if account.is_some() {
+                    // The MSX (Dataverse) sign-in names the account; the Azure CLI account used
+                    // for Power BI may differ and is shown only when Dataverse has none.
+                    if account.is_some()
+                        && (resource == Resource::Dataverse || status.account.is_none())
+                    {
                         status.account = account;
                     }
                     status
@@ -585,7 +611,7 @@ impl Client {
             };
             self.drop_session(resource).await;
             // A token the service keeps rejecting needs a new sign-in; later reads fail fast.
-            self.tokens.latch(&error);
+            self.tokens.latch(resource, &error);
             self.mark(resource, &error);
             return Err(error.message().into());
         }
@@ -655,7 +681,8 @@ impl Client {
         }
     }
 
-    /// Explicit interactive sign-in (browser/WAM, or a device code), then a connection check.
+    /// Explicit interactive sign-in (browser for Dataverse; Azure CLI for Power BI only when it
+    /// is signed out, optionally with a device code), then a connection check.
     pub async fn sign_in(
         self: &Arc<Self>,
         device_code: bool,
@@ -668,12 +695,7 @@ impl Client {
         // The sign-in may switch accounts; the next read resolves the user again.
         *self.user.lock().await = None;
         self.update(|status| {
-            status.message = if device_code {
-                DEVICE_REQUEST
-            } else {
-                BROWSER_PROMPT
-            }
-            .into();
+            status.message = BROWSER_PROMPT.into();
             status.device_code = None;
             status.dataverse = Service::new(Phase::SigningIn, "");
             status.powerbi = Service::new(Phase::SigningIn, "");
@@ -703,25 +725,39 @@ impl Client {
         }
     }
 
-    /// Forgets in-memory tokens, sessions and caches. The Azure CLI sign-in is not changed, and
-    /// nothing reconnects until the user checks the connection or signs in again.
-    pub async fn disconnect(&self) {
+    /// Ends sessions and forgets in-memory tokens and caches, keeping saved sign-ins; used
+    /// when Tomlook shuts down or the MSX settings change.
+    pub async fn close(&self) {
         for resource in Resource::ALL {
             self.drop_session(resource).await;
         }
         self.tokens.clear().await;
-        self.tokens
-            .latch(&auth::AuthError::SignInRequired(DISCONNECTED.into()));
         if let Ok(mut schemas) = self.schemas.lock() {
             schemas.clear();
         }
         *self.model.lock().await = None;
         *self.user.lock().await = None;
+        *self.territory.lock().await = None;
+    }
+
+    /// Removes Tomlook's saved MSX sign-in along with in-memory tokens, sessions and caches.
+    /// The Azure CLI sign-in is not changed, and nothing reconnects until the user signs in
+    /// again.
+    pub async fn disconnect(&self) {
+        self.close().await;
+        let message = match self.tokens.sign_out().await {
+            Ok(()) => DISCONNECTED,
+            Err(_) => DISCONNECT_INCOMPLETE,
+        };
+        for resource in Resource::ALL {
+            self.tokens
+                .latch(resource, &auth::AuthError::SignInRequired(message.into()));
+        }
         self.update(|status| {
             status.account = None;
             status.tools.clear();
-            status.dataverse = Service::new(Phase::NotConnected, DISCONNECTED);
-            status.powerbi = Service::new(Phase::NotConnected, DISCONNECTED);
+            status.dataverse = Service::new(Phase::NotConnected, message);
+            status.powerbi = Service::new(Phase::NotConnected, message);
         });
     }
 }

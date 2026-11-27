@@ -1,7 +1,9 @@
-//! Read-only, non-interactive MSX probe. One bounded Azure CLI token read (20 seconds) per
-//! resource, then tool discovery, a WhoAmI-style user resolution and a `TOP 1` read. Prints tool
-//! names, row counts and column names only: never tokens or customer values. It never signs in.
-use std::{sync::Arc, time::Instant};
+//! Read-only MSX probe using Tomlook's saved MSX sign-in (`%LOCALAPPDATA%\Tomlook`). By default
+//! it is non-interactive: one bounded silent token read per resource (the saved MSX sign-in for
+//! Dataverse, the Azure CLI for Power BI), then tool discovery, a WhoAmI-style user resolution
+//! and a `TOP 1` read. `--sign-in` first runs the explicit browser sign-in. Prints tool names,
+//! row counts and column names only: never tokens or customer values.
+use std::{path::PathBuf, sync::Arc, time::Instant};
 use tomlook::msx::{Client, DEFAULT_TENANT, Resource, Settings};
 
 fn shape(value: &serde_json::Value) -> String {
@@ -23,24 +25,53 @@ fn excerpt(error: &str) -> String {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let tenant = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| DEFAULT_TENANT.into());
+    let mut sign_in = false;
+    let mut tenant = None;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--sign-in" => sign_in = true,
+            _ if tenant.is_none() => tenant = Some(arg),
+            _ => {
+                eprintln!("Usage: msx-probe [--sign-in] [tenant-id]");
+                std::process::exit(1);
+            }
+        }
+    }
+    let tenant = tenant.unwrap_or_else(|| DEFAULT_TENANT.into());
     if let Err(error) = tomlook::msx::validate_tenant(&tenant) {
-        eprintln!("Usage: msx-probe [tenant-id]: {error}");
+        eprintln!("Usage: msx-probe [--sign-in] [tenant-id]: {error}");
+        std::process::exit(1);
+    }
+    let Some(root) = std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("Tomlook"))
+    else {
+        eprintln!("LOCALAPPDATA is not defined");
+        std::process::exit(1);
+    };
+    if let Err(error) = std::fs::create_dir_all(&root) {
+        eprintln!("Cannot create {}: {error}", root.display());
         std::process::exit(1);
     }
     let client = Arc::new(Client::new(
+        &root,
         &Settings {
             enabled: true,
             tenant,
         },
-        Arc::new(|_| {}),
+        Arc::new(|status: tomlook::msx::Status| {
+            if let Some(code) = &status.device_code {
+                println!("device code: {code}");
+            }
+        }),
     ));
     let (_cancel, cancelled) = tokio::sync::watch::channel(false);
     let (_stop, shutdown) = tokio::sync::watch::channel(false);
     let started = Instant::now();
-    let checked = client.check(false, cancelled, shutdown).await;
+    let checked = if sign_in {
+        println!("Complete the Microsoft sign-in in your browser...");
+        client.sign_in(false, cancelled, shutdown).await
+    } else {
+        client.check(false, cancelled, shutdown).await
+    };
     println!(
         "check: {} after {} ms",
         match &checked {
@@ -82,5 +113,5 @@ async fn main() {
             Err(error) => println!("Power BI ROW probe: {}", excerpt(&error)),
         }
     }
-    client.disconnect().await;
+    client.close().await;
 }

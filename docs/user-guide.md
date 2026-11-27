@@ -272,7 +272,10 @@ repositories, GitHub and WebIQ.
   calendar, and synchronized calendar days.
 - Insights within the next 14 days are refreshed after 24 hours; others are
   reused until the meeting changes. A failed automatic attempt is retried up to
-  three times with backoff without blocking other meetings.
+  three times with backoff without blocking other meetings, then once a day,
+  and immediately after the meeting or the preparation settings change. It
+  leaves the queue once the meeting is over. A failed **Research now** request
+  waits for **Retry**.
 - **Research now** in meeting details prepares any cached meeting (also past
   ones) immediately, even while automatic work is paused.
 - **Insights activity** (click the activity count in the status bar) lists
@@ -371,6 +374,13 @@ office and `mimo office` a customer's or partner's premises.
 
 **Check calendar result** on an uncertain item re-reads the calendar; it never
 submits the change again.
+
+Messages only offer changes that can still matter. Once a meeting has ended,
+its unsent, failed or unconfirmed calendar changes expire automatically and
+disappear; they are never submitted later. Proposed edits to saved Insights or
+notes and follow-ups stay, because they belong after the meeting. Event
+creation entries disappear once every time they cover has passed, unless the
+creation is still running.
 
 ## AI-proposed edits
 

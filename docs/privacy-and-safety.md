@@ -21,14 +21,15 @@ file permissions; only the files marked DPAPI are additionally encrypted.
 | `workiq-login.db` | WorkIQ sign-in, **DPAPI-encrypted**, bound to account, tenant and client |
 | `connector-login.db` | WebIQ key and GitHub tokens, **DPAPI-encrypted**, bound to provider and endpoint |
 | `copilot-login.db` | Tomlook's Copilot OAuth token and verified identity, **DPAPI-encrypted**, bound to the Copilot OAuth application and GitHub host |
+| `msx-login.db` | MSX (Dataverse) refresh token, **DPAPI-encrypted**, bound to tenant and client; removed by **Disconnect** |
 | `connections.json`, `decision-router.json` | Copilot runtime and Foundry configuration; never secrets |
 | `copilot\`, `workspace\` | The isolated Copilot CLI home and working directory; new sign-ins never store a token here. Legacy login files are not imported or automatically removed |
 | `company-icons\` | Cached company favicons |
 | `notification-icon.png`, `instance.lock` | Notification icon and the single-instance lock |
 
 Not stored on disk: ordinary Ask conversations (memory only, cleared on
-exit), participant photos (memory only, at most 128), Azure and MSX tokens,
-and WorkIQ access tokens. Full invitation bodies are never synchronized.
+exit), participant photos (memory only, at most 128), Azure and MSX access
+tokens, and WorkIQ access tokens. Full invitation bodies are never synchronized.
 Feedback, tasks and customers are never sent anywhere automatically, and
 Tomlook sends no usage telemetry.
 
@@ -48,9 +49,14 @@ previous executable is kept as `Tomlook.exe.old` until the next start.
   the shared keychain stays disabled, and ambient `GH_TOKEN`/`GITHUB_TOKEN`-style
   variables and `gh` logins are removed and rejected. Legacy isolated login
   files are not imported; sign in once in Tomlook after upgrading.
-- **Azure CLI (Foundry, MSX):** tokens are requested from Azure CLI, checked
-  against the configured tenant and kept in memory only. Azure CLI keeps its
-  own sign-in cache.
+- **Azure CLI (Foundry, Power BI for MSX):** tokens are requested from Azure
+  CLI, checked against the configured tenant and kept in memory only. Azure
+  CLI keeps its own sign-in cache.
+- **MSX Dataverse:** an explicit browser sign-in with the public GitHub
+  Copilot/VS Code client (authorization code with PKCE; the result passes
+  through `vscode.dev/redirect` to a one-time `127.0.0.1` listener). Only the
+  refresh token is saved, DPAPI-encrypted in `msx-login.db`; access tokens
+  are checked against the tenant and kept in memory.
 - Personal `.mcp.json`, `gh` credentials and Copilot profiles are never
   imported. Never put keys or tokens into configuration files or chat.
 
@@ -63,7 +69,7 @@ previous executable is kept as `Tomlook.exe.old` until the next start.
 | WebIQ | `api.microsoft.ai/v3/mcp` | Key verification and public web searches by the model |
 | GitHub connector | `api.githubcopilot.com/mcp/` (read-only), `github.com/login/device`, `github.com/login/oauth/access_token`, `api.github.com/user` | Sign-in, token renewal and repository reads |
 | Foundry | The configured `*.services.ai.azure.com` endpoint, token via Azure CLI | Only for Ask in **Auto** mode |
-| MSX | `microsoftsales.crm.dynamics.com/api/mcp`, `api.fabric.microsoft.com/v1/mcp/powerbi`, tokens via Azure CLI | When MSX is enabled and signed in: customer timeline, preparation of customer meetings, Thorough Ask |
+| MSX | `microsoftsales.crm.dynamics.com/api/mcp`, `api.fabric.microsoft.com/v1/mcp/powerbi`; Dataverse sign-in at `login.microsoftonline.com` via `vscode.dev/redirect`, Power BI tokens via Azure CLI | When MSX is enabled and signed in: customer timeline, preparation of customer meetings, Thorough Ask |
 | Updates | `api.github.com/repos/tkubica12/ai-outlook/releases/latest`, downloads from `github.com` / `*.githubusercontent.com` | About a minute after start, then daily; unauthenticated, no user data |
 | Company icons | `https://<domain>/favicon.ico` (or `www.<domain>`) | When an external company is shown; only the domain is sent, only public IP addresses, no redirects, bounded size |
 
@@ -173,9 +179,10 @@ Every write follows the same rules:
    sent, then the message itself). Deletion is proven by a "not found" of that
    exact resource. Retries apply to reads only.
 4. **Never replay.** An unknown or interrupted outcome stays in Messages for
-   review; **Check calendar result** only re-reads. Only a definitive
-   rejection allows a new, explicit approval. Rejections keep the HTTP status
-   and an allowlisted error code, never provider message bodies.
+   review until the meeting ends; **Check calendar result** only re-reads.
+   Unfinished changes to ended meetings expire and are never submitted. Only a
+   definitive rejection allows a new, explicit approval. Rejections keep the
+   HTTP status and an allowlisted error code, never provider message bodies.
 5. **No rollback.** Multi-part writes stop at the first failure; verified
    parts stay. With attendees, an uncertain outcome may mean invitations were
    already sent; check Outlook first.

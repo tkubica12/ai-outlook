@@ -158,17 +158,37 @@ failure.
 
 The **MSX** entry connects read-only to the MSX Dataverse
 (`https://microsoftsales.crm.dynamics.com/api/mcp`) and the Fabric Power BI
-MCP (`https://api.fabric.microsoft.com/v1/mcp/powerbi`) using your Azure CLI
-sign-in.
+MCP (`https://api.fabric.microsoft.com/v1/mcp/powerbi`).
 
 - **Settings → MSX** turns it on or off and sets the Entra tenant (default
   the Microsoft tenant `72f988bf-86f1-41af-91ab-2d7cd011db47`).
-- At start Tomlook makes one quiet token check. If a token read times out or
-  needs interaction, the status becomes **sign-in required** and Azure CLI is
-  not started again until you act.
-- **Sign in to MSX** (browser or Windows prompt) or **Use device code** starts
-  a cancellable `az login`; this may change Azure CLI's default account.
-- **Disconnect** forgets Tomlook's in-memory tokens only.
+- Dataverse admits only [allowed MCP clients](https://learn.microsoft.com/en-us/power-apps/maker/data-platform/data-platform-mcp-disable#configure-and-manage-the-dataverse-mcp-server),
+  so MSX uses its own browser sign-in with the public client that GitHub
+  Copilot and VS Code use (`aebc6443-996d-45c2-90f0-388ff96faa56`,
+  authorization code with PKCE, scope `mcp.tools`). Microsoft redirects to
+  `https://vscode.dev/redirect`, which forwards the result to a one-time
+  listener on `127.0.0.1`; Tomlook accepts it only with the expected nonce.
+- **Sign in to MSX** opens that sign-in in your default browser; complete it
+  within 10 minutes. The refresh token is saved in `msx-login.db`, encrypted
+  for your Windows user (DPAPI); access tokens stay in memory. Later starts
+  renew silently and never open a browser.
+- Power BI (Azure consumption) still uses your Azure CLI sign-in. Quiet checks
+  select an Azure CLI identity for the configured tenant without changing the
+  CLI's default account; if Power BI needs a sign-in, **Sign in to MSX** or
+  **Use device code** also starts a cancellable `az login`, which may change
+  Azure CLI's default account.
+- At start Tomlook makes one quiet check. Without a saved MSX sign-in, or if a
+  token read times out or needs interaction, the status becomes **sign-in
+  required** and nothing is retried until you act.
+- **Disconnect** removes the saved MSX sign-in and in-memory tokens; your
+  Azure CLI sign-in stays.
+- If Microsoft's device sign-in page shows [error 530033](https://login.microsoftonline.com/error?code=530033),
+  Entra Conditional Access requires device authentication that the remote
+  device-code flow cannot prove. Use **Sign in to MSX** on this device
+  instead of a device code.
+- If Dataverse returns HTTP 403 after a successful sign-in, check your
+  Dataverse permissions; a Power BI connection does not establish Dataverse
+  access. After any permission change, use **Check connection**.
 
 ## Local sources for research
 

@@ -1,9 +1,10 @@
-//! Memory-only Azure CLI tokens for the MSX resources.
+//! Memory-only tokens for the MSX resources.
 //!
-//! Background reads use a short hard deadline and never retry: without a fresh cache a
-//! `get-access-token` can wait indefinitely for interactive (WAM) authentication. Only an
-//! explicit sign-in may start `az login`.
-use super::Resource;
+//! Dataverse tokens come from Tomlook's saved browser sign-in ([`super::oauth`]); Power BI
+//! tokens come from the Azure CLI. Background reads use a short hard deadline and never retry:
+//! without a fresh cache a `get-access-token` can wait indefinitely for interactive (WAM)
+//! authentication. Only an explicit sign-in may open a browser or start `az login`.
+use super::{Resource, oauth::Grant};
 use base64::Engine as _;
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
@@ -30,11 +31,16 @@ pub const TENANT_MISMATCH: &str =
     "Azure CLI returned a token for a different tenant; MSX was not connected.";
 pub const INVALID_TOKEN: &str =
     "Azure CLI returned an unusable token response; MSX was not connected.";
+pub const INVALID_ACCOUNTS: &str =
+    "Azure CLI returned an unusable account list; MSX was not connected.";
+pub const AMBIGUOUS_ACCOUNTS: &str =
+    "Multiple Azure CLI identities are available for the MSX tenant. Sign in to MSX to choose one.";
 pub const NETWORK: &str =
     "Azure CLI could not reach Microsoft sign-in; check connectivity. Retrying automatically.";
 pub const LOGIN_FAILED: &str = "MSX sign-in failed or was blocked by tenant policy. Try again or use the other sign-in method.";
 pub const LOGIN_CANCELLED: &str = "MSX sign-in cancelled.";
 pub const LOGIN_TIMED_OUT: &str = "MSX sign-in timed out. Start sign-in again.";
+pub const REFRESH_TIMEOUT: &str = "MSX sign-in refresh timed out; retrying automatically.";
 pub const DEVICE_CODE_TIMEOUT: &str = "Azure CLI did not provide a device code within 60 seconds. Your tenant may block device-code sign-in; use Sign in to MSX instead.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,7 +58,7 @@ impl AuthError {
         }
     }
 
-    fn unavailable(message: &str) -> Self {
+    pub(super) fn unavailable(message: &str) -> Self {
         Self::Unavailable {
             message: message.into(),
             transient: false,
@@ -147,12 +153,17 @@ async fn login_output(
 #[async_trait::async_trait]
 impl Runner for CliRunner {
     async fn run(&self, args: Vec<String>, timeout: Duration) -> Result<Output, RunError> {
+        let account_list = args.first().is_some_and(|arg| arg == "account")
+            && args.get(1).is_some_and(|arg| arg == "list");
+        let stdout_limit = if account_list { 1_048_576 } else { 65_536 };
         let mut child = self.command(&args)?.spawn().map_err(|_| RunError::Spawn)?;
         let stdout = child.stdout.take().ok_or(RunError::Io)?;
         let stderr = child.stderr.take().ok_or(RunError::Io)?;
         let collect = async {
-            let (stdout, stderr) =
-                tokio::try_join!(read_bounded(stdout, 65_536), read_bounded(stderr, 16_384))?;
+            let (stdout, stderr) = tokio::try_join!(
+                read_bounded(stdout, stdout_limit),
+                read_bounded(stderr, 16_384)
+            )?;
             let status = child.wait().await.map_err(|_| RunError::Io)?;
             Ok::<_, RunError>(Output {
                 success: status.success(),
@@ -248,6 +259,14 @@ pub struct Token {
 }
 
 impl Token {
+    pub(super) fn new(secret: String, expires: i64, claims: Claims) -> Self {
+        Self {
+            secret,
+            expires,
+            claims,
+        }
+    }
+
     pub fn secret(&self) -> &str {
         &self.secret
     }
@@ -279,7 +298,7 @@ pub(crate) fn uuid(value: &str) -> bool {
         })
 }
 
-fn claims(token: &str, tenant: &str) -> Result<Claims, AuthError> {
+pub(super) fn claims(token: &str, tenant: &str) -> Result<Claims, AuthError> {
     let mut parts = token.split('.');
     let (Some(_), Some(payload), Some(_), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -353,7 +372,7 @@ pub fn parse_token(bytes: &[u8], tenant: &str, now: i64) -> Result<Token, AuthEr
     })
 }
 
-fn aadsts(text: &str) -> Option<&str> {
+pub(super) fn aadsts(text: &str) -> Option<&str> {
     let start = text.find("AADSTS")?;
     let digits = text[start + 6..]
         .bytes()
@@ -394,14 +413,13 @@ pub fn classify_failure(stderr: &[u8]) -> AuthError {
     }
 }
 
-pub fn token_args(resource: Resource, tenant: &str) -> Vec<String> {
+fn account_args() -> Vec<String> {
     [
         "account",
-        "get-access-token",
-        "--resource",
-        resource.uri(),
-        "--tenant",
-        tenant,
+        "list",
+        "--all",
+        "--query",
+        "[].{id:id,tenantId:tenantId,isDefault:isDefault,state:state,userName:user.name,userType:user.type}",
         "--output",
         "json",
         "--only-show-errors",
@@ -409,6 +427,110 @@ pub fn token_args(resource: Resource, tenant: &str) -> Vec<String> {
     .into_iter()
     .map(str::to_owned)
     .collect()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliAccount {
+    id: Option<String>,
+    tenant_id: Option<String>,
+    is_default: Option<bool>,
+    state: Option<String>,
+    user_name: Option<String>,
+    user_type: Option<String>,
+}
+
+// Azure CLI's `--tenant` uses its globally default identity; a subscription pins the tenant's
+// identity without changing that default.
+fn select_subscription(bytes: &[u8], tenant: &str) -> Result<String, AuthError> {
+    let accounts: Vec<CliAccount> =
+        serde_json::from_slice(bytes).map_err(|_| AuthError::unavailable(INVALID_ACCOUNTS))?;
+    let mut first = None;
+    let mut default = None;
+    let mut identity: Option<(&str, &str)> = None;
+    let mut ambiguous = false;
+    for account in &accounts {
+        let account_tenant = account
+            .tenant_id
+            .as_deref()
+            .ok_or_else(|| AuthError::unavailable(INVALID_ACCOUNTS))?;
+        if !account_tenant.eq_ignore_ascii_case(tenant) {
+            continue;
+        }
+        let state = account
+            .state
+            .as_deref()
+            .ok_or_else(|| AuthError::unavailable(INVALID_ACCOUNTS))?;
+        if !state.eq_ignore_ascii_case("Enabled") {
+            continue;
+        }
+        let id = account
+            .id
+            .as_deref()
+            .filter(|id| uuid(id))
+            .ok_or_else(|| AuthError::unavailable(INVALID_ACCOUNTS))?;
+        let valid_field = |value: &&str| {
+            !value.trim().is_empty() && value.len() <= 1024 && !value.chars().any(char::is_control)
+        };
+        let name = account
+            .user_name
+            .as_deref()
+            .filter(valid_field)
+            .ok_or_else(|| AuthError::unavailable(INVALID_ACCOUNTS))?;
+        let kind = account
+            .user_type
+            .as_deref()
+            .filter(valid_field)
+            .ok_or_else(|| AuthError::unavailable(INVALID_ACCOUNTS))?;
+        let is_default = account
+            .is_default
+            .ok_or_else(|| AuthError::unavailable(INVALID_ACCOUNTS))?;
+        if is_default && default.replace(id).is_some() {
+            return Err(AuthError::unavailable(INVALID_ACCOUNTS));
+        }
+        first.get_or_insert(id);
+        if let Some((previous_name, previous_kind)) = identity {
+            ambiguous |= !name.eq_ignore_ascii_case(previous_name)
+                || !kind.eq_ignore_ascii_case(previous_kind);
+        } else {
+            identity = Some((name, kind));
+        }
+    }
+    if let Some(id) = default {
+        return Ok(id.to_owned());
+    }
+    if ambiguous {
+        return Err(AuthError::SignInRequired(AMBIGUOUS_ACCOUNTS.into()));
+    }
+    first
+        .map(str::to_owned)
+        .ok_or_else(|| AuthError::SignInRequired(SIGN_IN_REQUIRED.into()))
+}
+
+pub fn token_args(resource: Resource, subscription: &str) -> Vec<String> {
+    [
+        "account",
+        "get-access-token",
+        "--resource",
+        resource.uri(),
+        "--subscription",
+        subscription,
+        "--output",
+        "json",
+        "--only-show-errors",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn run_failure(error: RunError, invalid: &str) -> AuthError {
+    match error {
+        RunError::Timeout => AuthError::SignInRequired(TOKEN_TIMEOUT.into()),
+        RunError::Missing => AuthError::unavailable(CLI_MISSING),
+        RunError::Spawn => AuthError::unavailable(CLI_FAILED),
+        RunError::Io => AuthError::unavailable(invalid),
+    }
 }
 
 pub fn login_args(resource: Resource, tenant: &str, device_code: bool) -> Vec<String> {
@@ -431,43 +553,61 @@ pub fn login_args(resource: Resource, tenant: &str, device_code: bool) -> Vec<St
 
 pub struct Tokens {
     runner: Arc<dyn Runner>,
+    grant: Arc<dyn Grant>,
     tenant: String,
     cache: Mutex<BTreeMap<Resource, Token>>,
-    /// The last sign-in failure. Background reads fail fast on it instead of starting the CLI
-    /// again; only an explicit check or sign-in clears it.
-    latched: std::sync::Mutex<Option<AuthError>>,
+    /// The last sign-in failure per resource. Background reads fail fast on it instead of
+    /// asking again; only an explicit check or sign-in clears it.
+    latched: std::sync::Mutex<BTreeMap<Resource, AuthError>>,
 }
 
 impl Tokens {
-    pub fn new(runner: Arc<dyn Runner>, tenant: &str) -> Self {
+    pub fn new(runner: Arc<dyn Runner>, grant: Arc<dyn Grant>, tenant: &str) -> Self {
         Self {
             runner,
+            grant,
             tenant: tenant.into(),
             cache: Mutex::new(BTreeMap::new()),
-            latched: std::sync::Mutex::new(None),
+            latched: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
-    fn latched(&self) -> Option<AuthError> {
-        self.latched.lock().ok().and_then(|latched| latched.clone())
+    fn latched(&self, resource: Resource) -> Option<AuthError> {
+        self.latched
+            .lock()
+            .ok()
+            .and_then(|latched| latched.get(&resource).cloned())
     }
 
-    pub(super) fn latch(&self, error: &AuthError) {
+    pub(super) fn latch(&self, resource: Resource, error: &AuthError) {
         if let (AuthError::SignInRequired(_), Ok(mut latched)) = (error, self.latched.lock()) {
-            *latched = Some(error.clone());
+            latched.insert(resource, error.clone());
         }
     }
 
     pub fn unlatch(&self) {
         if let Ok(mut latched) = self.latched.lock() {
-            *latched = None;
+            latched.clear();
         }
     }
 
-    /// Forgets every in-memory token; the Azure CLI sign-in itself is left unchanged.
+    fn unlatch_one(&self, resource: Resource) {
+        if let Ok(mut latched) = self.latched.lock() {
+            latched.remove(&resource);
+        }
+    }
+
+    /// Forgets every in-memory token; saved sign-ins are left unchanged.
     pub async fn clear(&self) {
         self.cache.lock().await.clear();
         self.unlatch();
+    }
+
+    /// Forgets in-memory tokens and removes Tomlook's saved MSX sign-in. The Azure CLI
+    /// sign-in used for Power BI is left unchanged.
+    pub async fn sign_out(&self) -> Result<(), AuthError> {
+        self.clear().await;
+        self.grant.clear().await
     }
 
     pub async fn forget(&self, resource: Resource) {
@@ -476,7 +616,7 @@ impl Tokens {
 
     /// A cached token, or one silent bounded read; never interactive and never retried.
     pub async fn token(&self, resource: Resource) -> Result<Token, AuthError> {
-        if let Some(error) = self.latched() {
+        if let Some(error) = self.latched(resource) {
             return Err(error);
         }
         let mut cache = self.cache.lock().await;
@@ -491,31 +631,51 @@ impl Tokens {
                 Ok(token)
             }
             Err(error) => {
-                self.latch(&error);
+                self.latch(resource, &error);
                 Err(error)
             }
         }
     }
 
     async fn fetch(&self, resource: Resource) -> Result<Token, AuthError> {
+        if resource == Resource::Dataverse {
+            return tokio::time::timeout(BACKGROUND_TIMEOUT, self.grant.refresh())
+                .await
+                .unwrap_or_else(|_| {
+                    Err(AuthError::Unavailable {
+                        message: REFRESH_TIMEOUT.into(),
+                        transient: true,
+                    })
+                });
+        }
+        let started = tokio::time::Instant::now();
+        let accounts = self
+            .runner
+            .run(account_args(), BACKGROUND_TIMEOUT)
+            .await
+            .map_err(|error| run_failure(error, INVALID_ACCOUNTS))?;
+        if !accounts.success {
+            return Err(classify_failure(&accounts.stderr));
+        }
+        let subscription = select_subscription(&accounts.stdout, &self.tenant)?;
+        let remaining = BACKGROUND_TIMEOUT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(AuthError::SignInRequired(TOKEN_TIMEOUT.into()));
+        }
         let output = self
             .runner
-            .run(token_args(resource, &self.tenant), BACKGROUND_TIMEOUT)
+            .run(token_args(resource, &subscription), remaining)
             .await
-            .map_err(|error| match error {
-                RunError::Timeout => AuthError::SignInRequired(TOKEN_TIMEOUT.into()),
-                RunError::Missing => AuthError::unavailable(CLI_MISSING),
-                RunError::Spawn => AuthError::unavailable(CLI_FAILED),
-                RunError::Io => AuthError::unavailable(INVALID_TOKEN),
-            })?;
+            .map_err(|error| run_failure(error, INVALID_TOKEN))?;
         if !output.success {
             return Err(classify_failure(&output.stderr));
         }
         parse_token(&output.stdout, &self.tenant, chrono::Utc::now().timestamp())
     }
 
-    /// Explicit, user-started sign-in for both resources. Bounded and cancellable; dropping
-    /// the operation ends the CLI.
+    /// Explicit, user-started sign-in: the browser sign-in for Dataverse, then Power BI through
+    /// the Azure CLI only when it has no usable token. Bounded and cancellable; dropping the
+    /// operation ends the listener and the CLI.
     pub async fn sign_in(
         &self,
         device_code: bool,
@@ -527,30 +687,34 @@ impl Tokens {
             return Err(AuthError::SignInRequired(LOGIN_CANCELLED.into()));
         }
         self.clear().await;
-        let deadline = if device_code {
-            DEVICE_LOGIN_TIMEOUT
-        } else {
-            BROWSER_LOGIN_TIMEOUT
-        };
+        let deadline = BROWSER_LOGIN_TIMEOUT
+            + if device_code {
+                DEVICE_LOGIN_TIMEOUT
+            } else {
+                BROWSER_LOGIN_TIMEOUT
+            };
         let operation = async {
-            for resource in Resource::ALL {
-                if resource != Resource::Dataverse {
-                    // One sign-in normally covers both resources; avoid a second prompt.
-                    match self.token(resource).await {
-                        Ok(_) => continue,
-                        Err(AuthError::SignInRequired(_)) => self.unlatch(),
-                        Err(error) => return Err(error),
-                    }
-                }
-                self.runner
+            let token = self.grant.sign_in().await?;
+            self.cache.lock().await.insert(Resource::Dataverse, token);
+            // Power BI is optional for MSX; its failure is reported for that resource only.
+            if let Err(AuthError::SignInRequired(_)) = self.token(Resource::PowerBi).await {
+                self.unlatch_one(Resource::PowerBi);
+                match self
+                    .runner
                     .login(
-                        login_args(resource, &self.tenant, device_code),
+                        login_args(Resource::PowerBi, &self.tenant, device_code),
                         device_code,
                         progress.clone(),
                     )
                     .await
-                    .map_err(AuthError::SignInRequired)?;
-                self.token(resource).await?;
+                {
+                    Ok(()) => {
+                        let _ = self.token(Resource::PowerBi).await;
+                    }
+                    Err(message) => {
+                        self.latch(Resource::PowerBi, &AuthError::SignInRequired(message));
+                    }
+                }
             }
             Ok(())
         };
@@ -574,6 +738,7 @@ pub(crate) mod tests {
     use std::sync::Mutex as StdMutex;
 
     pub(crate) const TENANT: &str = "00000000-0000-0000-0000-000000000001";
+    const SUBSCRIPTION: &str = "00000000-0000-0000-0000-000000000002";
 
     pub(crate) fn jwt(claims: Value) -> String {
         let encode = |value: &Value| {
@@ -622,6 +787,10 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct FakeRunner {
         pub replies: StdMutex<Vec<Reply>>,
+        pub account_data: StdMutex<Option<Vec<u8>>>,
+        pub account_calls: StdMutex<Vec<Vec<String>>>,
+        pub account_delay: StdMutex<Duration>,
+        pub timeouts: StdMutex<Vec<Duration>>,
         pub calls: StdMutex<Vec<Vec<String>>>,
         pub logins: StdMutex<Vec<Vec<String>>>,
         pub login_result: StdMutex<Option<Result<(), String>>>,
@@ -641,7 +810,40 @@ pub(crate) mod tests {
     #[async_trait::async_trait]
     impl Runner for FakeRunner {
         async fn run(&self, args: Vec<String>, timeout: Duration) -> Result<Output, RunError> {
-            assert_eq!(timeout, BACKGROUND_TIMEOUT);
+            assert!(!timeout.is_zero() && timeout <= BACKGROUND_TIMEOUT);
+            self.timeouts.lock().unwrap().push(timeout);
+            if args.get(1).is_some_and(|arg| arg == "list") {
+                self.account_calls.lock().unwrap().push(args);
+                let delay = *self.account_delay.lock().unwrap();
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let data = self
+                    .account_data
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| {
+                        let identity = self.identity.lock().unwrap().unwrap_or((
+                            "someone@example.test",
+                            "11111111-2222-3333-4444-555555555555",
+                        ));
+                        serde_json::to_vec(&serde_json::json!([{
+                            "id": SUBSCRIPTION,
+                            "tenantId": TENANT,
+                            "isDefault": true,
+                            "state": "Enabled",
+                            "userName": identity.0,
+                            "userType": "user"
+                        }]))
+                        .unwrap()
+                    });
+                return Ok(Output {
+                    success: true,
+                    stdout: data,
+                    stderr: Vec::new(),
+                });
+            }
             self.calls.lock().unwrap().push(args);
             let reply = {
                 let mut replies = self.replies.lock().unwrap();
@@ -683,6 +885,71 @@ pub(crate) mod tests {
             }
             self.login_result.lock().unwrap().clone().unwrap_or(Ok(()))
         }
+    }
+
+    /// Dataverse sign-in without a browser or network; signed out unless `saved` is set.
+    #[derive(Default)]
+    pub(crate) struct FakeGrant {
+        pub saved: StdMutex<bool>,
+        pub refreshes: StdMutex<usize>,
+        pub sign_ins: StdMutex<usize>,
+        pub cleared: StdMutex<usize>,
+        pub refresh_error: StdMutex<Option<AuthError>>,
+        pub sign_in_error: StdMutex<Option<AuthError>>,
+        /// The (UPN, object ID) of issued tokens; the default fixture identity when unset.
+        pub identity: StdMutex<Option<(&'static str, &'static str)>>,
+    }
+
+    impl FakeGrant {
+        pub(crate) fn signed_in() -> Arc<Self> {
+            let grant = Self::default();
+            *grant.saved.lock().unwrap() = true;
+            Arc::new(grant)
+        }
+
+        fn issue(&self) -> Token {
+            let (account, object_id) = self.identity.lock().unwrap().unwrap_or((
+                "someone@example.test",
+                "11111111-2222-3333-4444-555555555555",
+            ));
+            let secret = jwt(serde_json::json!({"tid": TENANT, "upn": account, "oid": object_id}));
+            let claims = claims(&secret, TENANT).unwrap();
+            Token::new(secret, chrono::Utc::now().timestamp() + 3600, claims)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Grant for FakeGrant {
+        async fn refresh(&self) -> Result<Token, AuthError> {
+            *self.refreshes.lock().unwrap() += 1;
+            if let Some(error) = self.refresh_error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            if !*self.saved.lock().unwrap() {
+                return Err(AuthError::SignInRequired(SIGN_IN_REQUIRED.into()));
+            }
+            Ok(self.issue())
+        }
+
+        async fn sign_in(&self) -> Result<Token, AuthError> {
+            *self.sign_ins.lock().unwrap() += 1;
+            if let Some(error) = self.sign_in_error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            *self.saved.lock().unwrap() = true;
+            *self.refresh_error.lock().unwrap() = None;
+            Ok(self.issue())
+        }
+
+        async fn clear(&self) -> Result<(), AuthError> {
+            *self.cleared.lock().unwrap() += 1;
+            *self.saved.lock().unwrap() = false;
+            Ok(())
+        }
+    }
+
+    fn tokens(runner: Arc<FakeRunner>) -> Tokens {
+        Tokens::new(runner, FakeGrant::signed_in(), TENANT)
     }
 
     #[test]
@@ -759,8 +1026,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn token_and_login_commands_are_tenant_bound_and_scoped_to_one_resource() {
-        let args = token_args(Resource::Dataverse, TENANT);
+    fn token_and_login_commands_are_scoped_to_the_selected_identity_and_resource() {
+        let args = token_args(Resource::Dataverse, SUBSCRIPTION);
         assert_eq!(
             args,
             [
@@ -768,18 +1035,14 @@ pub(crate) mod tests {
                 "get-access-token",
                 "--resource",
                 "https://microsoftsales.crm.dynamics.com",
-                "--tenant",
-                TENANT,
+                "--subscription",
+                SUBSCRIPTION,
                 "--output",
                 "json",
                 "--only-show-errors"
             ]
         );
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg == "set" || arg == "--subscription")
-        );
+        assert!(!args.iter().any(|arg| arg == "set" || arg == "--tenant"));
         let login = login_args(Resource::PowerBi, TENANT, false);
         assert!(login.windows(2).any(|pair| pair[0] == "--scope"
             && pair[1] == "https://analysis.windows.net/powerbi/api/.default"));
@@ -790,25 +1053,126 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_different_default_tenant_uses_the_matching_identity_without_switching_it() {
+        let runner = FakeRunner::with(vec![]);
+        *runner.account_data.lock().unwrap() = Some(
+            serde_json::to_vec(&serde_json::json!([
+                {
+                    "id": "00000000-0000-0000-0000-000000000003",
+                    "tenantId": "00000000-0000-0000-0000-000000000004",
+                    "isDefault": true, "state": "Enabled",
+                    "userName": "personal@example.test", "userType": "user"
+                },
+                {
+                    "id": SUBSCRIPTION, "tenantId": TENANT,
+                    "isDefault": false, "state": "Enabled",
+                    "userName": "work@example.test", "userType": "user"
+                },
+                {
+                    "id": "00000000-0000-0000-0000-000000000005", "tenantId": TENANT,
+                    "isDefault": false, "state": "Enabled",
+                    "userName": "WORK@example.test", "userType": "user"
+                }
+            ]))
+            .unwrap(),
+        );
+        let tokens = tokens(runner.clone());
+        tokens.token(Resource::PowerBi).await.unwrap();
+        let account_calls = runner.account_calls.lock().unwrap();
+        assert_eq!(account_calls.len(), 1);
+        assert_eq!(&account_calls[0][..2], ["account", "list"]);
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0]
+                .windows(2)
+                .any(|pair| pair == ["--subscription", SUBSCRIPTION])
+        );
+        assert!(!calls[0].iter().any(|arg| arg == "--tenant" || arg == "set"));
+    }
+
+    #[test]
+    fn account_selection_rejects_ambiguous_or_invalid_target_identities() {
+        let account = |id, name, default| {
+            serde_json::json!({
+                "id": id, "tenantId": TENANT, "isDefault": default, "state": "Enabled",
+                "userName": name, "userType": "user"
+            })
+        };
+        let first = account(SUBSCRIPTION, "first@example.test", false);
+        let second = account(
+            "00000000-0000-0000-0000-000000000003",
+            "second@example.test",
+            false,
+        );
+        let list = |accounts: Vec<Value>| serde_json::to_vec(&accounts).unwrap();
+        assert_eq!(
+            select_subscription(&list(vec![first.clone(), second.clone()]), TENANT),
+            Err(AuthError::SignInRequired(AMBIGUOUS_ACCOUNTS.into()))
+        );
+        let mut selected = second;
+        selected["isDefault"] = true.into();
+        assert_eq!(
+            select_subscription(&list(vec![first.clone(), selected]), TENANT).unwrap(),
+            "00000000-0000-0000-0000-000000000003"
+        );
+        let mut invalid = first;
+        invalid["userName"] = Value::Null;
+        assert_eq!(
+            select_subscription(&list(vec![invalid]), TENANT),
+            Err(AuthError::unavailable(INVALID_ACCOUNTS))
+        );
+        assert_eq!(
+            select_subscription(b"[]", TENANT),
+            Err(AuthError::SignInRequired(SIGN_IN_REQUIRED.into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn account_lookup_and_token_fetch_share_the_background_deadline() {
+        let runner = FakeRunner::with(vec![]);
+        *runner.account_delay.lock().unwrap() = Duration::from_millis(40);
+        tokens(runner.clone())
+            .token(Resource::PowerBi)
+            .await
+            .unwrap();
+        let timeouts = runner.timeouts.lock().unwrap();
+        assert_eq!(timeouts.len(), 2);
+        assert_eq!(timeouts[0], BACKGROUND_TIMEOUT);
+        assert!(timeouts[1] <= BACKGROUND_TIMEOUT - Duration::from_millis(30));
+    }
+
+    #[tokio::test]
     async fn a_background_timeout_requires_sign_in_once_and_never_spins_the_cli_again() {
         let runner = FakeRunner::with(vec![Reply::Timeout]);
-        let tokens = Tokens::new(runner.clone(), TENANT);
+        let grant = FakeGrant::signed_in();
+        let tokens = Tokens::new(runner.clone(), grant.clone(), TENANT);
         assert_eq!(
-            tokens.token(Resource::Dataverse).await.unwrap_err(),
+            tokens.token(Resource::PowerBi).await.unwrap_err(),
             AuthError::SignInRequired(TOKEN_TIMEOUT.into())
         );
-        for resource in Resource::ALL {
-            for _ in 0..5 {
-                assert_eq!(
-                    tokens.token(resource).await.unwrap_err(),
-                    AuthError::SignInRequired(TOKEN_TIMEOUT.into())
-                );
-            }
+        for _ in 0..5 {
+            assert_eq!(
+                tokens.token(Resource::PowerBi).await.unwrap_err(),
+                AuthError::SignInRequired(TOKEN_TIMEOUT.into())
+            );
         }
         assert_eq!(
             runner.calls.lock().unwrap().len(),
             1,
             "No busy retry after interaction is required"
+        );
+        tokens.token(Resource::Dataverse).await.unwrap();
+        *grant.refresh_error.lock().unwrap() =
+            Some(AuthError::SignInRequired(SIGN_IN_REQUIRED.into()));
+        tokens.forget(Resource::Dataverse).await;
+        for _ in 0..3 {
+            assert!(tokens.token(Resource::Dataverse).await.is_err());
+        }
+        assert_eq!(
+            *grant.refreshes.lock().unwrap(),
+            2,
+            "A Dataverse latch is independent of Power BI"
         );
         tokens.unlatch();
         tokens.token(Resource::PowerBi).await.unwrap();
@@ -821,60 +1185,132 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn dataverse_uses_the_saved_browser_sign_in_and_power_bi_the_cli() {
+        let runner = FakeRunner::with(vec![]);
+        let grant = FakeGrant::signed_in();
+        let tokens = Tokens::new(runner.clone(), grant.clone(), TENANT);
+        let token = tokens.token(Resource::Dataverse).await.unwrap();
+        tokens.token(Resource::Dataverse).await.unwrap();
+        assert_eq!(
+            token.claims.account.as_deref(),
+            Some("someone@example.test")
+        );
+        assert_eq!(*grant.refreshes.lock().unwrap(), 1);
+        assert!(runner.calls.lock().unwrap().is_empty());
+        assert!(runner.account_calls.lock().unwrap().is_empty());
+        tokens.token(Resource::PowerBi).await.unwrap();
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+        assert_eq!(*grant.refreshes.lock().unwrap(), 1);
+        tokens.sign_out().await.unwrap();
+        assert_eq!(*grant.cleared.lock().unwrap(), 1);
+        assert_eq!(
+            tokens.token(Resource::Dataverse).await.unwrap_err(),
+            AuthError::SignInRequired(SIGN_IN_REQUIRED.into())
+        );
+        assert!(runner.logins.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn transient_failures_are_not_latched_and_missing_cli_is_unavailable() {
         let runner = FakeRunner::with(vec![Reply::Fail("Max retries exceeded")]);
-        let tokens = Tokens::new(runner.clone(), TENANT);
+        let tokens = tokens(runner.clone());
         assert!(matches!(
-            tokens.token(Resource::Dataverse).await.unwrap_err(),
+            tokens.token(Resource::PowerBi).await.unwrap_err(),
             AuthError::Unavailable {
                 transient: true,
                 ..
             }
         ));
-        tokens.token(Resource::Dataverse).await.unwrap();
-        let missing = Tokens::new(Arc::new(CliRunner { cli: None }), TENANT);
+        tokens.token(Resource::PowerBi).await.unwrap();
+        let missing = Tokens::new(
+            Arc::new(CliRunner { cli: None }),
+            FakeGrant::signed_in(),
+            TENANT,
+        );
         assert_eq!(
-            missing.token(Resource::Dataverse).await.unwrap_err(),
+            missing.token(Resource::PowerBi).await.unwrap_err(),
             AuthError::unavailable(CLI_MISSING)
         );
+        missing.token(Resource::Dataverse).await.unwrap();
+    }
+
+    fn collect_codes() -> (Arc<StdMutex<Vec<String>>>, Progress) {
+        let codes = Arc::new(StdMutex::new(Vec::new()));
+        let seen = codes.clone();
+        (
+            codes,
+            Arc::new(move |code| {
+                seen.lock().unwrap().push(code);
+                Ok(())
+            }),
+        )
     }
 
     #[tokio::test]
-    async fn explicit_sign_in_covers_both_resources_and_forwards_a_device_code() {
-        let runner = FakeRunner::with(vec![Reply::Token, Reply::Token]);
-        let tokens = Tokens::new(runner.clone(), TENANT);
-        let codes = Arc::new(StdMutex::new(Vec::new()));
-        let seen = codes.clone();
+    async fn explicit_sign_in_uses_the_browser_for_dataverse_and_keeps_a_working_power_bi() {
+        let runner = FakeRunner::with(vec![]);
+        let grant = Arc::new(FakeGrant::default());
+        let tokens = Tokens::new(runner.clone(), grant.clone(), TENANT);
+        let (codes, progress) = collect_codes();
         let (_cancel, cancelled) = watch::channel(false);
         let (_stop, shutdown) = watch::channel(false);
         tokens
-            .sign_in(
-                true,
-                Arc::new(move |code| {
-                    seen.lock().unwrap().push(code);
-                    Ok(())
-                }),
-                cancelled,
-                shutdown,
-            )
+            .sign_in(true, progress, cancelled, shutdown)
+            .await
+            .unwrap();
+        assert_eq!(*grant.sign_ins.lock().unwrap(), 1);
+        assert!(runner.logins.lock().unwrap().is_empty());
+        assert!(codes.lock().unwrap().is_empty());
+        tokens.token(Resource::Dataverse).await.unwrap();
+        tokens.token(Resource::PowerBi).await.unwrap();
+        assert_eq!(*grant.refreshes.lock().unwrap(), 0);
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_sign_in_starts_the_cli_only_for_a_signed_out_power_bi() {
+        let runner = FakeRunner::with(vec![Reply::Fail("Please run 'az login'"), Reply::Token]);
+        let grant = Arc::new(FakeGrant::default());
+        let tokens = Tokens::new(runner.clone(), grant.clone(), TENANT);
+        let (codes, progress) = collect_codes();
+        let (_cancel, cancelled) = watch::channel(false);
+        let (_stop, shutdown) = watch::channel(false);
+        tokens
+            .sign_in(true, progress.clone(), cancelled.clone(), shutdown.clone())
             .await
             .unwrap();
         assert_eq!(*codes.lock().unwrap(), ["ABCD-EF12"]);
         {
             let logins = runner.logins.lock().unwrap();
-            assert_eq!(logins.len(), 1, "Power BI used the same sign-in silently");
+            assert_eq!(logins.len(), 1);
             assert!(
-                logins[0].contains(&"https://microsoftsales.crm.dynamics.com/.default".to_owned())
+                logins[0]
+                    .contains(&"https://analysis.windows.net/powerbi/api/.default".to_owned())
             );
+            assert!(logins[0].contains(&"--use-device-code".to_owned()));
         }
         tokens.token(Resource::PowerBi).await.unwrap();
         assert_eq!(runner.calls.lock().unwrap().len(), 2);
+
+        *runner.replies.lock().unwrap() = vec![Reply::Fail("Please run 'az login'")];
+        *runner.login_result.lock().unwrap() = Some(Err(LOGIN_FAILED.into()));
+        tokens
+            .sign_in(false, progress, cancelled, shutdown)
+            .await
+            .unwrap();
+        tokens.token(Resource::Dataverse).await.unwrap();
+        assert_eq!(
+            tokens.token(Resource::PowerBi).await.unwrap_err(),
+            AuthError::SignInRequired(LOGIN_FAILED.into()),
+            "A failed Power BI sign-in leaves Dataverse connected"
+        );
     }
 
     #[tokio::test]
     async fn cancelled_or_failed_sign_in_launches_nothing_or_reports_sign_in_required() {
         let runner = FakeRunner::with(vec![]);
-        let tokens = Tokens::new(runner.clone(), TENANT);
+        let grant = Arc::new(FakeGrant::default());
+        let tokens = Tokens::new(runner.clone(), grant.clone(), TENANT);
         let (_cancel, cancelled) = watch::channel(true);
         let (_stop, shutdown) = watch::channel(false);
         assert_eq!(
@@ -884,16 +1320,18 @@ pub(crate) mod tests {
                 .unwrap_err(),
             AuthError::SignInRequired(LOGIN_CANCELLED.into())
         );
-        assert!(runner.logins.lock().unwrap().is_empty());
-        *runner.login_result.lock().unwrap() = Some(Err(LOGIN_FAILED.into()));
+        assert_eq!(*grant.sign_ins.lock().unwrap(), 0);
+        let failure = AuthError::SignInRequired("MSX sign-in failed.".into());
+        *grant.sign_in_error.lock().unwrap() = Some(failure.clone());
         let (_cancel, cancelled) = watch::channel(false);
         assert_eq!(
             tokens
                 .sign_in(false, Arc::new(|_| Ok(())), cancelled, shutdown)
                 .await
                 .unwrap_err(),
-            AuthError::SignInRequired(LOGIN_FAILED.into())
+            failure
         );
+        assert!(runner.logins.lock().unwrap().is_empty());
         assert!(runner.calls.lock().unwrap().is_empty());
     }
 
