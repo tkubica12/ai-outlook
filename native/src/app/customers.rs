@@ -1280,6 +1280,8 @@ impl Tomlook {
             .and_then(|id| book.customers.get(id))
             .and_then(|customer| customer.msx.clone());
         let (mut open, mut submit, mut cancel, mut search, mut open_msx) = (true, false, false, false, false);
+        // Long MSX candidate lists scroll so Confirm and Cancel stay on screen.
+        let body_height = (context.content_rect().height() - 220.0).max(180.0);
         egui::Window::new(language.text(if draft.editing.is_some() { "Edit customer" } else { "Confirm customer" }))
             .id(Id::new("customer-confirm"))
             .open(&mut open)
@@ -1288,182 +1290,184 @@ impl Tomlook {
             .default_width(540.0)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 90.0])
             .show(context, |ui| {
-                if draft.group.len() > 1 {
-                    ui.label(format!("{}: {}", language.text("E-mail domains"), draft.group.join(", ")));
-                } else if let Some(domain) = &draft.domain {
-                    ui.label(format!("{}: {domain}", language.text("E-mail domain")));
-                }
-                if !draft.people.is_empty() {
-                    ui.weak(format!("{}: {}", language.text("People in this meeting"), names(&draft.people)));
-                }
-                let others = book.sorted().into_iter().filter(|customer| Some(&customer.id) != draft.editing.as_ref()).collect::<Vec<_>>();
-                if draft.domain.is_some() && !others.is_empty() {
-                    egui::ComboBox::from_label(language.text("Add to customer"))
-                        .selected_text(
-                            draft
-                                .existing
-                                .as_ref()
-                                .and_then(|id| book.customers.get(id))
-                                .map(|customer| customer.name.clone())
-                                .unwrap_or_else(|| language.text("New customer").into_owned()),
-                        )
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut draft.existing, None, language.text("New customer"));
-                            for customer in others {
-                                ui.selectable_value(&mut draft.existing, Some(customer.id.clone()), &customer.name);
-                            }
-                        });
-                }
-                if draft.existing.is_none() {
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.radio_value(&mut draft.kind, model::Kind::Customer, language.text("Customer organization"));
-                        ui.radio_value(&mut draft.kind, model::Kind::Partner, language.text("Partner organization"))
-                            .on_hover_text(language.text("Remember it as a partner: no MSX link, never offered as a customer again."));
-                        ui.radio_value(&mut draft.kind, model::Kind::Ignored, language.text("Don't track"))
-                            .on_hover_text(language.text("These domains are never offered again; undo it in Customers."));
-                    });
-                    ui.add_space(4.0);
-                    ui.label(language.text("Customer name"));
-                    let name = ui.add(
-                        egui::TextEdit::singleline(&mut draft.name)
-                            .id(Id::new("customer-name"))
-                            .desired_width(360.0),
-                    );
-                    if std::mem::take(&mut draft.focus) {
-                        name.request_focus();
+                egui::ScrollArea::vertical().id_salt("customer-confirm-body").max_height(body_height).show(ui, |ui| {
+                    if draft.group.len() > 1 {
+                        ui.label(format!("{}: {}", language.text("E-mail domains"), draft.group.join(", ")));
+                    } else if let Some(domain) = &draft.domain {
+                        ui.label(format!("{}: {domain}", language.text("E-mail domain")));
                     }
-                    if name.changed() {
-                        draft.name_edited = true;
+                    if !draft.people.is_empty() {
+                        ui.weak(format!("{}: {}", language.text("People in this meeting"), names(&draft.people)));
                     }
-                    ui.label(language.text("E-mail domains"));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.domains)
-                            .id(Id::new("customer-domains"))
-                            .hint_text("contoso.com, contoso.cz")
-                            .desired_width(360.0),
-                    );
-                    ui.add_space(6.0);
-                }
-                if draft.existing.is_none() && draft.kind.is_customer() {
-                    ui.strong(language.text("MSX customer"));
-                    if let Some(msx) = &current {
-                        ui.radio_value(&mut draft.link, Link::Keep, language.text(&format!("Keep the current MSX link: {}", msx.name)));
-                    }
-                    ui.radio_value(&mut draft.link, Link::Local, language.text("Local customer only (no MSX link)"));
-                    match &draft.lookup {
-                        Lookup::Idle if self.preview => {
-                            ui.weak(language.text(tomlook::msx::DEMO));
-                        }
-                        Lookup::Idle if !connected => {
-                            ui.weak(language.text("MSX is not connected; you can confirm a local customer now and link MSX later."));
-                            if self.preferences.msx_enabled && ui.button(language.text("Open MSX connection")).clicked() {
-                                open_msx = true;
-                            }
-                        }
-                        Lookup::Idle => {
-                            if ui.button(language.text("Search MSX")).clicked() {
-                                search = true;
-                            }
-                        }
-                        Lookup::Running(_) => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.weak(language.text("Searching MSX for matching customers..."));
+                    let others = book.sorted().into_iter().filter(|customer| Some(&customer.id) != draft.editing.as_ref()).collect::<Vec<_>>();
+                    if draft.domain.is_some() && !others.is_empty() {
+                        egui::ComboBox::from_label(language.text("Add to customer"))
+                            .selected_text(
+                                draft
+                                    .existing
+                                    .as_ref()
+                                    .and_then(|id| book.customers.get(id))
+                                    .map(|customer| customer.name.clone())
+                                    .unwrap_or_else(|| language.text("New customer").into_owned()),
+                            )
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut draft.existing, None, language.text("New customer"));
+                                for customer in others {
+                                    ui.selectable_value(&mut draft.existing, Some(customer.id.clone()), &customer.name);
+                                }
                             });
+                    }
+                    if draft.existing.is_none() {
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.radio_value(&mut draft.kind, model::Kind::Customer, language.text("Customer organization"));
+                            ui.radio_value(&mut draft.kind, model::Kind::Partner, language.text("Partner organization"))
+                                .on_hover_text(language.text("Remember it as a partner: no MSX link, never offered as a customer again."));
+                            ui.radio_value(&mut draft.kind, model::Kind::Ignored, language.text("Don't track"))
+                                .on_hover_text(language.text("These domains are never offered again; undo it in Customers."));
+                        });
+                        ui.add_space(4.0);
+                        ui.label(language.text("Customer name"));
+                        let name = ui.add(
+                            egui::TextEdit::singleline(&mut draft.name)
+                                .id(Id::new("customer-name"))
+                                .desired_width(360.0),
+                        );
+                        if std::mem::take(&mut draft.focus) {
+                            name.request_focus();
                         }
-                        Lookup::Failed(error) => {
-                            ui.colored_label(ui.visuals().warn_fg_color, language.text(&format!("MSX search failed: {error}")));
-                            if connected && ui.button(language.text("Search MSX again")).clicked() {
-                                search = true;
-                            }
+                        if name.changed() {
+                            draft.name_edited = true;
                         }
-                        Lookup::Ready(lookup) => {
-                            let likely = match &lookup.selection {
-                                tomlook::msx::dataverse::Selection::Likely { account_id } => Some(account_id.clone()),
-                                _ => None,
-                            };
-                            if lookup.candidates.is_empty() {
-                                ui.weak(language.text("No MSX candidates found. Confirm a local customer or search again later."));
-                            } else if likely.is_none() {
-                                ui.weak(language.text("Several candidates are possible; choose the right one."));
+                        ui.label(language.text("E-mail domains"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.domains)
+                                .id(Id::new("customer-domains"))
+                                .hint_text("contoso.com, contoso.cz")
+                                .desired_width(360.0),
+                        );
+                        ui.add_space(6.0);
+                    }
+                    if draft.existing.is_none() && draft.kind.is_customer() {
+                        ui.strong(language.text("MSX customer"));
+                        if let Some(msx) = &current {
+                            ui.radio_value(&mut draft.link, Link::Keep, language.text(&format!("Keep the current MSX link: {}", msx.name)));
+                        }
+                        ui.radio_value(&mut draft.link, Link::Local, language.text("Local customer only (no MSX link)"));
+                        match &draft.lookup {
+                            Lookup::Idle if self.preview => {
+                                ui.weak(language.text(tomlook::msx::DEMO));
                             }
-                            let mut chosen = None;
-                            for candidate in lookup.candidates.iter().take(CANDIDATES_SHOWN) {
-                                ui.push_id(("msx-candidate", &candidate.id), |ui| {
-                                    ui.horizontal_wrapped(|ui| {
-                                        if ui.radio(draft.link == Link::Candidate(candidate.id.clone()), &candidate.name).clicked() {
-                                            chosen = Some(candidate.clone());
-                                        }
-                                        if likely.as_ref() == Some(&candidate.id) {
-                                            chip(ui, &language.text("Likely match"), accent);
-                                        }
-                                    });
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.add_space(24.0);
-                                        ui.weak(language.text(&format!("Confidence {}%", (candidate.confidence * 100.0).round())));
-                                        if let Some(tpid) = &candidate.tpid {
-                                            ui.weak(format!("TPID {tpid}"));
-                                        }
-                                        if let Some(owner) = candidate.owner.as_ref().and_then(|owner| owner.name.as_deref()) {
-                                            ui.weak(language.text(&format!("Owner: {owner}")));
-                                        }
-                                    });
-                                    for item in &candidate.evidence {
-                                        ui.horizontal(|ui| {
-                                            ui.add_space(24.0);
-                                            ui.label(RichText::new(language.text(&evidence(item))).small());
-                                        });
-                                    }
-                                });
-                            }
-                            if let Some(candidate) = chosen {
-                                draft.link = Link::Candidate(candidate.id.clone());
-                                if !draft.name_edited {
-                                    draft.name = candidate.name.clone();
+                            Lookup::Idle if !connected => {
+                                ui.weak(language.text("MSX is not connected; you can confirm a local customer now and link MSX later."));
+                                if self.preferences.msx_enabled && ui.button(language.text("Open MSX connection")).clicked() {
+                                    open_msx = true;
                                 }
                             }
-                            if !lookup.territory.is_empty() {
-                                ui.add_space(6.0);
-                                ui.strong(language.text("Your MSX territory"));
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut draft.filter)
-                                        .id(Id::new("customer-territory-filter"))
-                                        .hint_text(language.text("Filter customers..."))
-                                        .desired_width(260.0),
-                                );
-                                let query = draft.filter.trim().to_lowercase();
-                                let mut picked = None;
-                                egui::ScrollArea::vertical()
-                                    .id_salt("customer-territory")
-                                    .max_height(220.0)
-                                    .show(ui, |ui| {
-                                        for account in lookup.territory.iter().filter(|account| {
-                                            query.is_empty() || account.name.to_lowercase().contains(&query)
-                                        }) {
-                                            ui.push_id(("msx-territory", &account.id), |ui| {
-                                                ui.horizontal_wrapped(|ui| {
-                                                    if ui.radio(draft.link == Link::Candidate(account.id.clone()), &account.name).clicked() {
-                                                        picked = Some(account.id.clone());
-                                                    }
-                                                    if let Some(tpid) = &account.tpid {
-                                                        ui.weak(format!("TPID {tpid}"));
-                                                    }
-                                                });
+                            Lookup::Idle => {
+                                if ui.button(language.text("Search MSX")).clicked() {
+                                    search = true;
+                                }
+                            }
+                            Lookup::Running(_) => {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.weak(language.text("Searching MSX for matching customers..."));
+                                });
+                            }
+                            Lookup::Failed(error) => {
+                                ui.colored_label(ui.visuals().warn_fg_color, language.text(&format!("MSX search failed: {error}")));
+                                if connected && ui.button(language.text("Search MSX again")).clicked() {
+                                    search = true;
+                                }
+                            }
+                            Lookup::Ready(lookup) => {
+                                let likely = match &lookup.selection {
+                                    tomlook::msx::dataverse::Selection::Likely { account_id } => Some(account_id.clone()),
+                                    _ => None,
+                                };
+                                if lookup.candidates.is_empty() {
+                                    ui.weak(language.text("No MSX candidates found. Confirm a local customer or search again later."));
+                                } else if likely.is_none() {
+                                    ui.weak(language.text("Several candidates are possible; choose the right one."));
+                                }
+                                let mut chosen = None;
+                                for candidate in lookup.candidates.iter().take(CANDIDATES_SHOWN) {
+                                    ui.push_id(("msx-candidate", &candidate.id), |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            if ui.radio(draft.link == Link::Candidate(candidate.id.clone()), &candidate.name).clicked() {
+                                                chosen = Some(candidate.clone());
+                                            }
+                                            if likely.as_ref() == Some(&candidate.id) {
+                                                chip(ui, &language.text("Likely match"), accent);
+                                            }
+                                        });
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.add_space(24.0);
+                                            ui.weak(language.text(&format!("Confidence {}%", (candidate.confidence * 100.0).round())));
+                                            if let Some(tpid) = &candidate.tpid {
+                                                ui.weak(format!("TPID {tpid}"));
+                                            }
+                                            if let Some(owner) = candidate.owner.as_ref().and_then(|owner| owner.name.as_deref()) {
+                                                ui.weak(language.text(&format!("Owner: {owner}")));
+                                            }
+                                        });
+                                        for item in &candidate.evidence {
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(24.0);
+                                                ui.label(RichText::new(language.text(&evidence(item))).small());
                                             });
                                         }
                                     });
-                                if let Some(id) = picked {
-                                    draft.link = Link::Candidate(id);
+                                }
+                                if let Some(candidate) = chosen {
+                                    draft.link = Link::Candidate(candidate.id.clone());
+                                    if !draft.name_edited {
+                                        draft.name = candidate.name.clone();
+                                    }
+                                }
+                                if !lookup.territory.is_empty() {
+                                    ui.add_space(6.0);
+                                    ui.strong(language.text("Your MSX territory"));
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut draft.filter)
+                                            .id(Id::new("customer-territory-filter"))
+                                            .hint_text(language.text("Filter customers..."))
+                                            .desired_width(260.0),
+                                    );
+                                    let query = draft.filter.trim().to_lowercase();
+                                    let mut picked = None;
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("customer-territory")
+                                        .max_height(220.0)
+                                        .show(ui, |ui| {
+                                            for account in lookup.territory.iter().filter(|account| {
+                                                query.is_empty() || account.name.to_lowercase().contains(&query)
+                                            }) {
+                                                ui.push_id(("msx-territory", &account.id), |ui| {
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        if ui.radio(draft.link == Link::Candidate(account.id.clone()), &account.name).clicked() {
+                                                            picked = Some(account.id.clone());
+                                                        }
+                                                        if let Some(tpid) = &account.tpid {
+                                                            ui.weak(format!("TPID {tpid}"));
+                                                        }
+                                                    });
+                                                });
+                                            }
+                                        });
+                                    if let Some(id) = picked {
+                                        draft.link = Link::Candidate(id);
+                                    }
+                                }
+                                if connected && ui.button(language.text("Search MSX again")).clicked() {
+                                    search = true;
                                 }
                             }
-                            if connected && ui.button(language.text("Search MSX again")).clicked() {
-                                search = true;
-                            }
                         }
+                        ui.weak(language.text("Inferred matches are never linked without your confirmation."));
                     }
-                    ui.weak(language.text("Inferred matches are never linked without your confirmation."));
-                }
+                });
                 if let Some(error) = &draft.error {
                     ui.colored_label(ui.visuals().error_fg_color, language.text(error));
                 }

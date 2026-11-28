@@ -8370,6 +8370,68 @@ fn meeting_card_confirms_customers_only_after_an_explicit_choice() {
 }
 
 #[test]
+fn a_long_msx_candidate_list_scrolls_and_keeps_confirm_on_a_short_screen() {
+    use super::customers::{Link, Lookup};
+    use tomlook::msx::dataverse::{AccountCandidate, AccountLookup, Evidence, Selection, record_url};
+    let language = tomlook::i18n::Language::En;
+    let (mut app, receiver, _, _, _) = customer_fixture(language);
+    app.customers.open = false;
+    app.open_company("orbit.example", vec!["Kim Lambert <kim@orbit.example>".into()], None);
+    let domain = || "orbit.example".to_owned();
+    let candidate = |n: usize| {
+        let id = format!("{n:08}-0000-4000-8000-000000000000");
+        AccountCandidate {
+            url: record_url("account", &id), id, name: format!("Orbit {n}"), tpid: Some(n.to_string()), account_number: None,
+            website: Some("https://www.orbit.example".into()), owner: None, confidence: 0.95,
+            evidence: vec![
+                Evidence::WebsiteDomain { domain: domain(), website: "https://www.orbit.example".into() },
+                Evidence::ContactDomain { domain: domain(), contacts: 24 },
+                Evidence::NameSimilarity { name: "Orbit".into(), similarity: 0.75 },
+                Evidence::DomainMatchesName { domain: domain() },
+                Evidence::Territory,
+            ],
+        }
+    };
+    let likely = candidate(1).id;
+    let draft = app.customers.confirm.as_mut().expect("The dialog is open");
+    draft.lookup = Lookup::Ready(AccountLookup {
+        candidates: (1..=6).map(candidate).collect(), selection: Selection::Likely { account_id: likely.clone() },
+        requires_confirmation: true, rejected_inputs: vec![], sources: vec![], territory: (1..=40).map(candidate).collect(),
+    });
+    draft.link = Link::Candidate(likely.clone());
+    let context = egui::Context::default();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 700.0));
+    let draw = |app: &mut Tomlook, events: Vec<egui::Event>| {
+        let mut output = context.run_ui(
+            egui::RawInput { screen_rect: Some(screen), events, ..Default::default() },
+            |ui| app.confirm_customer_dialog(ui.ctx()),
+        );
+        output.textures_delta.clear();
+        output
+    };
+    let mut confirm = None;
+    for _ in 0..6 {
+        let output = draw(&mut app, vec![]);
+        confirm = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.job.text == "Confirm" => Some(text.pos + text.galley.size() * 0.5),
+            _ => None,
+        });
+    }
+    let pos = confirm.expect("Confirm is drawn");
+    assert!(screen.shrink(4.0).contains(pos), "Confirm must stay on screen, was at {pos:?}");
+    for pressed in [true, false] {
+        draw(&mut app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+        }]);
+    }
+    let saved = receiver.try_iter().find_map(|command| match command {
+        Command::Customer(tomlook::worker::CustomerCommand::Save(customer)) => Some(customer),
+        _ => None,
+    }).expect("Confirm saves the chosen candidate");
+    assert_eq!(saved.msx.map(|msx| msx.id), Some(likely));
+}
+
+#[test]
 fn customers_open_from_the_palette_and_company_names_and_escape_closes_them() {
     for language in [tomlook::i18n::Language::En, tomlook::i18n::Language::Cs] {
         let (mut app, _, _, _, id) = customer_fixture(language);
