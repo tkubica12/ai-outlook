@@ -987,7 +987,7 @@ async fn a_cancelled_check_reports_cancellation_and_leaves_no_busy_state() {
 
 #[tokio::test]
 async fn copilot_tools_appear_only_when_connected_and_spend_the_shared_read_budget() {
-    use github_copilot_sdk::tool::ToolHandler;
+    use copilot_sdk::tool::ToolHandler;
     let (client, fake, _runner, _published) = fixture(standard(), vec![]);
     let recorder = Arc::new(crate::evidence::Recorder::new(Arc::new(
         crate::evidence::Redactor::default(),
@@ -1017,7 +1017,7 @@ async fn copilot_tools_appear_only_when_connected_and_spend_the_shared_read_budg
         remaining,
     };
     let invoke = |arguments: Value| {
-        serde_json::from_value::<github_copilot_sdk::ToolInvocation>(json!({
+        serde_json::from_value::<copilot_sdk::ToolInvocation>(json!({
             "sessionId": "fixture-session",
             "toolCallId": "fixture-call",
             "toolName": tools::QUERY_TOOL,

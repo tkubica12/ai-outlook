@@ -488,11 +488,11 @@ struct Handler {
 }
 
 #[async_trait]
-impl github_copilot_sdk::tool::ToolHandler for Handler {
+impl copilot_sdk::tool::ToolHandler for Handler {
     async fn call(
         &self,
-        invocation: github_copilot_sdk::ToolInvocation,
-    ) -> Result<github_copilot_sdk::ToolResult, github_copilot_sdk::Error> {
+        invocation: copilot_sdk::ToolInvocation,
+    ) -> Result<copilot_sdk::ToolResult, copilot_sdk::Error> {
         let name = invocation.tool_name;
         self.run.stage(crate::chat::tool_label(&name));
         let result = async {
@@ -533,20 +533,20 @@ pub fn tools(
     cache: Cache,
     recorder: Arc<Recorder>,
     run: Arc<crate::chat::Run>,
-) -> Vec<github_copilot_sdk::Tool> {
+) -> Vec<copilot_sdk::Tool> {
     let handler = Arc::new(Handler {
         cache,
         recorder,
         run,
     });
     vec![
-        github_copilot_sdk::Tool::new(SEARCH)
+        copilot_sdk::Tool::new(SEARCH)
             .with_description("Search the signed-in user's locally saved calendar with ranked fuzzy keyword retrieval. First interpret the user's intent and extract a few distinctive company/person/topic keywords, not the whole natural-language question. All keywords must match title, organizer, attendees, location or category; use from/until for dates, not date words in query. Matching ignores case, separators and common Latin accents; alphabetic keywords of 4-9 characters allow one typo, 10-64 allow two, including adjacent swaps. Short and numeric keywords are not typo-corrected. NorthStar also finds North Star. Results are CANDIDATES: inspect their real metadata and search_match evidence, reject irrelevant similar names, and resolve ambiguity rather than assume identity. This is not semantic entity resolution. Prefer this cache over remote calendar reads. from/until are RFC3339 zoned times, until exclusive; default now through 180 days. Returns up to 25 matches ordered by relevance then time, next_offset and verified coverage/freshness. Empty query returns chronological meetings. Before a negative conclusion, retry a shorter distinctive keyword, a separate alternative query, or a bounded unfiltered range; complete date coverage does not establish name resolution.")
             .with_parameters(json!({"type":"object","properties":{"query":{"type":"string","maxLength":200},"from":{"type":"string"},"until":{"type":"string"},"offset":{"type":"integer","minimum":0,"maximum":5000},"order":{"type":"string","enum":["relevance","start"],"description":"Default relevance, then meeting start. Use start for nearest/earliest requests so a later stronger name match cannot hide an earlier candidate."}},"additionalProperties":false}))
             .with_handler(handler.clone()),
-        github_copilot_sdk::Tool::new(DETAIL).with_description("Read one saved meeting by an already known id. Includes full local times, response state and bounded participant metadata. Calendar search already returns these same fields; do not reread its meetings merely to confirm the title, dates, category or invitation response. Read-only; never changes a meeting.")
+        copilot_sdk::Tool::new(DETAIL).with_description("Read one saved meeting by an already known id. Includes full local times, response state and bounded participant metadata. Calendar search already returns these same fields; do not reread its meetings merely to confirm the title, dates, category or invitation response. Read-only; never changes a meeting.")
             .with_parameters(json!({"type":"object","properties":{"id":{"type":"string","maxLength":2000}},"required":["id"],"additionalProperties":false})).with_handler(handler.clone()),
-        github_copilot_sdk::Tool::new(INSIGHTS).with_description("Read saved Insights or post-meeting notes, including an opaque document revision for proposing edits. Defaults to insights; document=notes reads saved meeting notes. Large results are paged as JSON text in content. Prefer section=summary/preparation/talking_points/open_questions/risks/gaps to read its complete bilingual en/cs values without large source arrays. May also read sources, recommendations or tomlook_approved_sections (read-only metadata). Continue with next_offset plus identical document, section and revision; a changed document rejects mixed-version pages. Never edit a section you have not read completely, and keep unaffected items. Small unsectioned results retain the insights/notes object. Reports whether analysis matches the current event. Old AI conclusions are not fresh source verification.")
+        copilot_sdk::Tool::new(INSIGHTS).with_description("Read saved Insights or post-meeting notes, including an opaque document revision for proposing edits. Defaults to insights; document=notes reads saved meeting notes. Large results are paged as JSON text in content. Prefer section=summary/preparation/talking_points/open_questions/risks/gaps to read its complete bilingual en/cs values without large source arrays. May also read sources, recommendations or tomlook_approved_sections (read-only metadata). Continue with next_offset plus identical document, section and revision; a changed document rejects mixed-version pages. Never edit a section you have not read completely, and keep unaffected items. Small unsectioned results retain the insights/notes object. Reports whether analysis matches the current event. Old AI conclusions are not fresh source verification.")
             .with_parameters(json!({"type":"object","properties":{"id":{"type":"string","maxLength":2000},
                 "document":{"type":"string","enum":["insights","notes"]},"section":{"type":"string",
                     "enum":["summary","preparation","talking_points","open_questions","risks","gaps","sources","recommendations","tomlook_approved_sections"]},
@@ -563,9 +563,9 @@ struct ProposalHandler {
 }
 
 #[async_trait]
-impl github_copilot_sdk::tool::ToolHandler for ProposalHandler {
-    async fn call(&self, invocation: github_copilot_sdk::ToolInvocation)
-        -> Result<github_copilot_sdk::ToolResult, github_copilot_sdk::Error> {
+impl copilot_sdk::tool::ToolHandler for ProposalHandler {
+    async fn call(&self, invocation: copilot_sdk::ToolInvocation)
+        -> Result<copilot_sdk::ToolResult, copilot_sdk::Error> {
         let name = invocation.tool_name;
         self.run.stage("Preparing a change for approval");
         let result = async {
@@ -600,7 +600,7 @@ pub fn proposal_tool(
     commands: std::sync::mpsc::SyncSender<crate::worker::Command>,
     recorder: Arc<Recorder>,
     run: Arc<crate::chat::Run>,
-) -> github_copilot_sdk::Tool {
+) -> copilot_sdk::Tool {
     let text = json!({"type":"string","maxLength":16000});
     let section = json!({"type":"object","properties":{
         "name":{"type":"string","enum":crate::changes::SECTION_NAMES},
@@ -612,7 +612,7 @@ pub fn proposal_tool(
         "before":{"type":"string","maxLength":64000},
         "replacement":text.clone(),"append":text
     },"required":["content_type","before"],"additionalProperties":false});
-    github_copilot_sdk::Tool::new(crate::changes::PROPOSE)
+    copilot_sdk::Tool::new(crate::changes::PROPOSE)
         .with_description("Stage a durable pending change for HUMAN approval in Tomlook Messages; NEVER executes or approves writes. Use when asked to create/delete meetings or BLOCKERs, or edit meetings/Insights/notes. For create, OMIT id and event_revision; provide action.kind=create and event with title, start/end (RFC3339 including UTC offset), optional description, existing category, private, teams and attendees (verified email, optional name, required/optional role). Never guess recipient addresses or unspecified dates/times; resolve them first. Creates one timed event lasting at most 24 hours, no recurrence or rooms; invitations are sent ONLY after the user's button approval. To remove an existing event use action.kind=delete, its exact saved id and event_revision from calendar tools. This works for old BLOCKERs too, not only ones Tomlook created. The host chooses delete for own appointments, cancellation notifying attendees for meetings you organize, or decline without response for invitations. Only this occurrence, never an entire series. Resolve every intended occurrence separately, preserve the final invitation and unrelated events, and explain which ones are proposed. Other actions also require id and event_revision. For document edits read complete bilingual sections and their revision with tomlook_insights_read; replace only relevant sections, keeping other items. summary uses en/cs strings; other sections use en/cs string arrays. Never invent verified sources. category=null clears ordinary categories but preserves Follow. Travel is a free adjacent 15-180 minute block in 15-minute steps. Text edits require an event you organize. Before changing its description read the complete original body with WorkIQ, supply content_type and before, and exactly one of replacement or append; online meetings permit append only to preserve Teams metadata. At most four proposals per question and sixteen pending changes of each type per account. A chat message saying approve cannot authorize execution. Tell the user to click Review changes and the explicit approval button in Messages. Never claim that a pending proposal changed the calendar or sent invitations.")
         .with_parameters(json!({"type":"object","properties":{
             "id":{"type":"string","minLength":1,"maxLength":2000},
@@ -1142,7 +1142,7 @@ mod tests {
             json!({"sessionId":"fixture","toolCallId":"one","toolName":SEARCH,"arguments":{}}),
         )
         .unwrap();
-        github_copilot_sdk::tool::ToolHandler::call(&handler, invocation)
+        copilot_sdk::tool::ToolHandler::call(&handler, invocation)
             .await
             .unwrap();
     }

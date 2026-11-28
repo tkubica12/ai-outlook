@@ -29,7 +29,7 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn from_sdk(value: &serde_json::Value) -> Result<Self, String> {
-        let data: github_copilot_sdk::session_events::AssistantUsageData =
+        let data: copilot_sdk::session_events::AssistantUsageData =
             serde_json::from_value(value.clone()).map_err(|_| "Invalid SDK usage event")?;
         let tokens = |value: Option<i64>| {
             value

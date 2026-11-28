@@ -1,6 +1,6 @@
 use crate::evidence::Recorder;
 use async_trait::async_trait;
-use github_copilot_sdk::{Tool, ToolInvocation, ToolResult, ToolResultExpanded, tool::ToolHandler};
+use copilot_sdk::{Tool, ToolInvocation, ToolResult, ToolResultExpanded, tool::ToolHandler};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -393,7 +393,7 @@ impl ToolHandler for LocalRead {
     async fn call(
         &self,
         invocation: ToolInvocation,
-    ) -> Result<ToolResult, github_copilot_sdk::Error> {
+    ) -> Result<ToolResult, copilot_sdk::Error> {
         let name = invocation.tool_name.clone();
         let result = async {
             if !valid_arguments(&name, &invocation.arguments) {

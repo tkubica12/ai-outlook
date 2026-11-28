@@ -44,10 +44,11 @@ previous executable is kept as `Tomlook.exe.old` until the next start.
 - **GitHub Copilot:** Tomlook obtains its own OAuth token through an explicit
   device-code sign-in, verifies the GitHub identity, and saves it with
   current-user Windows DPAPI encryption. Only that token is explicitly passed
-  to the isolated runtime, in memory and its child-process environment; it is
-  never stored as plaintext runtime configuration. The SDK stays in Empty mode,
-  the shared keychain stays disabled, and ambient `GH_TOKEN`/`GITHUB_TOKEN`-style
-  variables and `gh` logins are removed and rejected. Legacy isolated login
+  to the isolated runtime in memory (and the child environment when running a
+  standalone `.exe`); it is never stored as plaintext runtime configuration.
+  The SDK stays in Empty mode with client telemetry disabled, the shared
+  keychain stays disabled, and ambient `GH_TOKEN`/`GITHUB_TOKEN`-style
+  variables and `gh` logins are disabled and rejected. Legacy isolated login
   files are not imported; sign in once in Tomlook after upgrading.
 - **Azure CLI (Foundry, Power BI for MSX):** tokens are requested from Azure
   CLI, checked against the configured tenant and kept in memory only. Azure
@@ -98,10 +99,12 @@ uses the same existing occurrence-only confirmation and verified write path.
 
 ## AI boundaries
 
-- **Isolated runtime.** The Copilot CLI child runs with its own home and
-  working directory in the profile, configuration discovery and remote
-  sessions/export disabled, and fail-closed permissions. It gets no shell,
-  file-system, arbitrary SQL or approval tools.
+- **Isolated runtime.** Microsoft Copilot SDK 2 runs the installed protocol-4
+  runtime in-process over its C ABI (or a standalone `.exe` as a child process)
+  with its own isolated Copilot home and per-session workspace directory in the
+  profile, configuration discovery and client telemetry disabled, and
+  fail-closed permissions. It gets no shell, file-system, arbitrary SQL or
+  approval tools.
 - **Read-only tools, per task.**
 
   | Task | Tools |

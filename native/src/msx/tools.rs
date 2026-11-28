@@ -96,11 +96,11 @@ pub(super) struct Read {
 }
 
 #[async_trait]
-impl github_copilot_sdk::tool::ToolHandler for Read {
+impl copilot_sdk::tool::ToolHandler for Read {
     async fn call(
         &self,
-        invocation: github_copilot_sdk::ToolInvocation,
-    ) -> Result<github_copilot_sdk::ToolResult, github_copilot_sdk::Error> {
+        invocation: copilot_sdk::ToolInvocation,
+    ) -> Result<copilot_sdk::ToolResult, copilot_sdk::Error> {
         let result = async {
             if invocation.tool_name != self.name || !valid(self.name, &invocation.arguments) {
                 return Err(format!(
@@ -140,7 +140,7 @@ impl github_copilot_sdk::tool::ToolHandler for Read {
 pub fn register(
     client: &Arc<Client>,
     names: &mut BTreeSet<String>,
-    tools: &mut Vec<github_copilot_sdk::Tool>,
+    tools: &mut Vec<copilot_sdk::Tool>,
     recorder: &Arc<Recorder>,
     remaining: &Arc<AtomicUsize>,
 ) -> bool {
@@ -172,7 +172,7 @@ pub fn register(
         }
         names.insert(name.into());
         tools.push(
-            github_copilot_sdk::Tool::new(name)
+            copilot_sdk::Tool::new(name)
                 .with_description(description)
                 .with_parameters(parameters)
                 .with_handler(Arc::new(Read {

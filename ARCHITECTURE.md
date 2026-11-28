@@ -3,8 +3,10 @@
 Tomlook is one Rust crate in [`native\`](native/) that builds a native
 Windows executable with [egui/eframe](https://github.com/emilk/egui)
 (OpenGL, AccessKit). There is no browser, WebView, server or Python/Node
-bridge. AI runs through the official Rust GitHub Copilot SDK, which drives an
-installed Copilot CLI runtime as a child process.
+bridge. AI runs through the official Rust Microsoft Copilot SDK 2 (`copilot-sdk`),
+hosting an installed protocol-4 native Copilot runtime library (`runtime.node` /
+`copilot_runtime.dll`) in-process over its C ABI (or a standalone protocol-4
+Copilot CLI executable as a child process).
 
 ## Components and threads
 

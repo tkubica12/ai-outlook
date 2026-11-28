@@ -4,7 +4,7 @@ use crate::{
 };
 use chrono::{Local, NaiveDate};
 use eframe::egui;
-use github_copilot_sdk::MessageOptions;
+use copilot_sdk::MessageOptions;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     collections::BTreeMap,
@@ -3015,7 +3015,7 @@ async fn ask_chat(
 
 #[allow(clippy::too_many_arguments)]
 async fn collect_chat(
-    session: &github_copilot_sdk::session::Session,
+    session: &copilot_sdk::session::Session,
     prompt: &str,
     cancel: &mut watch::Receiver<bool>,
     run: &crate::chat::Run,

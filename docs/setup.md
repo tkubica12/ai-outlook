@@ -75,14 +75,20 @@ connects to the hosted WorkIQ endpoint `https://workiq.svc.cloud.microsoft/mcp`.
 
 ## GitHub Copilot (AI)
 
-Tomlook runs the installed Copilot CLI as a child process with its own,
-isolated Copilot home in the profile; it never uses your regular Copilot
-profile, `gh` login or token environment variables.
+Tomlook uses Microsoft Copilot SDK 2 (`copilot-sdk`, protocol 4) with an
+installed Copilot runtime in an isolated Copilot home in the profile; it never
+uses your regular Copilot profile, `gh` login or token environment variables.
+When `runtime` points to `runtime.node`, `copilot_runtime.dll`, or a
+`copilot-runtime.exe` beside `runtime.node`, Tomlook hosts the native runtime
+in-process over its C ABI; a standalone protocol-4 `copilot.exe` runs as an
+isolated child process.
 
-1. Install the [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli).
+1. Install a protocol-4 [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli)
+   or `copilot-runtime` package (1.0.115+).
 2. Copy [`native\connections.example.json`](../native/connections.example.json)
    to `%LOCALAPPDATA%\Tomlook\connections.json` and set:
-   - `runtime`: the absolute path of the installed `copilot.exe`;
+   - `runtime`: the absolute path of the installed protocol-4 `runtime.node`,
+     `copilot_runtime.dll`, `copilot-runtime.exe`, or `copilot.exe`;
    - `use_stored_login`: `true`;
    - `model`: the model for meeting preparation (Ask's Quick and Thorough
      modes use fixed models);
@@ -96,8 +102,9 @@ Tomlook uses the Copilot CLI public OAuth application, requesting `read:user`
 and `read:org` to identify the authorized user and organization membership.
 It verifies the GitHub identity and saves the token in `copilot-login.db`,
 encrypted with Windows DPAPI for the current Windows user. The isolated SDK
-runtime receives this token explicitly in its child-process environment;
-the shared system keychain remains disabled. No token is written to the
+runtime receives this token explicitly in memory (or its child-process
+environment for standalone `.exe` runtimes); client telemetry and the shared
+system keychain remain disabled. No token is written to the
 runtime's configuration file, and no existing Copilot or `gh` login is imported.
 The older isolated `copilot login` workaround is no longer used: after
 upgrading, sign in once from Tomlook to create its encrypted record.

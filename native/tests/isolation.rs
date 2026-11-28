@@ -7,25 +7,75 @@ fn home_and_working_directory_are_child_only_and_app_owned() {
     let root = tempfile::tempdir().unwrap();
     let runtime = PathBuf::from(r"C:\installed\copilot.exe");
     let options = isolated_options(root.path(), &runtime);
+    let Some(copilot_sdk::RuntimeConnection::SpawnedStdio(process)) = &options.runtime else {
+        panic!("Expected spawned stdio runtime");
+    };
     assert_eq!(
-        options.base_directory.as_deref(),
+        process.owned.base_directory.as_deref(),
         Some(root.path().join("copilot").as_path())
     );
-    assert_eq!(options.working_directory, root.path().join("workspace"));
-    assert!(options.env.iter().any(|(key, value)| key == "COPILOT_HOME"
-        && value == &root.path().join("copilot").into_os_string()));
+    assert_eq!(process.working_directory, root.path().join("workspace"));
+    assert!(process.env.is_none());
+    assert!(process.args.iter().any(|arg| arg == "--no-remote-export"));
     for _ in 0..2 {
         let spaced = root.path().join("Tomlook \u{010c}esk\u{00fd} profile");
         let retry = isolated_options(&spaced, &runtime);
-        assert_eq!(retry.base_directory, Some(spaced.join("copilot")));
-        assert_eq!(retry.working_directory, spaced.join("workspace"));
+        let Some(copilot_sdk::RuntimeConnection::SpawnedStdio(retry_process)) = &retry.runtime
+        else {
+            panic!("Expected spawned stdio runtime");
+        };
+        assert_eq!(
+            retry_process.owned.base_directory,
+            Some(spaced.join("copilot"))
+        );
+        assert_eq!(retry_process.working_directory, spaced.join("workspace"));
     }
-    assert!(!options.enable_remote_sessions);
-    assert_eq!(options.use_logged_in_user, Some(false));
-    assert!(options.env_remove.iter().any(|name| name == "GH_TOKEN"));
-    assert!(options.env_remove.iter().any(|name| name == "GITHUB_TOKEN"));
-    assert!(options.github_token.is_none());
+    assert_eq!(options.mode, copilot_sdk::ClientMode::Empty);
+    assert_eq!(options.github.use_logged_in_user, Some(false));
+    assert!(options.observability.disable_client_telemetry);
+    assert!(process.env_remove.iter().any(|name| name == "GH_TOKEN"));
+    assert!(process.env_remove.iter().any(|name| name == "GITHUB_TOKEN"));
+    assert!(options.github.token.is_none());
     assert_eq!(std::env::var_os("COPILOT_HOME"), original);
+}
+
+#[test]
+fn native_runtime_library_or_adjacent_wrapper_hosts_in_process_isolated() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime_dir = root.path().join("pkg");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let library = runtime_dir.join("runtime.node");
+    let wrapper = runtime_dir.join("copilot-runtime.exe");
+    std::fs::write(&library, b"fixture").unwrap();
+    std::fs::write(&wrapper, b"fixture").unwrap();
+
+    for configured in [&library, &wrapper] {
+        let config = Config {
+            runtime: configured.clone(),
+            model: "sample".into(),
+            copilot_credential_env: None,
+            use_stored_login: true,
+            servers: Default::default(),
+        };
+        assert!(config.validate().is_ok());
+        let options = isolated_options(root.path(), configured);
+        let Some(copilot_sdk::RuntimeConnection::InProcess(in_process)) = &options.runtime else {
+            panic!("Expected in-process runtime for {}", configured.display());
+        };
+        assert_eq!(
+            in_process.owned.base_directory.as_deref(),
+            Some(root.path().join("copilot").as_path())
+        );
+        assert_eq!(
+            in_process.runtime_library_path.as_deref(),
+            Some(library.as_path())
+        );
+        assert_eq!(in_process.eager_power_shell_resolution, Some(false));
+        assert_eq!(options.mode, copilot_sdk::ClientMode::Empty);
+        assert_eq!(options.github.use_logged_in_user, Some(false));
+        assert!(options.observability.disable_client_telemetry);
+        assert!(options.github.token.is_none());
+    }
 }
 
 #[test]
